@@ -49,14 +49,19 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-36" "build-tools;36.0.0" \
-                     "ndk;28.2.13676358" "cmake;3.22.1"
+          # Not android-actions/setup-android: it insists on installing the
+          # legacy "tools" package, which current SDK images no longer publish
+          # ("Failed to find package 'tools'"), and the whole job dies there.
+          # The runner image already has cmdline-tools, so drive sdkmanager.
+          SDKM=$(ls "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | tail -1)
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0" \
+                  "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "--- ndk ---"; ls "$ANDROID_SDK_ROOT/ndk"
+          echo "--- cmake ---"; ls "$ANDROID_SDK_ROOT/cmake"
 
       - name: Build deps, shasum shim, Linux port of build.sh
         run: |
