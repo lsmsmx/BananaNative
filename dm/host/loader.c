@@ -706,6 +706,27 @@ static uint8_t *slurp(const char *path, size_t *n) {
     close(fd); *n = st.st_size; return p;
 }
 
+// Pointer authentication, host side. Switch 2 modules return through RETAA/RETAB
+// in every function that has a PAC prologue. On a CPU without FEAT_PAuth
+// (Armv8.2: Cortex-A78/X1 and older, so Snapdragon 888) the HINT forms
+// (PACIBSP/AUTIBSP) run as NOP, so the return address is never signed, but
+// RETAA/RETAB are UNDEFINED and trap. Trapping them would cost a signal round
+// trip per call, so rewrite them here, once, while the text is still writable:
+// RETAB/RETAA become RET, which is exactly what the failed (NOP) signing leaves
+// valid. The cold PAC instructions stay in crash.c's SIGILL path -- the register
+// forms as NOPs, PACGA computed, since it produces a value and has no
+// single-instruction stand-in.
+static void pac_patch_text(module_t *m) {
+    uint32_t *w = (uint32_t *)m->base;
+    const size_t n = (size_t)(m->text_end / 4);
+    size_t cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t v = w[i];
+        if (v == 0xD65F0FFFu || v == 0xD65F0BFFu) { w[i] = 0xD65F03C0u; cnt++; }   // RETAB / RETAA -> RET
+    }
+    if (cnt) LOG("%s: %zu RETAB/RETAA returns rewritten to RET (host CPU has no PAC)", m->name, cnt);
+}
+
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
 static void map_image(module_t *m, const char *dir) {
@@ -722,7 +743,7 @@ static void map_image(module_t *m, const char *dir) {
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
-        free(raw); install_key_page(m); window_apply(m);
+        free(raw); install_key_page(m); window_apply(m); pac_patch_text(m);
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
@@ -733,7 +754,7 @@ static void map_image(module_t *m, const char *dir) {
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m);
+    memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); pac_patch_text(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
