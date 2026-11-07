@@ -29,21 +29,8 @@ jobs:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/28.2.13676358
     steps:
-      - name: Checkout the 0.1.5 release commit (matching shader chain)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          ref: 243bae31a836503d216bb0003e90b194d4366bad
-          fetch-depth: 0
-
-      - name: PAC fix from the pushed head (host-side; shaders untouched)
-        run: |
-          # The PAC work is host-side, not in the packer, so the pack keeps
-          # 0.1.5's shader chain and prepares once. Both edited files come from
-          # the pushed branch; the rest of the tree stays at the release commit.
-          git checkout "${{ github.sha }}" -- dm/host/crash.c dm/host/loader.c dm/host/hle_svc.c
-          grep -n "RETAB / RETAA" dm/host/crash.c
-          grep -n "pac_patch_text" dm/host/loader.c
-          grep -n "guest_file_init" dm/host/hle_svc.c
 
       - name: Free disk space
         run: |
