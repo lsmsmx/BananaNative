@@ -1,0 +1,94 @@
+name: build-apk
+
+# Builds the Android APK for Mario Kart World (0400C3F00006E000) and uploads it
+# as a workflow artifact. No game code or game data is in the repo or the APK:
+# the pack is still made on the phone from the user's own dump.
+#
+# Two upstream assumptions are patched for a Linux runner below:
+#   * android/ondevice/build.sh hard-codes the NDK's darwin-x86_64 llvm-strip
+#   * it calls `shasum`, which GitHub's Ubuntu image does not ship
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ android ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/28.2.13676358
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf "$ANDROID_SDK_ROOT/emulator" "$ANDROID_SDK_ROOT/system-images" || true
+          df -h /
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: .NET 10 (NativeAOT translator)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" \
+                     "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Build deps, shasum shim, Linux port of build.sh
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh ninja-build cmake git curl zlib1g-dev
+          sudo tee /usr/local/bin/shasum > /dev/null <<'EOF'
+          #!/bin/sh
+          [ "$1" = "-a" ] && [ "$2" = "256" ] && shift 2
+          exec sha256sum "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/shasum
+          sed -i 's|\$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip|\$BIN/llvm-strip|' \
+            android/ondevice/build.sh
+          grep -n llvm-strip android/ondevice/build.sh
+
+      - name: Packer stage (CPython, capstone, lz4, translator, SPIRV-Tools)
+        run: zsh android/ondevice/build.sh "$RUNNER_TEMP/packer"
+
+      - name: APK (Mario Kart World)
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > android/app/local.properties
+          cd android/app
+          ./gradlew --no-daemon \
+            -PnxPackStage="$RUNNER_TEMP/packer/stage" \
+            -PnxGames=0400C3F00006E000 \
+            -PnxApp=mkw \
+            apk
+          ls -la out/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxnative-android-mkw
+          path: android/app/out/*.apk
+          if-no-files-found: error
