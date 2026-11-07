@@ -337,6 +337,7 @@ static unsigned pool_flags(const void *pool) { unsigned f = 0; nvn_pool_live(poo
 uint64_t nvn_sparse_gen(void); uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n);   // hle_nvn.c: sparse virtual pools
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n);
 int nvn_sparse_any(const void *pool, uint64_t a, uint64_t n); int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n);
+uint64_t nvn_sparse_phys(const void *pool, uint64_t a, uint64_t n);   // the physical run behind [a, a+n), 0 when its pages are not one run: the tile's shared slot (vka_sparse.c)
 static void upload(vka_img *im, const tex_t *t, VkCommandBuffer cb);
 static uint64_t g_rows_up;   // bytes of partial row re-uploads (upload_rows_tracked)
 
@@ -513,7 +514,7 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     if (res) {   // no memory of its own: tiles bound as the page table maps them (vks_tile), the rest now (vks_new)
         int ok = mt != UINT32_MAX && mr.alignment && 0x10000 % mr.alignment == 0;
         if (ok && !vks_va_take(mr.size)) { vk.vkDestroyImage(V.dev, im->img, NULL); free(im); *why = 1; *need = mr.size; return NULL; }
-        if (ok && !(im->rs = vks_new(im->img, mt, im->w, im->h, im->levels, im->layers, rtw, rth, (uint32_t)ntl - base))) { vks_va_give(mr.size); ok = 0; }
+        if (ok && !(im->rs = vks_new(im->img, mt, im->w, im->h, im->levels, im->layers, rtw, rth, (uint32_t)ntl - base, (uint32_t)f->vk, !sparse_sampled(t, f)))) { vks_va_give(mr.size); ok = 0; }
         else if (!ok) VRED_ONCE("sparse residency image of serial %llu: memory alignment %llu, type %u: dense images instead", (unsigned long long)t->serial, (unsigned long long)mr.alignment, mt);
         if (!ok) { vk.vkDestroyImage(V.dev, im->img, NULL); free(im); *why = 2; return NULL; }
         im->va = mr.size; im->rs_tw = rtw; im->rs_th = rth; im->bytes = 0;
@@ -910,7 +911,7 @@ static int res_level(vka_img *im, uint32_t i, uint32_t band_rows, uint64_t band_
     if (band_rows * im->f.bh == im->rs_th && band_bytes == (uint64_t)ntx * 0x10000) return 1;
     VRED_ONCE("sparse texture serial %llu level %u: bands of %u block rows / %llu bytes are not rows of %ux%u tiles: the level is bound whole", (unsigned long long)im->serial, i + im->base,
               band_rows, (unsigned long long)band_bytes, im->rs_tw, im->rs_th);
-    for (uint32_t ly = 0; ly < im->layers; ly++) for (uint32_t ty = 0; ty < nty; ty++) for (uint32_t tx = 0; tx < ntx; tx++) vks_tile(im->rs, i, ly, tx, ty, 1);
+    for (uint32_t ly = 0; ly < im->layers; ly++) for (uint32_t ty = 0; ty < nty; ty++) for (uint32_t tx = 0; tx < ntx; tx++) vks_tile(im->rs, i, ly, tx, ty, 1, 0);
     return 0;
 }
 // The bound tiles of bands [k, k1) of image level i, layer ly from staging s (rows from block row y0 at pitch): one copy region per run of bound tiles in a band
@@ -969,7 +970,10 @@ static void upload_sparse_parts(vka_img *im, VkCommandBuffer cb, uint64_t gen, u
                 int b2 = 0;
                 if (BAND_CHANGED(k)) for (uint32_t tx = 0; tx < rs_ntx(im, i); tx++) {
                     uint64_t po = off + BAND_OFF(k) + (uint64_t)tx * 0x10000;
-                    b2 |= vks_tile(im->rs, i, ly, tx, k, po < off + len && nvn_sparse_any(im->vpool, mem + po, 0x10000));
+                    int mapped = po < off + len && nvn_sparse_any(im->vpool, mem + po, 0x10000);
+                    // The tile's slot is shared with every other place the same physical memory is mapped at (vka_sparse.c): only a tile whose 16 pages are one run of
+                    // physical memory and wholly inside the level has one (a tile at the level's edge, or of scattered pages, keeps a slot of its own)
+                    b2 |= vks_tile(im->rs, i, ly, tx, k, mapped, mapped && po + 0x10000 <= off + len ? nvn_sparse_phys(im->vpool, mem + po, 0x10000) : 0);
                 }
                 bst[k] = b2 ? 2 : 0;
             }

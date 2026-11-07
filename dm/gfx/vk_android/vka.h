@@ -100,6 +100,7 @@ typedef struct {
     VkSemaphore tl;                                 // the timeline: value n = submission n has completed
     pthread_mutex_t qmu;                            // the queue is shared by the submit and present threads
     int sparse_res;                                 // sparse residency images can be made (vka_sparse.c): binding on the queue, 2D residency, standard block shape, strict non-resident reads
+    int sparse_aliased;                             // the driver reports sparseResidencyAliased: one tile slot may be bound at several images (vka_sparse.c share_take)
     uint64_t tl_queued;                             // the highest timeline value a vkQueueSubmit so far signals (under qmu): what a later submission on the queue may wait for
 } vka_dev;
 extern vka_dev V;
@@ -168,8 +169,8 @@ int vks_on(void);                                   // the device can (V.sparse_
 int vks_va_take(uint64_t bytes);                    // sparse address space for an image of that virtual size: 1 = taken
 void vks_va_give(uint64_t bytes);
 uint64_t vks_va_free(void);                         // sparse address space free now (a texture left at a coarser level tries a finer one once more is free than when it failed)
-vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t levels, uint32_t layers, uint32_t tw, uint32_t th, uint32_t tiled);   // NULL: make it dense
-int vks_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, int want);   // bind / unbind one tile of image level lv: 1 = bound now
+vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t levels, uint32_t layers, uint32_t tw, uint32_t th, uint32_t tiled, uint32_t fmt, int drawn);   // NULL: make it dense (fmt and drawn: what a shared slot is keyed by, a drawn image never uploads into one)
+int vks_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, int want, uint64_t key);   // bind / unbind one tile of level lv to the slot of the physical memory key (0: a slot of its own): 1 = bound now
 int vks_tile_bound(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty);
 uint32_t vks_tiled(const vks_img *s);               // image levels bound tile by tile (the later ones are bound whole)
 uint64_t vks_img_bytes(vks_img *s);

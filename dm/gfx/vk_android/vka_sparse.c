@@ -10,25 +10,32 @@
 // A bind batch waits for every submission handed to the queue before it (none still reads a tile it unbinds or rebinds): an empty vkQueueSubmit first signals the sparse
 // timeline at a value of its own, which by queue order covers everything submitted before (replay parts that signal nothing, upload batches, framegen), after the batch before
 // it; the bind waits for that value only and signals the next. Every later submission of the replay and of the upload batches waits for the bind's value, so the tiles are
-// bound before the copies that fill them and the draws that read them. A batch that fails keeps its binds (and the slots its unbinds free) for the next one. A slot unbound is reused only by a later batch; a tile block is freed once empty and the batch that emptied it has run. No aliasing (a slot is one tile of one image):
-// the phone has no sparseResidencyAliased.
+// bound before the copies that fill them and the draws that read them. A batch that fails keeps its binds (and the slots its unbinds free) for the next one. A slot unbound is reused only by a later batch; a tile block is freed once empty and the batch that emptied it has run.
+// Sharing (share_take): where the driver reports sparseResidencyAliased (V.sparse_aliased, vka_dev.c), a tile whose 16 pages are one run of physical memory is the same tile at every place the game maps it
+// (Mario Kart World maps most pages at about three places: 2,959 MB of mapped virtual pages on 976 MB of physical), so the slot is shared, keyed by the run's first physical
+// address, the VkFormat and the tile shape (a 64 KiB block reads the same through any texture of that format, Vulkan's standard 2D block shape). A GPU-drawn tile is shared
+// only with drawn ones (a drawn image is never uploaded into); a sampled one re-uploads at every new place, as one tile per place did. DM_VK_SPARSE_SHARE=0: a slot per place.
 // DM_VK_SPARSE_RES=0: dense images as before (read once)
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_pshare.h"
 #include <stdlib.h>
 
 #define TILE 65536u
 #define BLOCK_TILES 1024u                     // 64 MiB tile blocks
 typedef struct { VkDeviceMemory dm; uint32_t type, used; uint64_t bits[BLOCK_TILES / 64]; uint64_t free_at; } tblock;   // free_at: the sparse value after which, empty, it may be freed
+typedef struct { uint32_t id; uint64_t key; } tslot;   // one tile: its slot, and the physical memory behind it when the slot is a shared one (key 0: a slot of its own)
 struct vks_img {
     VkImage img; uint32_t type, w, h, levels, layers, tiled, mtfl, tw, th;
+    uint32_t fmt, flat; int drawn;             // what a shared slot is keyed by (share_take): the VkFormat, the tile shape, GPU-drawn or sampled
     uint32_t lofs[16], ntx[16], nty[16], per_layer;   // levels < mtfl: first tile of the level in a layer's run of slot[], tiles across and down; tiles a layer
-    uint32_t *slot;                            // per tile of levels < mtfl, layer-major: slot id + 1, 0 = unbound
+    tslot *slot;                               // per tile of levels < mtfl, layer-major: slot id + 1 (0 = unbound) and the key it was bound by
     uint32_t ntail, tail_each, *tail;          // mip tails (one, or one a layer) of tail_each slots each
     VkSparseImageMemoryRequirements sr;
     uint64_t last;                             // the last sparse value whose batch binds into it (under g_ks)
     uint32_t bound;                            // slots bound (tiles and tails)
 };
+static vkp_tab g_ps;                           // slots shared by the physical memory behind a tile (vka_pshare.h)
 static pthread_mutex_t g_ks = PTHREAD_MUTEX_INITIALIZER;
 static tblock **g_tb; static uint32_t g_ntb, g_ctb;
 static VkSemaphore g_stl; static uint64_t g_sval, g_sig;   // the sparse timeline: g_sval = the last bind batch's value handed to the queue, g_sig = the last value anything signals
@@ -38,7 +45,8 @@ typedef struct { vks_img *s; uint64_t seq; VkSparseMemoryBind b; } popq;
 static uint64_t g_seq;
 static pimg *g_pi; static uint32_t g_npi, g_cpi;
 static popq *g_po; static uint32_t g_npo, g_cpo;
-static uint32_t *g_rel; static uint32_t g_nrel, g_crel;   // slots that pending binds unbind: given back once their batch is queued
+typedef struct { uint32_t id, fmt, flat; uint64_t key; uint8_t drawn; } rel_ent;   // a slot (or a share of one) a queued bind gives up: released once its batch has run
+static rel_ent *g_rel; static uint32_t g_nrel, g_crel;
 static uint64_t g_bytes, g_va, g_nbatch, g_nbinds, g_nimg;
 static int grow(void **p, uint32_t *cap, uint32_t n, size_t sz) {
     if (n < *cap) return 1;
@@ -98,6 +106,39 @@ static void slot_give(uint32_t id, uint64_t at) {   // caller holds g_ks; at: th
 }
 static VkDeviceMemory slot_mem(uint32_t id, VkDeviceSize *off) { id--; *off = (VkDeviceSize)(id % BLOCK_TILES) * TILE; return g_tb[id / BLOCK_TILES]->dm; }
 
+// ---- Slots shared by the physical memory behind a tile (the file's head, vka_pshare.h) ----
+// Sharing is Vulkan's aliasing between sparse resources: the driver has to report it (vka_dev.c), and DM_VK_SPARSE_SHARE=0 turns it off anyway
+static int share_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("DM_VK_SPARSE_SHARE"); on = V.sparse_aliased && !(e && atoi(e) == 0);
+                  if (!V.sparse_aliased) VRED_ONCE("sparse tiles are not shared between the places that map the same physical pages: the driver does not report sparseResidencyAliased"); }
+    return on;
+}
+static uint32_t share_take(vks_img *s, uint64_t key) {   // caller holds g_ks: the slot this physical run is already bound by, or a new one
+    if (!share_on()) return slot_take(s->type);
+    int i = vkp_ref(&g_ps, key, s->fmt, s->flat, s->drawn);
+    if (i >= 0) return g_ps.e[i].id;
+    uint32_t id = slot_take(s->type);
+    if (!id) return 0;
+    if (vkp_add(&g_ps, key, s->fmt, s->flat, s->drawn, id) < 0) { slot_give(id, 0); return 0; }
+    return id;
+}
+static void share_put(uint64_t key, uint32_t fmt, uint32_t flat, int drawn, uint64_t at) {   // caller holds g_ks: one place fewer; the slot goes with the last one
+    if (!key) return;
+    int i = vkp_at(&g_ps, key, fmt, flat, drawn);
+    if (i < 0) return;
+    uint32_t id = g_ps.e[i].id;
+    if (vkp_put(&g_ps, key, fmt, flat, drawn) == 1) slot_give(id, at);
+}
+static int rel_add(uint32_t id, uint64_t key, const vks_img *s) {   // caller holds g_ks: 1 = queued (released once the batch that gives it up has run)
+    if (!grow((void **)&g_rel, &g_crel, g_nrel, sizeof *g_rel)) return 0;
+    g_rel[g_nrel++] = (rel_ent){id, s->fmt, s->flat, key, (uint8_t)s->drawn};
+    return 1;
+}
+static void rel_give(const rel_ent *r, uint64_t at) {   // caller holds g_ks
+    if (r->key) share_put(r->key, r->fmt, r->flat, r->drawn, at); else slot_give(r->id, at);
+}
+
 // One tile's bind (id 0: unbind) queued (caller holds g_ks)
 static int push_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, uint32_t id) {
     if (!grow((void **)&g_pi, &g_cpi, g_npi, sizeof *g_pi)) return 0;
@@ -115,19 +156,24 @@ static int push_opaque(vks_img *s, VkDeviceSize at, VkDeviceSize n, uint32_t id)
     if (id) p->b.memory = slot_mem(id, &p->b.memoryOffset);
     return 1;
 }
-static uint32_t *tile_at(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty) { return &s->slot[(size_t)ly * s->per_layer + s->lofs[lv] + (size_t)ty * s->ntx[lv] + tx]; }
-static int bind_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty) {   // caller holds g_ks: 1 = bound
-    uint32_t *t = tile_at(s, lv, ly, tx, ty);
-    if (*t) return 1;
-    uint32_t id = slot_take(s->type);
-    if (!id) return 0;
-    if (!push_tile(s, lv, ly, tx, ty, id)) { slot_give(id, 0); return 0; }
-    *t = id; s->bound++; return 1;
+static tslot *tile_at(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty) { return &s->slot[(size_t)ly * s->per_layer + s->lofs[lv] + (size_t)ty * s->ntx[lv] + tx]; }
+// The tile bound to key (0: a slot of its own, for the levels bound whole): caller holds g_ks: 1 = bound. A tile whose physical memory changed moves to that memory's slot
+static int bind_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, uint64_t key) {
+    tslot *t = tile_at(s, lv, ly, tx, ty);
+    if (key && !share_on()) key = 0;   // DM_VK_SPARSE_SHARE=0: a slot of its own per place, and released as one
+    if (t->id && t->key == key) return 1;
+    if (t->id && !grow((void **)&g_rel, &g_crel, g_nrel, sizeof *g_rel)) return 1;   // (no room to queue the old slot's release: the tile keeps it)
+    uint32_t id = key ? share_take(s, key) : slot_take(s->type);
+    if (!id) return t->id != 0;
+    if (!push_tile(s, lv, ly, tx, ty, id)) { if (key) share_put(key, s->fmt, s->flat, s->drawn, 0); else slot_give(id, 0); return t->id != 0; }
+    if (t->id) rel_add(t->id, t->key, s); else s->bound++;
+    t->id = id; t->key = key;
+    return 1;
 }
 
 // The residency of a new sparse image: its tile shape (texels, the format's granularity), the levels bound tile by tile (tiled: NVN's tiled levels that Vulkan tiles too).
 // Levels from tiled to the mip tail and the mip tail are bound now. NULL: the image cannot be one (the caller makes a dense image)
-vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t levels, uint32_t layers, uint32_t tw, uint32_t th, uint32_t tiled) {
+vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t levels, uint32_t layers, uint32_t tw, uint32_t th, uint32_t tiled, uint32_t fmt, int drawn) {
     uint32_t n = 0; vk.vkGetImageSparseMemoryRequirements(V.dev, img, &n, NULL);
     VkSparseImageMemoryRequirements sr[4];
     if (n > 4) { VRED_ONCE("sparse image: %u sparse memory requirements (at most 4 handled): dense images instead", n); return NULL; }
@@ -145,6 +191,7 @@ vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t le
     vks_img *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->img = img; s->type = type; s->w = w; s->h = h; s->levels = levels; s->layers = layers; s->tw = tw; s->th = th; s->sr = sr[k];
+    s->fmt = fmt; s->flat = (tw << 16) | th; s->drawn = drawn != 0;
     s->mtfl = sr[k].imageMipTailFirstLod < levels ? sr[k].imageMipTailFirstLod : levels;
     if (s->mtfl > 16) { free(s); return NULL; }
     s->tiled = tiled < s->mtfl ? tiled : s->mtfl;
@@ -165,9 +212,9 @@ vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t le
         VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
         if (vk.vkCreateSemaphore(V.dev, &sci, NULL, &g_stl)) { g_stl = VK_NULL_HANDLE; ok = 0; VRED("sparse timeline not made: dense images instead"); }
     }
-    for (uint32_t ly = 0; ly < layers && ok; ly++)   // levels NVN keeps in its mip tail but Vulkan tiles: bound whole
+    for (uint32_t ly = 0; ly < layers && ok; ly++)   // levels NVN keeps in its mip tail but Vulkan tiles: bound whole (a slot of their own: not driven by the page table)
         for (uint32_t lv = s->tiled; lv < s->mtfl && ok; lv++)
-            for (uint32_t ty = 0; ty < s->nty[lv] && ok; ty++) for (uint32_t tx = 0; tx < s->ntx[lv] && ok; tx++) ok = bind_tile(s, lv, ly, tx, ty);
+            for (uint32_t ty = 0; ty < s->nty[lv] && ok; ty++) for (uint32_t tx = 0; tx < s->ntx[lv] && ok; tx++) ok = bind_tile(s, lv, ly, tx, ty, 0);
     for (uint32_t t = 0; t < s->ntail && ok; t++)
         for (uint32_t j = 0; j < s->tail_each && ok; j++) {
             uint32_t id = slot_take(type); VkDeviceSize at = sr[k].imageMipTailOffset + t * sr[k].imageMipTailStride + (VkDeviceSize)j * TILE;
@@ -181,16 +228,20 @@ vks_img *vks_new(VkImage img, uint32_t type, uint32_t w, uint32_t h, uint32_t le
     return s;
 }
 
-// The tile of level lv, layer ly at (tx, ty) bound (want) or unbound, as the page table has it: 1 = bound now. Levels at or past the tiled ones are always bound
-int vks_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, int want) {
+// The tile of level lv, layer ly at (tx, ty) bound (want) to the slot of the physical memory behind it (key: vka_tex.c nvn_sparse_phys, 0 for one of its own) or unbound, as
+// the page table has it: 1 = bound now. Levels at or past the tiled ones are always bound
+int vks_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, int want, uint64_t key) {
     if (lv >= s->tiled) return 1;
     if (ly >= s->layers || tx >= s->ntx[lv] || ty >= s->nty[lv]) return 0;
     pthread_mutex_lock(&g_ks);
-    uint32_t *t = tile_at(s, lv, ly, tx, ty); int r;
-    if (want) r = bind_tile(s, lv, ly, tx, ty);
+    tslot *t = tile_at(s, lv, ly, tx, ty); int r;
+    if (want) r = bind_tile(s, lv, ly, tx, ty, key);
     else {
-        if (*t && grow((void **)&g_rel, &g_crel, g_nrel, sizeof *g_rel) && push_tile(s, lv, ly, tx, ty, 0)) { g_rel[g_nrel++] = *t; *t = 0; s->bound--; }
-        r = *t != 0;
+        // (the release entry and the unbind are both queued: with no room for either the tile keeps its slot)
+        if (t->id && grow((void **)&g_rel, &g_crel, g_nrel, sizeof *g_rel) && grow((void **)&g_pi, &g_cpi, g_npi, sizeof *g_pi) && push_tile(s, lv, ly, tx, ty, 0)) {
+            rel_add(t->id, t->key, s); t->id = 0; t->key = 0; s->bound--;
+        }
+        r = t->id != 0;
     }
     pthread_mutex_unlock(&g_ks);
     return r;
@@ -198,7 +249,7 @@ int vks_tile(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty, int
 int vks_tile_bound(vks_img *s, uint32_t lv, uint32_t ly, uint32_t tx, uint32_t ty) {
     if (lv >= s->tiled) return 1;
     if (ly >= s->layers || tx >= s->ntx[lv] || ty >= s->nty[lv]) return 0;
-    pthread_mutex_lock(&g_ks); int r = *tile_at(s, lv, ly, tx, ty) != 0; pthread_mutex_unlock(&g_ks); return r;
+    pthread_mutex_lock(&g_ks); int r = tile_at(s, lv, ly, tx, ty)->id != 0; pthread_mutex_unlock(&g_ks); return r;
 }
 uint32_t vks_tiled(const vks_img *s) { return s->tiled; }
 uint64_t vks_img_bytes(vks_img *s) { pthread_mutex_lock(&g_ks); uint64_t b = (uint64_t)s->bound * TILE; pthread_mutex_unlock(&g_ks); return b; }
@@ -209,7 +260,7 @@ void vks_free(vks_img *s) {
     pthread_mutex_lock(&g_ks);
     uint32_t j = 0; for (uint32_t i = 0; i < g_npi; i++) if (g_pi[i].s != s) g_pi[j++] = g_pi[i]; g_npi = j;
     j = 0; for (uint32_t i = 0; i < g_npo; i++) if (g_po[i].s != s) g_po[j++] = g_po[i]; g_npo = j;
-    if (!g_npi && !g_npo) { for (uint32_t i = 0; i < g_nrel; i++) slot_give(g_rel[i], g_sval); g_nrel = 0; }   // (unbinds of its own tiles only: no batch would give them back)
+    if (!g_npi && !g_npo) { for (uint32_t i = 0; i < g_nrel; i++) rel_give(&g_rel[i], g_sval); g_nrel = 0; }   // (unbinds of its own tiles only: no batch would give them back)
     uint64_t last = s->last; VkSemaphore sem = g_stl;
     pthread_mutex_unlock(&g_ks);
     if (last && sem && !vka_hung()) {
@@ -218,7 +269,10 @@ void vks_free(vks_img *s) {
     }
     pthread_mutex_lock(&g_ks);
     uint64_t at = g_sval;   // (an unbind of one of its tiles may still be queued behind: a slot freed by the image's end is not reused before the next batch)
-    for (size_t i = 0; i < (size_t)s->per_layer * s->layers; i++) if (s->slot[i]) slot_give(s->slot[i], at);
+    for (size_t i = 0; i < (size_t)s->per_layer * s->layers; i++) if (s->slot[i].id) {
+        if (s->slot[i].key) share_put(s->slot[i].key, s->fmt, s->flat, s->drawn, at); else slot_give(s->slot[i].id, at);
+        s->slot[i].id = 0;
+    }
     for (size_t i = 0; i < (size_t)s->ntail * s->tail_each; i++) if (s->tail[i]) slot_give(s->tail[i], at);
     if (g_nimg) g_nimg--;
     blocks_trim();
@@ -278,7 +332,7 @@ void vks_queue_locked(uint32_t *nw, VkSemaphore *ws, uint64_t *wv, VkPipelineSta
                 g_sig = g_sval = n; g_nbatch++; g_nbinds += g_npi + g_npo;
                 for (uint32_t i = 0; i < g_npi; i++) g_pi[i].s->last = n;
                 for (uint32_t i = 0; i < g_npo; i++) g_po[i].s->last = n;
-                for (uint32_t i = 0; i < g_nrel; i++) slot_give(g_rel[i], n);   // reused only by a later batch, which runs after this one
+                for (uint32_t i = 0; i < g_nrel; i++) rel_give(&g_rel[i], n);   // reused only by a later batch, which runs after this one
                 g_npi = g_npo = g_nrel = 0;
                 blocks_trim();
             }
@@ -292,8 +346,10 @@ void vks_queue_locked(uint32_t *nw, VkSemaphore *ws, uint64_t *wv, VkPipelineSta
 void vks_stats(char *o, size_t n) {
     pthread_mutex_lock(&g_ks);
     uint64_t used = 0; uint32_t nb = 0; for (uint32_t i = 0; i < g_ntb; i++) if (g_tb[i]) { nb++; used += g_tb[i]->used; }
-    snprintf(o, n, "sparse images: %llu, %.0f MiB of address space; tiles %.1f MiB bound in %u blocks (%.0f MiB); %llu bind batches, %llu binds",
-             (unsigned long long)g_nimg, g_va / 1048576.0, used * (double)TILE / 1048576.0, nb, g_bytes / 1048576.0, (unsigned long long)g_nbatch, (unsigned long long)g_nbinds);
+    uint64_t nsh = 0, npl = 0, nsv = 0; vkp_stats(&g_ps, &nsh, &npl, &nsv);
+    snprintf(o, n, "sparse images: %llu, %.0f MiB of address space; tiles %.1f MiB bound in %u blocks (%.0f MiB); %llu bind batches, %llu binds; %llu tiles shared by %llu places (%.0f MiB saved)",
+             (unsigned long long)g_nimg, g_va / 1048576.0, used * (double)TILE / 1048576.0, nb, g_bytes / 1048576.0, (unsigned long long)g_nbatch, (unsigned long long)g_nbinds,
+             (unsigned long long)nsh, (unsigned long long)npl, (double)nsv * TILE / 1048576.0);
     pthread_mutex_unlock(&g_ks);
 }
 uint64_t vks_bytes_nolock(void) { return g_bytes; }

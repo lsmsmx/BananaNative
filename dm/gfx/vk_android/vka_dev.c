@@ -96,7 +96,9 @@ static int init_once(void) {
            (unsigned long long)V.props.limits.bufferImageGranularity);
       // Sparse residency images (vka_sparse.c) need it all: binding on the replay's queue, 2D residency, the standard block shape (NVN's 64 KB tiles) and strict non-resident reads
       // (an unbound tile reads 0, as an unmapped NVN page). The features are enabled with every other supported one (vkGetPhysicalDeviceFeatures2 below)
-      V.sparse_res = pf.sparseBinding && pf.sparseResidencyImage2D && sp->residencyStandard2DBlockShape && sp->residencyNonResidentStrict && V.qf < nq && (qp[V.qf].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT); }
+      V.sparse_res = pf.sparseBinding && pf.sparseResidencyImage2D && sp->residencyStandard2DBlockShape && sp->residencyNonResidentStrict && V.qf < nq && (qp[V.qf].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
+      // One slot bound at several sparse images' tiles (vka_sparse.c share_take) is Vulkan's aliasing between sparse resources, which the driver has to report
+      V.sparse_aliased = pf.sparseResidencyAliased; }
     free(qp);
     if (V.qf == UINT32_MAX) { VRED("no graphics + compute queue family"); return 0; }
 

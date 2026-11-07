@@ -2863,6 +2863,22 @@ int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n) {   // every pag
     for (uint64_t o = v ? (a - (uint64_t)(uintptr_t)v->base) & ~0xFFFull : 0, end = v ? a - (uint64_t)(uintptr_t)v->base + n : 0; ok && o < end; o += 0x1000) { const vpte *e = o < v->size ? vpt_get(v, o) : NULL; ok = e && e->phys; }
     pthread_mutex_unlock(&g_vp_mu); return ok;
 }
+// The physical memory behind [a, a+n) when its pages are one run of it (the host address of the run's first byte), else 0: the Vulkan replay's sparse tiles are shared by it
+// (vka_sparse.c), one host tile for one piece of physical memory however many places the game maps it at, as on hardware. A tile of scattered, partly unmapped or
+// mixed pages has none and keeps a host tile of its own (the same rule upstream nxnative/mkw-neo's nvn_mtl.m sp_tile applies, reading it from the physical pool's pages)
+uint64_t nvn_sparse_phys(const void *pool, uint64_t a, uint64_t n) {
+    if (!n || (a & 0xFFF) || (n & 0xFFF)) return 0;
+    pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); uint64_t key = 0;
+    if (v) {
+        uint64_t o = a - (uint64_t)(uintptr_t)v->base; const uint8_t *first = NULL; int ok = o + n <= v->size;
+        for (uint64_t at = 0; ok && at < n; at += 0x1000) {
+            const vpte *e = vpt_get(v, o + at);
+            if (!e || !e->phys) ok = 0; else if (!first) first = e->phys; else if (e->phys != first + at) ok = 0;
+        }
+        if (ok && first) key = (uint64_t)(uintptr_t)first;
+    }
+    pthread_mutex_unlock(&g_vp_mu); return key;
+}
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
 static int run_any(const uint8_t *p, uint64_t n, uint64_t unused) { (void)p; (void)n; (void)unused; return 1; }
 int nvn_sparse_any(const void *pool, uint64_t a, uint64_t n) {   // some page of [a, a+n) has memory behind it (leaves never mapped are skipped 2 MB at a time)
