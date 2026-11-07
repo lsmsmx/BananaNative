@@ -40,9 +40,10 @@ jobs:
           # The PAC work is host-side, not in the packer, so the pack keeps
           # 0.1.5's shader chain and prepares once. Both edited files come from
           # the pushed branch; the rest of the tree stays at the release commit.
-          git checkout "${{ github.sha }}" -- dm/host/crash.c dm/host/loader.c
+          git checkout "${{ github.sha }}" -- dm/host/crash.c dm/host/loader.c dm/host/hle_svc.c
           grep -n "RETAB / RETAA" dm/host/crash.c
           grep -n "pac_patch_text" dm/host/loader.c
+          grep -n "guest_file_init" dm/host/hle_svc.c
 
       - name: Free disk space
         run: |
