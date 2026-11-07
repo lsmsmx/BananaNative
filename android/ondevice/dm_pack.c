@@ -1,10 +1,15 @@
 // The on-device packer's Python start-up and tool runner (dm_pack.h, android/ONDEVICE.md): CPython 3.14 embedded, each tool run by runpy.run_path with its sys.argv.
 // Build: android/ondevice/build.sh (NDK clang, linked against the official CPython Android build's libpython3.14.so)
+#define _GNU_SOURCE   // cpu_set_t and sched_setaffinity (thread placement)
 #include "dm_pack.h"
 #include <Python.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sched.h>
+#include <unistd.h>
+#include <errno.h>
 #ifdef __ANDROID__
 #include <jni.h>
 #endif
@@ -150,7 +155,31 @@ static char **strings(JNIEnv *e, jobjectArray a, int *n) {   // a Java String[] 
 }
 static void unstrings(char **v) { for (char **p = v; p && *p; p++) free(*p); free(v); }
 
+#ifdef __ANDROID__
+// Preparation runs as a foreground service in :pack, and without an affinity mask Android leaves the work on the little cores:
+// the shader translation (about eleven thousand shaders) then takes an hour instead of minutes. Pin the process -- CPython and
+// the translator's threads inherit it -- to the cores at 75 % of the top clock or more (the big cluster: A78 + X1 on a 888,
+// never the A55s). The same rule as the launcher's "Use fast cores" (android/app/src/main/cpp/nxlaunch.c).
+static long cpu_max_khz(int c) {
+    char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+    FILE *f = fopen(path, "r"); long v = 0; if (f) { if (fscanf(f, "%ld", &v) != 1) v = 0; fclose(f); }
+    return v;
+}
+static void pin_fast_cores(void) {
+    int n = (int)sysconf(_SC_NPROCESSORS_CONF); if (n > CPU_SETSIZE) n = CPU_SETSIZE;
+    long top = 0;
+    for (int c = 0; c < n; c++) { long k = cpu_max_khz(c); if (k > top) top = k; }
+    if (!top) return;   // no cpufreq: leave the scheduler alone
+    cpu_set_t cs; CPU_ZERO(&cs); int cnt = 0;
+    for (int c = 0; c < n; c++) { long k = cpu_max_khz(c); if (k * 4 >= top * 3) { CPU_SET(c, &cs); cnt++; } }
+    if (!cnt) return;
+    if (sched_setaffinity(0, sizeof cs, &cs)) fprintf(stderr, "[pack] thread placement: sched_setaffinity failed, errno %d\n", errno);
+    else fprintf(stderr, "[pack] thread placement: %d of %d cores (%ld MHz or more): the little cores stay with the system\n", cnt, n, top * 3 / 4000);
+}
+#endif
+
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_PackNative_init0(JNIEnv *e, jclass c, jstring home) {
+    pin_fast_cores();
     const char *h = (*e)->GetStringUTFChars(e, home, NULL);
     int r = dm_pack_init(h);
     (*e)->ReleaseStringUTFChars(e, home, h);
@@ -158,6 +187,7 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_PackNative_init0(JNIEnv *e, jcl
 }
 
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_PackNative_run0(JNIEnv *e, jclass c, jstring tool, jobjectArray args, jobjectArray env, jstring log) {
+    pin_fast_cores();   // again per tool: Android resets a process's mask when it changes foreground state
     int argc; char **argv = strings(e, args, &argc), **envv = strings(e, env, NULL);
     const char *t = (*e)->GetStringUTFChars(e, tool, NULL), *l = log ? (*e)->GetStringUTFChars(e, log, NULL) : NULL;
     int r = dm_pack_run(t, argc, argv, (const char *const *)envv, l);
