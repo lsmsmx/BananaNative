@@ -29,8 +29,18 @@ jobs:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/28.2.13676358
     steps:
-      - name: Checkout
+      - name: Checkout the 0.1.5 release commit (matching shader chain)
         uses: actions/checkout@v4
+        with:
+          ref: 243bae31a836503d216bb0003e90b194d4366bad
+          fetch-depth: 0
+
+      - name: PAC fix from the pushed head (host-side; shaders untouched)
+        run: |
+          # retab/retaa are an instruction-level fix in the host, not the
+          # packer, so the pack keeps 0.1.5's shader chain and prepares once.
+          git checkout "${{ github.sha }}" -- dm/host/crash.c
+          grep -n "RETAB / RETAA" dm/host/crash.c
 
       - name: Free disk space
         run: |
