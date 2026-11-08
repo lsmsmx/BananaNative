@@ -409,12 +409,14 @@ static int guest_release(uintptr_t lo, uintptr_t hi) {
 #else
         (void)done; punched = 0;   // no hole punching here (Apple): keep the bytes, the reopening callers zero them
 #endif
-        if (mprotect((void *)lo, span, PROT_NONE)) die("guest_release mprotect (file-backed) %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
+        // A protection change the kernel refuses (ENOMEM: a fragmented or exhausted mapping table, not a lack of RAM) leaves the pages as they are: the
+        // range is not given back, which its callers already handle. Ending the session here turned one failed mprotect into a crash 21 minutes in.
+        if (mprotect((void *)lo, span, PROT_NONE)) { static _Atomic int nr; if (atomic_fetch_add(&nr, 1) < 8) LOG("[RED] guest memory %#lx+%#lx: PROT_NONE refused (errno %d), the range stays as it was", (unsigned long)lo, (unsigned long)span, errno); return 0; }
         return punched;
     }
     if (mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != MAP_FAILED) return 1;
     static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) LOG("[RED] guest memory %#lx+%#lx not given back (errno %d): it stays resident", (unsigned long)lo, (unsigned long)(hi - lo), errno);
-    if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
+    if (mprotect((void *)lo, hi - lo, PROT_NONE)) { static _Atomic int nr2; if (atomic_fetch_add(&nr2, 1) < 8) LOG("[RED] guest memory %#lx+%#lx: PROT_NONE refused (errno %d), the range stays as it was", (unsigned long)lo, (unsigned long)(hi - lo), errno); }
     return 0;
 }
 // Initialize holes using the OLD commit bitmap. Fresh anonymous host pages stay
@@ -870,9 +872,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         int64_t unmap_d = 0; int unmapped_bits = 0;   // Unmap: the bitmap change, made before the pages are released
         if (changed && mhi > mlo) {
             if (commit) {
+                if (mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE)) {
+                    // ENOMEM here is the kernel refusing such a fragmented range, not a shortage of RAM (the game ran 21 minutes at 1.5 GB RSS before one did).
+                    // Refusing the map as the pool limit does makes the SDK free what it keeps mapped and retry; aborting ended the session instead.
+                    static _Atomic int nm; if (atomic_fetch_add(&nm, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: mprotect errno=%d (%.2f GB mapped; ResultLimitReached)", size, errno, atomic_load(&g_alias_mapped) / 1073741824.0);
+                    pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
+                }
                 dm_gfx_guest_open((void *)mlo, mhi - mlo);
-                if (mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE))
-                    die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
                 dm_guest_write_prepare((void *)mlo, mhi - mlo);
             } else {
                 // the bits go first: a host reader (dm_guest_read_mapped) that finds a page mapped must not find it inaccessible
