@@ -86,6 +86,11 @@ DM_GPU_CAPTURE_KEEP	diagnostic	Before each GPU capture, prunes the capture folde
 DM_GRAPHICS_SCALE	player	The Switch 2 graphics scale the game sees in every operation mode: `0`, `1` or `2` (`oe::GetCurrentGraphicsScale`, scaling parameters 10 / 20 / 30); unset follows the operation mode (0 handheld, 1 console). Mario Kart World renders its 3D scenes smaller at a higher scale (handheld scale 2: 1280x720); read once
 DM_GUEST_BASE	diagnostic	`=<hex>` where the guest address block starts on Android (default `0x4000000000`); when it is taken the host tries the next 64 GiB boundaries, always below `1 << 39`
 DM_GUEST_SPAWN_TEST	diagnostic	`=1` runs a self-test before `nnMain`: a host-started guest thread does SDK malloc / free and locks an `nn::os` mutex, and the result is logged; `=2` also keeps a resident thread
+DM_GUEST_FILE	switch	`1` / `0` (Android) forces guest memory into unlinked sparse files (the default decides from the game's pool against what is available); this host carries it and upstream does not, so the knob is not documented in other trees
+DM_GUEST_FILE_CHUNK	switch	`=<size>` (Android, 1G) the size of each guest file, in bytes or K/M/G (at most 1024 files); smaller files stall less at the kernel's periodic flush, larger ones use less of the app's cache
+DM_GUEST_FILE_DIR	switch	`=<dir>` where the guest files live (default `TMPDIR`); the Android app sets it to its own `cache` directory
+DM_GUEST_FILE_DIRTY_MB	switch	`=<MiB>` (Android, 512) push writeback once that much of the guest file is dirty; `0` never (the kernel then flushes in bursts), which is where a stall comes from
+DM_GUEST_FILE_MIN_FREE	switch	`=<size>` (Android, 5G) stop the game (exit 87) rather than fill the disk the guest files are on
 DM_HID_LOG	diagnostic	`1` logs the HID button usage number of each button pressed on a raw HID gamepad (`pad_hid_mac.h`), to write a `DM_HID_MAP`
 DM_HID_MAP	switch	`=<map>` such as `A=1,B=2,X=4,Y=5`: which HID button usage presses each Switch button on a raw HID gamepad (names A B X Y LS RS L R ZL ZR PLUS MINUS LEFT UP RIGHT DOWN; default 8BitDo's D-input numbering by position, `pad_hid.h`); Mac only
 DM_HID_PADS	switch	`0` stops reading raw HID gamepads that GameController does not list, such as an 8BitDo in its own mode (`pad_hid_mac.h`); Mac only
