@@ -312,7 +312,13 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
     }
     if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1; return; }
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
-    vpx_codec_dec_cfg_t cfg = {.threads = 2, .w = d->w, .h = d->h};
+    // DM_VP9_THREADS (diagnostic, read at each decoder's open; default 2): libvpx's decode threads. VP9 decodes a frame's rows in parallel when the stream allows it, so more
+    // threads finish a large picture sooner at more of the cores' cost; Mario Kart World's cutscenes are 2560x1440, where two threads may not keep real time at all
+    int nth = 2;
+    { const char *e = getenv("DM_VP9_THREADS"); if (e && atoi(e) > 0) nth = atoi(e);
+      long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu > 0 && nth > ncpu) nth = (int)ncpu;
+      static int logged; if (!logged++) LOG("[codec] libvpx decodes with %d thread(s) (DM_VP9_THREADS)", nth); }
+    vpx_codec_dec_cfg_t cfg = {.threads = (unsigned)nth, .w = d->w, .h = d->h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, d->codec == CV_VP8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
     if (!d->vpx_ok) LOG("[RED] nn::codec %s decoder: libvpx init failed", k_cv_name[d->codec]);
 }
