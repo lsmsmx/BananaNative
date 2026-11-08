@@ -123,6 +123,7 @@ enum { NSLOT = 8, MAXPOOLS = 64 };
 static VkDescriptorPool g_dp[NSLOT][MAXPOOLS]; static int g_ndp[NSLOT], g_cur_dp[NSLOT];
 void vka_dyn_invalidate(void);
 static void drv_memo_reset(void);
+static void sets_memo_drop(void);
 void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
@@ -931,7 +932,7 @@ static struct { int valid; vka_span s; uint64_t k[3]; uint8_t b[DMSH_DRV_SIZE]; 
 static struct { int valid; uint64_t gen; vka_span s; } g_gm;
 static struct { int valid; uint32_t ref; vka_span s; } g_sm_ref;   // the support buffer with the alpha test's reference (stage_writes)
 static int g_drv_memo = 1, g_drv_stamp = 1; static uint64_t g_dm_hit, g_dm_miss, g_dm_stamp;
-static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_gm.valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); g_drv_stamp = VKA_ENV("DM_VK_DRV_STAMP", 1); }
+static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_gm.valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); g_drv_stamp = VKA_ENV("DM_VK_DRV_STAMP", 1); sets_memo_drop(); }   // (and the sets' memo: the spans g_w holds go with the submission's fence)
 // What a graphics stage's segment is filled from (vka_bind.c vka_drv_fill), as stamps and values: c0 from the stage's storage buffers, the base instance and the sample
 // count; c2 from the stage's texture, sampler and image handles (and the pools' bases when the shader reads the pools); the push bank from the pushed constants. The same
 // key as the memo's: the same bytes, so the draw binds the memo's span without filling the segment and comparing it (DM_VK_DRV_STAMP, live from the next submission,
@@ -1255,7 +1256,86 @@ static int sets_push(const vka_layout *lay, VkPipelineBindPoint bp, int any_pool
     if (any_pool) { VkDescriptorSet ps = vka_bindless_set(); if (ps) vk.vkCmdBindDescriptorSets(g_cb, bp, lay->layout, 1, 1, &ps, 0, NULL); else VRED_ONCE("a shader reads the texture pool and there is no pool set"); }
     return 1;
 }
+// The last draw's writes, kept as what made them (DM_VK_SETS_MEMO, live, default 1). Building them (stage_writes) is 7.7 us a draw on the phone: 7.6 image descriptors of it,
+// each resolving its texture ID to a view. The resolution's inputs are the walk (walk_all), the shaders' keys (their c1 bytes), the texture IDs' view and sampler versions, the
+// open pass's attachments, the memory segments' generation, and the draw state the driver segments and the alpha test's copy are filled from. When all of those are the ones
+// the last draw had, the descriptors are the same and are not built again: g_w still holds them (a draw resolves set 0 once, and the only other writer, the instanced run's
+// range shrinking, drops the memo). Only graphics draws whose walks resolve without an image of their own, a storage image, a shared-memory spill, a texel buffer or raw global
+// memory's log are kept: those take memory or a new scratch span each time. DM_VK_SETS_MEMO=0: every draw builds them, as before
+typedef struct {
+    uint64_t lay, texgen, memgen, fbgen, alpha, spush, pools, base, sk[VKA_NSTAGE], stemo[VKA_NSTAGE][2];
+    int rast_discard;
+} sets_key;
+static struct { sets_key k; int ok, any, n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint64_t rv[VKA_NSTAGE][512]; vka_res r[VKA_NSTAGE][512]; } g_smemo;
+static void sets_memo_drop(void) { g_smemo.ok = 0; }
+// The key of this draw's writes: the layout, the shaders, the generations the views and samplers resolve from, and the state the driver segments are filled from
+static void sets_key_of(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, sets_key *k) {
+    memset(k, 0, sizeof *k);   // (memcmp'd: its padding too)
+    uint32_t ab; memcpy(&ab, &d->alpha_ref, 4);
+    k->lay = (uint64_t)lay->layout; k->texgen = vka_tex_gen(); k->memgen = vka_mem_gen(); k->fbgen = vka_tex_fb_gen();
+    k->alpha = (uint64_t)ab | (uint64_t)d->color.alpha_func << 32;
+    k->spush = d->s_push; k->pools = (uint64_t)(uint32_t)d->b.tex_base | (uint64_t)(uint32_t)d->b.samp_base << 32;
+    k->base = (uint64_t)d->b.base_instance | (uint64_t)d->b.samples << 32; k->rast_discard = d->rast_discard;
+    for (int st = 0; st < VKA_NSTAGE; st++) {
+        k->sk[st] = sh[st] ? sh[st]->key : 0;
+        k->stemo[st][0] = d->s_ssbo[st]; k->stemo[st][1] = d->s_tex[st];
+    }
+}
+// A record's view and sampler versions (the memos' keys): what a texture or image binding resolves to changes only with them
+static uint64_t sets_rv(const vka_res *r) {
+    if (r->what != VKA_R_TEX && r->what != VKA_R_IMG && r->what != VKA_R_TBUF) return 0;
+    return (uint64_t)vka_tex_ver(r->tid) | (uint64_t)vka_samp_ver(r->sid) << 32;
+}
+// 0 when the draw's writes cannot be kept: they take memory or a new scratch span each time, so no two draws' are ever the same
+static int sets_keepable(vka_shader *const sh[VKA_NSTAGE], VkPipelineBindPoint bp) {
+    if (bp != VK_PIPELINE_BIND_POINT_GRAPHICS || !g_drv_memo) return 0;   // (a compute stage's driver segment is filled into a new span every dispatch)
+    if (sh[2] && sh[2]->gs_fx > 0) return 0;                              // (the claim words: a zeroed span per draw)
+    for (int st = 0; st < VKA_NSTAGE; st++) for (int i = 0; i < g_wk.n[st]; i++) {
+        const vka_res *r = &g_wk.r[st][i];
+        if (r->what == VKA_R_IMG || r->what == VKA_R_TBUF || r->what == VKA_R_SHARED_SPILL || r->what == VKA_R_GMEM_LOG) return 0;
+        if (r->desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || r->desc == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || r->desc == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) return 0;
+    }
+    return 1;
+}
+// The walk's records compared field by field (vka_res has padding bytes vka_walk's initializer does not fix: a raw memcmp would read them)
+static inline int res_same(const vka_res *a, const vka_res *b) {
+    return a->what == b->what && a->desc == b->desc && a->flags == b->flags && a->dim == b->dim && a->binding == b->binding && a->elem == b->elem
+        && a->bank == b->bank && a->tid == b->tid && a->sid == b->sid && a->addr == b->addr && a->size == b->size;
+}
+// 1 when the last kept draw's walk and view and sampler versions are this draw's
+static uint64_t g_sm_hit, g_sm_try;   // draws whose writes were kept, of the draws that could be (vka_draw_pace's line)
+static int sets_memo_same(const sets_key *k) {
+    if (memcmp(k, &g_smemo.k, sizeof *k)) return 0;
+    for (int st = 0; st < VKA_NSTAGE; st++) {
+        int n = g_wk.n[st];
+        if (n != g_smemo.n[st] || g_wk.pool[st] != g_smemo.pool[st]) return 0;
+        if (n <= 0) continue;
+        for (int i = 0; i < n; i++) if (sets_rv(&g_wk.r[st][i]) != g_smemo.rv[st][i] || !res_same(&g_wk.r[st][i], &g_smemo.r[st][i])) return 0;
+    }
+    return 1;
+}
+// The writes the build below makes, kept for the next draw (the key is the one the hit test read: what the build does must not change it)
+static void sets_memo_store(const sets_key *k, int any_pool) {
+    g_smemo.k = *k; g_smemo.any = any_pool;
+    for (int st = 0; st < VKA_NSTAGE; st++) {
+        int n = g_smemo.n[st] = g_wk.n[st]; g_smemo.pool[st] = g_wk.pool[st];
+        for (int i = 0; i < n; i++) g_smemo.rv[st][i] = sets_rv(&g_wk.r[st][i]);
+        if (n > 0) memcpy(g_smemo.r[st], g_wk.r[st], (size_t)n * sizeof(vka_res));
+    }
+    g_smemo.ok = 1;
+}
 static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, VkPipelineBindPoint bp, c0_at *c0) {
+    int keep = VKA_ENV("DM_VK_SETS_MEMO", 1) && sets_keepable(sh, bp);
+    sets_key k; if (keep) sets_key_of(d, sh, lay, &k);   // (before the build: what it resolves must not change it)
+    if (keep && g_smemo.ok) {
+        g_sm_try++;
+        if (sets_memo_same(&k)) {   // g_w as the last draw left it: the same writes
+            g_sm_hit++;
+            if (g_sets_dry) { g_dry_pool = g_smemo.any; return 1; }
+            return sets_push(lay, bp, g_smemo.any);
+        }
+    }
+    g_smemo.ok = 0;   // (anything below that fails leaves it dropped)
     g_w.n = 0;
     int any_pool = 0;
     uint64_t t1_ = g_prof ? cntvct() : 0;
@@ -1277,6 +1357,7 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
         g_w.bi[k] = (VkDescriptorBufferInfo){cs.buf, cs.off, n};
         g_w.w[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = VKA_GS_CLAIM_BINDING, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &g_w.bi[k]};
     }
+    if (keep) sets_memo_store(&k, any_pool);
     if (g_sets_dry) { g_dry_pool = any_pool; return 1; }   // DM_VK_INSTANCE: the writes only (sets_push binds them)
     return sets_push(lay, bp, any_pool);
 }
@@ -1606,10 +1687,11 @@ void vka_draw_prof(char *b, size_t n, double draws) {
 // The pace line's view of the draw path (vka_perf.c pace_tick, on the recording thread): the timed draws' mean per draw (us) and by phase, and the shortcuts' shares.
 // *draw_us: the mean whole time of a draw (0: none timed)
 void vka_draw_pace(char *b, size_t n, double *draw_us) {
-    static dprof last; static uint64_t vk0, vb0, vk1, vb1, dh0, dm0, ds0;
+    static dprof last; static uint64_t vk0, vb0, vk1, vb1, dh0, dm0, ds0, sh0, st0;
     dprof d; dprof_take(&last, &d);
     uint64_t vk = g_vin_kept - vk0, vb = g_vin_built - vb0, bk = g_vb_kept - vk1, bb = g_vb_bound - vb1, dh = g_dm_hit - dh0, dm = g_dm_miss - dm0, ds = g_dm_stamp - ds0;
-    vk0 = g_vin_kept; vb0 = g_vin_built; vk1 = g_vb_kept; vb1 = g_vb_bound; dh0 = g_dm_hit; dm0 = g_dm_miss; ds0 = g_dm_stamp;
+    uint64_t sh = g_sm_hit - sh0, st = g_sm_try - st0;
+    vk0 = g_vin_kept; vb0 = g_vin_built; vk1 = g_vb_kept; vb1 = g_vb_bound; dh0 = g_dm_hit; dm0 = g_dm_miss; ds0 = g_dm_stamp; sh0 = g_sm_hit; st0 = g_sm_try;
     *draw_us = 0; if (n) b[0] = 0;
     size_t o = 0;
     if (d.n) {
@@ -1618,6 +1700,8 @@ void vka_draw_pace(char *b, size_t n, double *draw_us) {
         for (int i = 0; i < 8 && o < n; i++) o += (size_t)snprintf(b + o, n - o, " %s %.2f%s", g_pt_nm[i], d.pt[i] * us, i < 7 ? "," : "");
         if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f, driver segments %.2f), push %.2f)", d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[3] * us, d.ps[2] * us);
     }
+    if (o < n) o += (size_t)snprintf(b + o, n - o, "%sset 0 writes kept %.0f %% of the draws that could (DM_VK_SETS_MEMO)",
+                                      o ? "; " : "", st ? 100.0 * (double)sh / (double)st : 0.0);
     if (o < n) o += (size_t)snprintf(b + o, n - o, "%svertex input kept %.0f %% (DM_VK_VIN_SKIP), vertex buffers kept %.0f %%, driver segments %.0f %% by their inputs (DM_VK_DRV_STAMP) of %.0f %% bound again",
                                       o ? "; " : "", vk + vb ? 100.0 * vk / (double)(vk + vb) : 0.0, bk + bb ? 100.0 * bk / (double)(bk + bb) : 0.0, dh ? 100.0 * ds / (double)dh : 0.0, dh + dm ? 100.0 * dh / (double)(dh + dm) : 0.0);
 }
@@ -1855,7 +1939,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
                      && vka_scratch(4 * INST_CAP, 16, &i_ta) && vka_scratch(20, 4, &i_aa);
             if (istart) {
                 vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ip); DY.pipe = ip; VB.valid = 0;
-                g_w.bi[i_wv].range = wv; g_w.bi[i_wp].range = wp;
+                g_w.bi[i_wv].range = wv; g_w.bi[i_wp].range = wp; sets_memo_drop();   // (g_w is no longer what the walk alone makes it)
                 vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.layout, 0, g_w.n, g_w.w); g_pd[0].n = 0;
                 RUN.open = 1; RUN.ipipe = ip; RUN.wv = i_wv; RUN.wp = i_wp; RUN.win_v = wv; RUN.win_p = wp; RUN.n = 1;
                 RUN.table = (uint32_t *)i_ta.ptr; RUN.args = (uint32_t *)i_aa.ptr; RUN.table[0] = 0;

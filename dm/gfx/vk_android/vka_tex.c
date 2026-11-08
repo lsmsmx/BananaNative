@@ -1872,8 +1872,12 @@ static VkComponentSwizzle swz1(int n) { return n >= 0 && n <= 5 ? (VkComponentSw
 // levels below (nvn_mtl.m fb_prepare, "Mip-chain pass sampling the level it renders" in docs/reference/rendering.md). DKB fills its environment cube's mip chain level by level,
 // each drawn from the one above through a view of the whole chain; sampling the attached level is a feedback loop Vulkan leaves undefined (on Adreno: NaN texels, which bloom
 // spread into white blotches and black speckles over the whole level)
-static vka_img *g_fb_im[9]; static uint32_t g_fb_lv[9]; static int g_nfb;
-void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n) { g_nfb = n > 9 ? 9 : n; for (int i = 0; i < g_nfb; i++) { g_fb_im[i] = ims[i]; g_fb_lv[i] = levels[i]; } }
+static vka_img *g_fb_im[9]; static uint32_t g_fb_lv[9]; static int g_nfb; static _Atomic uint32_t g_fbgen;
+void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n) {
+    g_nfb = n > 9 ? 9 : n; for (int i = 0; i < g_nfb; i++) { g_fb_im[i] = ims[i]; g_fb_lv[i] = levels[i]; }
+    atomic_fetch_add_explicit(&g_fbgen, 1, memory_order_release);   // (a view of a pass's own attachment differs: vka_draw.c's sets memo reads vka_tex_fb_gen)
+}
+uint64_t vka_tex_fb_gen(void) { return atomic_load_explicit(&g_fbgen, memory_order_acquire); }
 static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int storage, VkFormat ovr) {
     vka_fmt f; const view_t *v = e->has_v ? &e->v : NULL;
     if (!vka_fmt_of(v && v->set_format ? v->format : e->t.d.format, &f)) f = im->f;
@@ -2079,6 +2083,12 @@ VkSampler vka_samp_id_rec(int id) {
     m->id = id; m->ver = ver; m->s = sp;
     return sp;
 }
+// The inputs vka_tex_id_view_rec and vka_samp_id_rec resolve from, as generations: the view memo's global (a texture map entry added or tombstoned) and per-ID, the sampler's
+// per-ID, and the open pass's attachments. vka_draw.c keeps a draw's resolved descriptors while all of these and its walk hold (sets_memo); each is read under the same rule
+// the memos use, so a change that makes a memo entry stale also makes the draw's descriptors stale
+uint64_t vka_tex_gen(void) { return atomic_load_explicit(&g_tgen, memory_order_acquire); }
+uint32_t vka_tex_ver(int id) { return g_tver && id > 0 && id < (1 << 20) ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0; }
+uint32_t vka_samp_ver(int id) { return g_sver && id > 0 && id < 4096 * 4 ? atomic_load_explicit(&g_sver[id], memory_order_acquire) : 0; }
 // The format of the same texel size and channel layout in numeric class cls (0 float / unorm, 1 uint, 2 sint) for a view that reads a texture as another class, else UNDEFINED
 static VkFormat class_twin(VkFormat v, int cls) {
     static const struct { VkFormat f[3]; } t[] = {
