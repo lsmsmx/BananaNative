@@ -1680,6 +1680,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     vka_barrier(g_cb);   // (also frees the shared memory spill buffer for the next dispatch)
     g_dispatches++;
 }
+int vka_prof_on(void) { return g_prof; }   // DM_VK_PROF: the recording loop (vka_exec.c) times its records by the same switch
 void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines) {
     if (draws) *draws = g_draws; if (skipped) *skipped = g_skipped; if (dispatches) *dispatches = g_dispatches; if (pipelines) *pipelines = 0;
 }

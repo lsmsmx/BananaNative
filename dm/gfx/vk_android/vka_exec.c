@@ -45,6 +45,20 @@ extern uint64_t vka_n_rp, vka_n_bar; static uint64_t g_n_ub, g_n_sub, g_rec_ns, 
 static _Atomic uint64_t g_fstart[64], g_fstart_f[64];   // when the replay began recording each frame's first submission (its number mod 64): the adaptive floor's spans
 static uint64_t g_job_frame; static int g_job_frame_set;   // the frame of the submission the worker replays (vka_exec_sub_frame)
 void vka_exec_sub_frame(uint64_t f) { g_job_frame = f; g_job_frame_set = 1; }
+// DM_VK_PROF: where the recording's time goes beyond the draws (vka_draw times its own body): cycles and calls per class of command record
+static inline uint64_t cntvct_(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+enum { EP_DRAW, EP_BAR, EP_CC, EP_UB, EP_STATE, EP_OTHER, EP_N };
+static uint64_t g_epc[EP_N], g_epn[EP_N];
+static int ep_class(uint32_t op) {
+    switch (op) {
+    case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: return EP_DRAW;
+    case OP_BARRIER: return EP_BAR;
+    case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_CLEAR_TEX: case OP_CLEAR_BUF: case OP_COPY_B2B: case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: return EP_CC;
+    case OP_UPDATE_UB: return EP_UB;
+    case OP_END: case OP_BEGIN: case OP_JUMP: case OP_CALL: case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_FENCE_SYNC: case OP_RENDER_COND: case OP_RESET_COUNTER: return EP_OTHER;
+    default: return EP_STATE;   // vka_state_op: buffer, texture and sampler binds, dynamic state
+    }
+}
 uint64_t vka_frame_start_ns(uint64_t f) { unsigned k = f % 64; return atomic_load(&g_fstart_f[k]) == f ? atomic_load(&g_fstart[k]) : 0; }   // now_ns; 0 = not known (vka_perf.c)
 void mtl_set_frame(uint64_t f) {
     g_frame = f; vka_ctl_frame(f);
@@ -60,6 +74,12 @@ void mtl_set_frame(uint64_t f) {
           vka_enc_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           vka_floor_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb);
           vka_rp_bar_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
+          { uint64_t frq; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq)); double usf = 1e6 / (double)frq / n;
+            if (g_epn[EP_DRAW] + g_epn[EP_BAR] + g_epn[EP_CC] + g_epn[EP_UB] + g_epn[EP_STATE] + g_epn[EP_OTHER])
+                VLOG("recording steps a frame (us): draw %.0f in %.0f records, barrier %.0f in %.0f, clear/copy %.0f in %.0f, uniform %.0f in %.0f, state %.0f in %.0f, other %.0f in %.0f",
+                     g_epc[EP_DRAW] * usf, (double)g_epn[EP_DRAW] / n, g_epc[EP_BAR] * usf, (double)g_epn[EP_BAR] / n, g_epc[EP_CC] * usf, (double)g_epn[EP_CC] / n,
+                     g_epc[EP_UB] * usf, (double)g_epn[EP_UB] / n, g_epc[EP_STATE] * usf, (double)g_epn[EP_STATE] / n, g_epc[EP_OTHER] * usf, (double)g_epn[EP_OTHER] / n);
+            memset(g_epc, 0, sizeof g_epc); memset(g_epn, 0, sizeof g_epn); }
           { void vka_drv_memo_stats(char *b, size_t n); vka_drv_memo_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb); } }
         f0 = f; d0 = g_stat_draws; rp0 = vka_n_rp; b0 = vka_n_bar; ub0 = g_n_ub; s0 = g_n_sub; r0 = g_rec_ns; o0 = g_stat_ops; pc0 = g_n_pclear; ch0 = g_n_chunks;
     }
@@ -685,9 +705,11 @@ static int rc_known(uint64_t a, uint64_t *v) {   // a counter at a: 0 for a time
 
 static void seg_write(const void *a) { struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w; memcpy(&w, a, sizeof w); qf.write(w.cb, w.st, g_sqp, w.q); }
 static void exec(const uint8_t *p, int depth) {
+    int vka_prof_on(void); const int tm = vka_prof_on();
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         const void *a = p + 8;
+        uint64_t t0_ = tm ? cntvct_() : 0;
         int bar_kept = 0;   // a game barrier taken inside the open pass (vka_rp_game_barrier): no pass end, no full barrier
         if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) chunk_check();   // before a draw that opens a new pass
         switch (h.op) {   // a render pass a draw opened stays open across draws and state; anything else closes it first
@@ -741,6 +763,7 @@ static void exec(const uint8_t *p, int depth) {
         case OP_DRAW_TEX: not_yet(h.op); break;
         default: break;   // state: taken by vka_state_op above
         }
+        if (t0_ && h.op != OP_CALL) { int c = ep_class(h.op); g_epc[c] += cntvct_() - t0_; g_epn[c]++; }   // (a call's own list is counted record by record)
         if (h.size < 8) { VRED("command record of size %u at %p (op %u): the list is cut here", h.size, (const void *)p, h.op); return; }
         p += h.size;
     }
