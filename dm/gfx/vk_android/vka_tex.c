@@ -2289,11 +2289,17 @@ VkSampler vka_samp_default(void) {
     return s;
 }
 
+// vka_tex_prepare's phases (cumulative ns, the pace line reads them as deltas): the pruner, the CPU re-uploads, the GPU write log's poll, and the scan and re-uploads a GPU
+// write that is done calls for. The rest of the function -- the tracked images whose pages the CPU wrote -- is the pace line's remainder
+static uint64_t g_tp[4];
+void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw) { *prune = g_tp[0]; *redo = g_tp[1]; *poll = g_tp[2]; *gw = g_tp[3]; }
 void vka_tex_prepare(VkCommandBuffer cb) {
+    uint64_t t0_ = now_ns();
     bindless_init();
     nvn_pool_use(1);   // the re-uploads below read guest storage: no pool is finalized (and unmapped) under them. Taken before g_tmu, as write_tex does
     pthread_mutex_lock(&g_tmu);
     vka_tex_prune_locked();   // (the limit measured again every 60 frames; nothing to do under it)
+    g_tp[0] += now_ns() - t0_; t0_ = now_ns();
     for (int i = 0; i < g_nredo; i++) {   // CPU writes to textures that already have an image (WriteTexels): from now on they follow their storage
         smap_ent *e = map_get(g_redo[i]); vka_img *im = e ? e->im : NULL;
         if (!im || !im->cpu_dirty) continue;
@@ -2307,8 +2313,10 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         g_reup++;
     }
     g_nredo = 0;
+    g_tp[1] += now_ns() - t0_; t0_ = now_ns();
     // GPU writes whose submission is done: the images over them that did not get their bytes are uploaded again (see gw_t above)
     gml_poll();
+    g_tp[2] += now_ns() - t0_; t0_ = now_ns();
     if (vka_nan_on()) watch_scan(cb);
     static uint64_t nprep, kinds[4], ntake; nprep++;
     if (vka_nan_on()) { for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence && g_gw[i].fence <= vka_done()) kinds[g_gw[i].kind]++;
@@ -2355,6 +2363,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         #undef GW_TAKES
         g_ngw = k;
     }
+    g_tp[3] += now_ns() - t0_;
     // Tracked images whose pages the CPU wrote since their last upload (a write to a protected page moves the dirty clock, so nothing is scanned while it stands still)
     // Sparse pools' textures also when a mapping request came since (the page table's generation moved)
     static uint64_t seen, vseen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen();
