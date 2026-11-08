@@ -3146,17 +3146,21 @@ def main():
             os.makedirs(rd, exist_ok=True)
             for f in os.listdir(rd):
                 if f not in ('targeted', 'full', 'targeted.failed'): _remove(os.path.join(rd, f))   # an older split's results, kept in the folder itself
+        anyway = os.environ.get('DM_PACK_SHADERS_ANYWAY') not in (None, '', '0')   # keep the targeted tables although they are not the profile's
         if want is not None:
             big, todo = scan_jobs(files, want)
             dg = scan_digest(inputs, big + todo + mains)
             failed = os.path.join(rd, 'targeted.failed') if rd else None
-            if failed and os.path.isfile(failed) and open(failed).read().strip() == dg: why = 'an earlier run on these inputs found the targeted scan\'s tables differ from the profile\'s'
+            if not anyway and failed and os.path.isfile(failed) and open(failed).read().strip() == dg: why = 'an earlier run on these inputs found the targeted scan\'s tables differ from the profile\'s'
             else:
                 print(f'targeted split: {len(want):,} of {len(files):,} RomFS files hold the shaders of the profile\'s shader_map.tsv (main build {", ".join(build_id(m) for m in main_v)}); only these are scanned', flush=True)
                 try:
                     out = split_tables(list(results), big, todo, dumps, J, common, zdicts, ScanCache(os.path.join(rd, 'targeted'), dg) if rd else None, targeted=True)
                     why = profile_differs(out, pairsout, psopairsout)
                 except Fallback as e: why = str(e)
+                if why and anyway:
+                    print(f"targeted split: kept anyway, {why}: DM_PACK_SHADERS_ANYWAY is set -- the app's shader_map.tsv is not this dump's; a shader it lists and the dump lacks is left out", flush=True)
+                    why = None
                 if why:
                     out = None; why = 'the targeted scan ' + why
                     if failed:
