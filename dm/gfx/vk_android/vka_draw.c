@@ -674,6 +674,7 @@ VkImageView placeholder(uint8_t dim, int storage) {
 
 // Where a draw's CPU time goes (DM_VK_PROF=1, logged with the replay statistics): the virtual counter at each phase boundary of vka_draw
 static uint64_t g_pt_last, g_pt[9], g_ps[6]; static int g_pt_ph;
+static uint64_t g_dtot, g_dn;   // DM_VK_PROF: cycles in the whole of vka_draw (every exit) and the calls that entered it, against the phases (which a draw that returns early does not reach)
 static inline uint64_t cntvct(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
 // ---------- Set 0 from the walk ----------
 typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint64_t ad[512]; uint32_t n; } writes_t;   // ad: a guest buffer's address (0 = other)
@@ -1162,6 +1163,7 @@ void vka_draw_prof(char *b, size_t n, double draws) {
     uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); double us = 1e6 / (double)f / draws;
     static const char *nm[8] = {"resolve", "layout", "images+pass+key", "vertex input", "pipeline", "sets", "vertex buffers+dynamic", "draw"};
     size_t o = 0; for (int i = 0; i < 8 && o < n; i++) o += snprintf(b + o, n - o, "%s%s %.2f", i ? ", " : "", nm[i], g_pt[i] * us);
+    if (o < n) o += snprintf(b + o, n - o, "; the whole of vka_draw %.2f us a draw over %llu calls", g_dtot * us, (unsigned long long)g_dn);
     if (o < n) o += snprintf(b + o, n - o, "; pushes %.0f%% skipped as the last one", g_pd_skip + g_pd_push ? 100.0 * g_pd_skip / (double)(g_pd_skip + g_pd_push) : 0.0);
     g_pd_skip = g_pd_push = 0;
     if (o < n) o += snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (driver segments %.2f, %.1f images %.2f), push %.2f", g_ps[0] * us, g_ps[1] * us, g_ps[3] * us, g_ps[5] / draws, g_ps[4] * us, g_ps[2] * us);
@@ -1171,8 +1173,9 @@ void vka_draw_prof(char *b, size_t n, double draws) {
     g_inst_runs = g_inst_joined = g_inst_fast = g_inst_falls = 0;
     memset(g_ps, 0, sizeof g_ps);
     memset(g_pt, 0, sizeof g_pt);
+    g_dtot = g_dn = 0;
 }
-void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
+static void vka_draw_(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
     if (RUN.open && RUN.fast && di && !dw && g_inst_on && inst_fast(d, rt, has_rt, sc, has_sc, di)) return;   // DM_VK_INSTANCE: the run's next object, no walk
     if (!d->inited) vka_dstate_reset(d);
@@ -1490,6 +1493,14 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (icand && !istart && !RUN.open) { if (inst_snap(&g_ia, p, i_ib, i_io, i_it, di, d)) g_ia.mark = vka_enc_total(); } else g_ia.valid = 0;   // a run may start from this draw
     PT(8);
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
+}
+// The whole of a draw, every exit included (the instanced fast path, a skipped one, one whose indirect count is past): its total per draw against the recording's,
+// so what the phases leave out is named instead of guessed (DM_VK_PROF)
+void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
+    if (!g_prof) { vka_draw_(d, rt, has_rt, sc, has_sc, dw, di); return; }
+    uint64_t t0 = cntvct();
+    vka_draw_(d, rt, has_rt, sc, has_sc, dw, di);
+    g_dtot += cntvct() - t0; g_dn++;
 }
 
 int dm_sdk_ounce(void);
