@@ -40,6 +40,9 @@ mem_alias	0x100000000
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x4000000
+# mem_map_limit (hle_svc.c): a MapPhysicalMemory past the pool fails with ResultLimitReached, so the SDK unmaps the block nninitStartup's probe left cached instead of keeping it
+# mapped beside the game's own use, and the used memory GetInfo counts the pages mapped. Without it the touched set runs past the 9 GB pool (this phone: an 8.3 GB guest file)
+mem_map_limit	on
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
