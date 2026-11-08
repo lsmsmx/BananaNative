@@ -38,7 +38,10 @@ zip_store	.zs:.bwav:.webm:.metallib
 mem_reserve	0x300000000
 mem_alias	0x100000000
 mem_stack	0x10000000
-app_pool	0x240000000
+# app_pool: 0x240000000 is the Switch 2's 9 GB, and nninitStartup turns it into a 7.47 GB heap, which on a 10.9 GiB phone leaves the guest file (and the flash behind it) holding
+# ~3 GB it cannot hold. The game sizes itself from what it is told: 6 GB takes the heap to about 4.5 GB and the touched set with it. If a track fails to load, this is the line to
+# put back to 0x240000000.
+app_pool	0x180000000
 sys_resource	0x4000000
 # mem_map_limit (hle_svc.c): a MapPhysicalMemory past the pool fails with ResultLimitReached, so the SDK unmaps the block nninitStartup's probe left cached instead of keeping it
 # mapped beside the game's own use, and the used memory GetInfo counts the pages mapped. Without it the touched set runs past the 9 GB pool (this phone: an 8.3 GB guest file)
