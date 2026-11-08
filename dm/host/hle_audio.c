@@ -43,6 +43,7 @@ typedef struct {
     audio_stats st_report; _Atomic int st_pending; // one snapshot, consumed by the watchdog or Close under g_aos_lock
     _Atomic uint64_t cb_n;             // device callbacks of this output (the watchdog's evidence that the device still plays it)
     uint64_t wd_n, wd_t;               // watchdog: callback count last seen and when it last moved (under g_aos_lock)
+    uint64_t wd_un, wd_ub, wd_qt;      // watchdog: underruns, zero-filled bytes and appends last seen (DM_AUDIO_STALL_DUMP's dump when an underrun is new)
     int stalled, retry_ms; uint64_t retry_at;   // the device stopped calling back (or would not start): the silent sink stands in and the watchdog retries the AudioUnit at retry_at, backing off
 } aout;
 
@@ -445,6 +446,7 @@ static void stats_drain(void) {
 }
 static void *au_watchdog(void *p) {
     (void)p;
+    char dump[300] = {0};
     for (;;) {
         usleep((dm_guest_suspended() ? 10 : 1) * WD_TICK_MS * 1000);   // suspended (dm_guest_suspend): every 0.5 s, the outputs stand still
         pthread_mutex_lock(&g_aos_lock);
@@ -467,12 +469,21 @@ static void *au_watchdog(void *p) {
                 a->retry_ms = 0;
                 a->wd_n = n; a->wd_t = t;
             }
+            // DM_AUDIO_STALL_DUMP: an output that underran since the last tick (the counters are the callback's, the queue's are atomics). The dump itself runs after
+            // g_aos_lock is dropped: it suspends every guest thread, and no audio operation waits behind that
+            { uint64_t un = atomic_load_explicit(&a->under_n, memory_order_relaxed), ub = atomic_load_explicit(&a->under_b, memory_order_relaxed);
+              uint32_t qt = atomic_load_explicit(&a->q_tail, memory_order_acquire), qh = atomic_load_explicit(&a->q_head, memory_order_acquire);
+              if (un != a->wd_un && a->backend == BK_AU && !g_suspended && !dump[0])
+                  snprintf(dump, sizeof dump, "audio #%d: %llu underruns in the last %d ms (%.1f ms zero-filled), %u buffers queued, %u appended since the tick before, the guest threads:",
+                           a->id, (unsigned long long)(un - a->wd_un), WD_TICK_MS, (ub - a->wd_ub) / (2.0 * a->ch) / (RATE / 1000.0), qt - qh, qt - (uint32_t)a->wd_qt);
+              a->wd_un = un; a->wd_ub = ub; a->wd_qt = qt; }
             if (a->stalled && a->backend == BK_NULL && !g_suspended && t >= a->retry_at) {
                 null_stop(a); au_go(a, t);
                 if (a->backend == BK_AU) LOG("audio #%d: AudioUnit restarted", a->id);
             }
         }
         pthread_mutex_unlock(&g_aos_lock);
+        if (dump[0]) { dm_audio_threads_dump(dump); dump[0] = 0; }
         stats_drain();
     }
     return NULL;

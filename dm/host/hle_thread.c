@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <dlfcn.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdatomic.h>
@@ -495,23 +496,91 @@ static void hitch_log(const hitch_t *h) {
         kinds[h->wkind], (unsigned long long)h->waddr, (unsigned long long)h->wkey, h->sleeping ? " sleeping" : "", h->host_work ? " host-work" : "", h->rs, h->svc, m ? m->name : "?",
         (unsigned long long)(m ? h->lr - (uint64_t)m->base : h->lr), w);
 }
+// Every started guest thread, logged once (the caller holds no guest lock and is not a device callback: this suspends the threads one by one and logs)
+static hitch_t g_hs[256];
+static pthread_mutex_t g_dump_lock = PTHREAD_MUTEX_INITIALIZER;
+static void threads_dump(const char *why) {
+    pthread_mutex_lock(&g_dump_lock);
+    LOG("%s", why);
+    int nt = 0;
+    pthread_mutex_lock(&G); for (thr_t *t = g_all; t && nt < 256; t = t->all) if (t->started && !t->exited) hitch_grab(t, &g_hs[nt++]); pthread_mutex_unlock(&G);
+    for (int k = 0; k < nt; k++) hitch_log(&g_hs[k]);
+    pthread_mutex_unlock(&g_dump_lock);
+}
+// The host threads' CPU time (/proc/<pid>/task/<tid>/stat utime+stime) and their names, the busiest first: what the guest-thread dump cannot show, the threads that are not
+// guest threads -- a game's decoder's own workers (libvpx / dav1d), the replay worker, the present thread. Printed as the change since the dump before it, so every line but the
+// first is that window. *total: the whole process's CPU seconds over the same window (0 on the first dump)
+static void host_cpu_snapshot(char *out, size_t n, int top, double *total) {
+    enum { HMAX = 128 };
+    static struct { int tid; char nm[16]; uint64_t ticks; } prev[HMAX]; static int nprev;
+    static struct { int tid; char nm[16]; uint64_t ticks; } cur[HMAX]; int used[HMAX] = {0};
+    double hz = (double)sysconf(_SC_CLK_TCK); if (hz <= 0) hz = 100;
+    int nc = 0; uint64_t tot = 0;
+    DIR *d = opendir("/proc/self/task");
+    if (d) {
+        struct dirent *e;
+        while (nc < HMAX && (e = readdir(d))) {
+            int tid = atoi(e->d_name); if (tid <= 0) continue;
+            char p[64], b[1024];
+            snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
+            FILE *f = fopen(p, "r"); if (!f) continue;
+            size_t r = fread(b, 1, sizeof b - 1, f); fclose(f); b[r] = 0;
+            char *lp = strchr(b, '('), *rp = strrchr(b, ')'); if (!lp || !rp || rp <= lp) continue;
+            size_t nl = (size_t)(rp - lp - 1); if (nl > 15) nl = 15;
+            snprintf(cur[nc].nm, sizeof cur[nc].nm, "%.*s", (int)nl, lp + 1);
+            unsigned long long ut = 0, st = 0;   // after ") " state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime
+            if (sscanf(rp + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu", &ut, &st) == 2) {
+                cur[nc].tid = tid; cur[nc].ticks = (uint64_t)(ut + st); tot += cur[nc].ticks; nc++;
+            }
+        }
+        closedir(d);
+    }
+    size_t o = 0;
+    for (int k = 0; k < top; k++) {
+        int best = -1;
+        for (int i = 0; i < nc; i++) if (!used[i] && (best < 0 || cur[i].ticks > cur[best].ticks)) best = i;
+        if (best < 0) break;
+        uint64_t was = 0; int had = 0;
+        for (int i = 0; i < nprev; i++) if (prev[i].tid == cur[best].tid) { was = prev[i].ticks; had = 1; break; }
+        used[best] = 1;
+        double sec = (double)(had && cur[best].ticks >= was ? cur[best].ticks - was : cur[best].ticks) / hz;
+        if (o + 40 < n) o += (size_t)snprintf(out + o, n - o, "%s'%s' %.0f ms", k ? ", " : "", cur[best].nm, sec * 1000.0);
+    }
+    if (!o && n) snprintf(out, n, "none");
+    double now_s = (double)tot / hz;
+    if (o + 40 < n) o += (size_t)snprintf(out + o, n - o, "; the process %.0f ms", (now_s - (*total < 0 ? now_s : *total)) * 1000.0);
+    *total = now_s;
+    memcpy(prev, cur, sizeof prev); nprev = nc;
+}
 static void *hitch_main(void *arg) {
     plat_thread_set_name("dm hitch dump");
     const char *e = arg; uint64_t lim = (uint64_t)atoi(e) * 1000000ull, seen = 0, skip = 0; int n = 0;
     if (strchr(e, ':')) skip = (uint64_t)atoi(strchr(e, ':') + 1) * 1000000000ull;
     extern uint64_t g_t0_ns;
-    static hitch_t hs[256];
     while (n < 24) {
         { struct timespec ts = {0, 2000000}; nanosleep(&ts, 0); }
         uint64_t p = atomic_load(&dm_present_ns), now = now_ns();
         if (!p || p == seen || now - p < lim || now - g_t0_ns < skip) continue;
         seen = p; n++;
-        LOG("hitch dump %d: no present for %.1f ms", n, (now - p) / 1e6);
-        int nt = 0;
-        pthread_mutex_lock(&G); for (thr_t *t = g_all; t && nt < 256; t = t->all) if (t->started && !t->exited) hitch_grab(t, &hs[nt++]); pthread_mutex_unlock(&G);
-        for (int k = 0; k < nt; k++) hitch_log(&hs[k]);
+        char why[64]; snprintf(why, sizeof why, "hitch dump %d: no present for %.1f ms", n, (now - p) / 1e6);
+        threads_dump(why);
     }
     return NULL;
+}
+// DM_AUDIO_STALL_DUMP=<n> (diagnostic): hle_audio.c calls this when a playing output underran, at most n times and at least 1 s apart. The dump says whether the game's audio
+// thread was runnable and starved (its state and priority beside the core it wants) or blocked (what it waits on, and its last SVC and call site); the host line says which threads
+// that are not guest threads were on the cores meanwhile. Both are written from the audio watchdog's thread, never from the device callback
+int dm_audio_threads_dump(const char *why) {
+    static int max = -1, n; static uint64_t last;
+    if (max < 0) { const char *e = getenv("DM_AUDIO_STALL_DUMP"); max = e ? atoi(e) : 0; if (max > 0) LOG("DM_AUDIO_STALL_DUMP=%d: the guest threads are logged when an output underruns", max); }
+    if (n >= max) return 0;
+    uint64_t now = now_ns(); if (last && now - last < 1000000000ull) return 0;
+    last = now; n++;
+    char cpu[400]; double tot = -1;
+    host_cpu_snapshot(cpu, sizeof cpu, 5, &tot);
+    char b[560]; snprintf(b, sizeof b, "%s (host threads since the last dump: %s)", why, cpu);
+    threads_dump(b);
+    return 1;
 }
 static void hitch_init(void) {
     const char *e = getenv("DM_HITCH_DUMP"); if (!e || atoi(e) <= 0) return;
