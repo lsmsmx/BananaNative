@@ -338,6 +338,7 @@ uint64_t nvn_sparse_gen(void); uint64_t nvn_sparse_copy(const void *pool, void *
 int nvn_sparse_since(const void *pool, uint64_t a, uint64_t n, uint64_t gen, uint64_t stamp); void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n);
 int nvn_sparse_any(const void *pool, uint64_t a, uint64_t n); int nvn_sparse_mapped(const void *pool, uint64_t a, uint64_t n);
 uint64_t nvn_sparse_phys(const void *pool, uint64_t a, uint64_t n);   // the physical run behind [a, a+n), 0 when its pages are not one run: the tile's shared slot (vka_sparse.c)
+uint64_t vka_frame(void);   // vka_exec.c: the game frame the replay is on (an image's last use, "Idle textures")
 static void upload(vka_img *im, const tex_t *t, VkCommandBuffer cb);
 static uint64_t g_rows_up;   // bytes of partial row re-uploads (upload_rows_tracked)
 
@@ -1770,9 +1771,10 @@ VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int sto
     if (layout) *layout = VK_IMAGE_LAYOUT_GENERAL;
     if (storage || id <= 0 || id >= (1 << 20) || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return id_view(id, cb, dim, storage, NULL);
     vmemo *m = vm_slot(id, dim);
-    if (vm_hit(m, id, dim)) return m->v;
+    if (vm_hit(m, id, dim)) { if (m->im) m->im->last = vka_frame(); return m->v; }   // (a draw binds it: not idle, DM_VK_TEX_EVICT)
     uint32_t gen = atomic_load_explicit(&g_tgen, memory_order_acquire), ver = g_tver ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0;
     vka_img *im = NULL; VkImageView v = id_view(id, cb, dim, 0, &im);
+    if (im) im->last = vka_frame();
     if (v && im && g_tver && !in_fb(im)) *m = (vmemo){id, dim, ver, gen, im, v};
     return v;
 }
@@ -1903,10 +1905,39 @@ VkSampler vka_samp_default(void) {
     return s;
 }
 
+// Idle textures (DM_VK_TEX_EVICT=<frames>, 0 = off): an image whose content guest memory or the page table can supply again — nothing the GPU wrote, no holder (the present,
+// frame generation, a dump), not bound by a draw for that many frames — lets its memory go. Its texture IDs are written again and its mappings dropped, so the next binding
+// makes an image and fills it from the same place (storage through storage_mode, or the page table through upload_sparse). A GPU-written image never qualifies: its content
+// exists nowhere else. This is the memory sparse residency would have given back where the device has none, paid for in re-upload.
+static int evict_after(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_VK_TEX_EVICT"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+static void tex_evict(void) {   // caller holds g_tmu; the map walk runs every 60 frames, not every submission
+    int after = evict_after(); uint64_t f = vka_frame();
+    if (after <= 0 || f < (uint64_t)after) return;
+    static uint64_t ran; if (ran && f - ran < 60) return;
+    ran = f;
+    int n = 0; uint64_t bytes = 0;
+    for (int i = g_nlive - 1; i >= 0; i--) {   // backwards: an image that goes away has the last one moved into its place
+        vka_img *im = g_live[i];
+        if (!im || im->holds || im->gpu_owned || im->zold || im->no_storage) continue;
+        if (f - im->last < (uint64_t)after) continue;
+        redirty_ids(im);   // (its texture IDs resolve again at this submission)
+        unsigned dropped = 0;
+        for (uint32_t k = 0; k < g_mapcap; k++)
+            if (g_map[k].serial && g_map[k].serial != ~0ull && g_map[k].im == im) { map_del(g_map[k].serial); unref_locked(im); dropped++; }
+        if (!dropped) continue;
+        bytes += im->bytes; n++;
+    }
+    if (n) VLOG("idle textures: %d images, %.1f MiB let go (bound by no draw for %d frames, DM_VK_TEX_EVICT)", n, bytes / 1048576.0, after);
+}
 void vka_tex_prepare(VkCommandBuffer cb) {
     bindless_init();
     nvn_pool_use(1);   // the re-uploads below read guest storage: no pool is finalized (and unmapped) under them. Taken before g_tmu, as write_tex does
     pthread_mutex_lock(&g_tmu);
+    tex_evict();
     for (int i = 0; i < g_nredo; i++) {   // CPU writes to textures that already have an image (WriteTexels): from now on they follow their storage
         smap_ent *e = map_get(g_redo[i]); vka_img *im = e ? e->im : NULL;
         if (!im || !im->cpu_dirty) continue;

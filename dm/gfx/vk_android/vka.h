@@ -243,6 +243,7 @@ typedef struct vka_img {
     // pdead: that pool was finalized since (vka_tex.c img_pool_dead): its storage is not read again
     const void *pool; uint64_t pgen, pfin; int pdead;
     uint8_t dcap;            // a sparse texture's dense image whose finer levels DM_VK_SPARSE_DENSE_MB left out (vka_tex.c dense_floor)
+    uint64_t last;           // the frame it was last bound for a draw (vka_tex.c "Idle textures": DM_VK_TEX_EVICT lets it go when it has not been for long)
     struct vka_img *zold;    // the zero-shared image it left while a holder had it (vka_tex.c img_own): destroyed once holds drop to 0
     // Large images (DM_VK_BIGIMG_MB, vka_tex.c "Large images"): draws that bound it for sampling, other textures found over its storage (the first serials)
     uint32_t nsamp, novl; uint64_t ovl[4];

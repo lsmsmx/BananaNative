@@ -147,6 +147,16 @@ The game may also write into an NVN object directly, without an NVN call, throug
 - **Status:** not yet run on the phone (2026-11-08). It only applies where sparse residency images themselves do: the PurpleVK run of 2026-11-08 has none (`missing (degraded): Sparse residency images`, `sparse tile blocks 0 MiB`, every array dense from a coarser level), so the system driver is where to read it. The ctl line's `tiles shared by N places (M MiB saved)` is the measure: with the same physical pages mapped at k places it should read about k places per shared tile, and the block count should stop following the mapped bytes.
 - **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) — the pattern is the one its Metal runs recorded; the phone run is the check.
 
+### Idle textures let their image go (Android)
+
+- **Symptom:** the replay's image memory sits at several GB and does not come down — 2.4 GB to 5.8 GB while Mario Kart World 1.8.0 loads, then flat over 34,912 images — and the run is ended by the low-memory killer once the guest file's working set and those images no longer fit together.
+- **Cause:** every texture object the game holds keeps its `VkImage` for as long as its pool lives, because on the console its texels are only the pool storage the game already allocated. Most of those textures — streamed terrain, liveries, UI atlases — are bound by no draw in any given frame, and their content is in guest memory (or behind a sparse pool's page table): it can be made again byte for byte.
+- **Fix:** `DM_VK_TEX_EVICT=<frames>` (`vka_tex.c` "Idle textures", 0 = off). An image the GPU never wrote (`gpu_owned` clear), that no holder keeps (`holds` clear: the present, frame generation, a dump), whose pool is still live and that no draw has bound for that many frames is let go: `redirty_ids` writes its texture IDs again, its serial mappings are dropped, and the image is destroyed behind the fence the last reference gives it. The next binding makes an image again and fills it from the same place (`storage_mode` from storage, or `upload_sparse` from the page table), so the bytes are the ones it would have had.
+- **Not covered:** render targets and shader images — the GPU's content exists nowhere else, so they keep their memory. On Mario Kart World that is the four 163842 R8 terrain targets (1,365 MiB) and the SPARSE D16 arrays, which only sparse residency would have shrunk, and no Adreno 660 driver has it.
+- **Cost:** the re-upload — deswizzle and the I/O of the storage read again, on the replay thread. The frame count is the dial: a higher one frees less and costs less.
+- **Check:** the `idle textures: N images, X MiB let go` line, and the `[vk] memory:` images figure over a session against the same session with the switch off.
+- **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 (the image set and its growth above). Not yet run with the switch on.
+
 ### Finalized pools kept alive by residency and the sharing table
 
 - **Symptom:** GPU memory grows with every scene change (Engage's idle title demo reached 5.4 GB of GPU memory and 3.6 GB resident in 850 s).
