@@ -444,6 +444,8 @@ static void stats_drain(void) {
     pthread_mutex_unlock(&g_aos_lock);
     for (int i = 0; i < n; i++) stats_log(&reports[i]);
 }
+// DM_AUDIO_STALL_DUMP's dump lives in hle_thread.c (the guest-thread list); the unit tests link this file without it and never dump (as dm_guest_suspend_wait)
+__attribute__((weak)) int dm_audio_threads_dump(const char *why) { (void)why; return 0; }
 static void *au_watchdog(void *p) {
     (void)p;
     char dump[300] = {0};
