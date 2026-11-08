@@ -1450,7 +1450,8 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
         if (!im) {
             vka_tex_prune_locked();
             mode = first_mode(t, &f, cpuw_take(t->serial, 0));
-            g_zwant = mode == ST_ZERO && !(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (t->L.size <= 32ull * 1024 * 1024);
+            // the size cap is vkz_candidate's (DM_VK_ZSHARE_MAX_MB): a second one here stopped the large targets that switch exists for before it was asked
+            g_zwant = mode == ST_ZERO && !(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE);
             im = img_create(t, &f, base);
             g_zwant = 0;
         }
