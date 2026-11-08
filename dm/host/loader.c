@@ -748,7 +748,9 @@ static uint8_t *slurp(const char *path, size_t *n) {
 static int host_has_pac(void) {
 #if defined(__ANDROID__) && defined(__aarch64__)
     static int v = -1;
-    if (v < 0) { unsigned long h = getauxval(AT_HWCAP); v = (h & ((1ul << 20) | (1ul << 21))) != 0; }
+    // HWCAP_PACA is bit 30 (linux/arm64 asm/hwcap.h). NOT bits 20/21: those are HWCAP_ASIMDDP and HWCAP_SHA512, which every Armv8.2 phone
+    // (the Snapdragon 888) has -- a check on them called the one class of host that must be rewritten PAC-capable, and every RETAB then trapped and was emulated one signal at a time.
+    if (v < 0) { unsigned long h = getauxval(AT_HWCAP); v = (h & (1ul << 30)) != 0; }
     return v;
 #else
     return 0;
