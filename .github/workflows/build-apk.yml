@@ -28,6 +28,9 @@ jobs:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/28.2.13676358
+      # 120 s instead of the default 10 s: the runner's route to services.gradle.org
+      # and Maven Central is the flakiest part of this job
+      GRADLE_OPTS: -Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,6 +51,18 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+
+      # The wrapper downloads its Gradle distribution on first use, and that
+      # download is a single request with a 10 s socket timeout: on a bad runner
+      # day it times out and the whole job dies before a line of code runs
+      # ("Downloading gradle-8.14.3-bin.zip failed: timeout (10000ms)").
+      # This action fetches the version the wrapper names itself, caches it
+      # between runs, and the two timeouts below give the network room.
+      - name: Gradle (cached, with the wrapper's version)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          cache-read-only: false
 
       - name: Install SDK packages
         run: |
