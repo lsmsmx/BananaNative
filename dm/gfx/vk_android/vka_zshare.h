@@ -13,9 +13,11 @@ typedef struct { uint8_t key[VKZ_KEY]; uint32_t klen; uint64_t h, size; int refs
 typedef struct { vkz_ent *e; int n, cap; uint64_t made, owned; } vkz_tab;   // made: allocations ever made; owned: images that left their entry for memory of their own (vkz_note_own)
 
 // An image is a candidate when it is dense (no residency image), single-sampled, not 3D, not block-compressed, not linear and not a display (window) texture, and its storage
-// takes at least min_bytes. Whether its content is the GPU's (ST_ZERO) is the caller's: only those are bound to shared memory
-static inline int vkz_candidate(uint64_t storage_bytes, uint64_t min_bytes, int res, uint32_t samples, int is3d, int compressed, int linear_or_display) {
-    return min_bytes && storage_bytes >= min_bytes && storage_bytes <= (32ull * 1024 * 1024) && !res && samples <= 1 && !is3d && !compressed && !linear_or_display;
+// takes between min_bytes and max_bytes. Whether its content is the GPU's (ST_ZERO) is the caller's: only those are bound to shared memory.
+// max_bytes is a switch (DM_VK_ZSHARE_MAX_MB, default 32 MiB), not a rule: the cap was added to stop one game's depth copies from duplicating, and it also turns sharing off
+// for the large never-written colour targets it was made for (Mario Kart World's four 163842 R8 targets, 341 MiB each: about 1 GB of image memory).
+static inline int vkz_candidate(uint64_t storage_bytes, uint64_t min_bytes, uint64_t max_bytes, int res, uint32_t samples, int is3d, int compressed, int linear_or_display) {
+    return min_bytes && max_bytes && storage_bytes >= min_bytes && storage_bytes <= max_bytes && !res && samples <= 1 && !is3d && !compressed && !linear_or_display;
 }
 static inline int vkz_find(const vkz_tab *t, const void *key, uint32_t klen) {
     for (int i = 0; i < t->n; i++) if (t->e[i].klen == klen && !memcmp(t->e[i].key, key, klen)) return i;
