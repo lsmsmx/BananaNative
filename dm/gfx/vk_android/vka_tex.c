@@ -1914,10 +1914,10 @@ static int evict_after(void) {
     if (v < 0) { const char *e = getenv("DM_VK_TEX_EVICT"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0; }
     return v;
 }
-static void tex_evict(void) {   // caller holds g_tmu; the map walk runs every 60 frames, not every submission
+static void tex_evict(void) {   // caller holds g_tmu; the map walk runs every 30 frames, not every submission
     int after = evict_after(); uint64_t f = vka_frame();
     if (after <= 0 || f < (uint64_t)after) return;
-    static uint64_t ran; if (ran && f - ran < 60) return;
+    static uint64_t ran; if (ran && f - ran < 30) return;
     ran = f;
     int n = 0; uint64_t bytes = 0;
     for (int i = g_nlive - 1; i >= 0; i--) {   // backwards: an image that goes away has the last one moved into its place
