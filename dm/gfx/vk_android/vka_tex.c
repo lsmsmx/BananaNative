@@ -2052,6 +2052,9 @@ int vka_tex_id_in_pass(int id) {
 typedef struct { int id; uint8_t dim; uint32_t ver, gen; vka_img *im; VkImageView v; } vmemo;
 static vmemo g_vm[2048]; static struct { int id; uint32_t ver; VkSampler s; } g_sm[512];
 static inline vmemo *vm_slot(int id, uint8_t dim) { return &g_vm[((unsigned)id * 7u + dim) & 2047]; }
+// The memo's answers and, when it had none, why (vka_tex_memo_stats, the pace line): another ID's entry is in the slot / the ID was registered again / the image is the open pass's
+// own attachment (a view of it differs) / a texture mapping or image was dropped since (g_tgen). Counted on the recording thread only
+static _Atomic uint64_t g_vm_hit, g_vm_other, g_vm_ver, g_vm_infb, g_vm_gen;
 static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
     return m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && !in_fb(m->im);
 }
@@ -2061,14 +2064,24 @@ VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int sto
     if (storage || id <= 0 || id >= (1 << 20) || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return id_view(id, cb, dim, storage, NULL);
     vmemo *m = vm_slot(id, dim);
     if (vm_hit(m, id, dim)) {
+        atomic_fetch_add_explicit(&g_vm_hit, 1, memory_order_relaxed);
         if (m->im) { m->im->last_frame = vka_frame(); m->im->last_fence = vka_fence_last(); }
         return m->v;
     }
     uint32_t gen = atomic_load_explicit(&g_tgen, memory_order_acquire), ver = g_tver ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0;
+    if (m->id != id || m->dim != dim) atomic_fetch_add_explicit(&g_vm_other, 1, memory_order_relaxed);
+    else if (m->ver != ver) atomic_fetch_add_explicit(&g_vm_ver, 1, memory_order_relaxed);
+    else if (in_fb(m->im)) atomic_fetch_add_explicit(&g_vm_infb, 1, memory_order_relaxed);
+    else atomic_fetch_add_explicit(&g_vm_gen, 1, memory_order_relaxed);
     vka_img *im = NULL; VkImageView v = id_view(id, cb, dim, 0, &im);
     if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
     if (v && im && g_tver && !in_fb(im)) *m = (vmemo){id, dim, ver, gen, im, v};
     return v;
+}
+void vka_tex_memo_stats(uint64_t *hit, uint64_t *other, uint64_t *ver, uint64_t *infb, uint64_t *gen) {
+    *hit = atomic_load_explicit(&g_vm_hit, memory_order_relaxed); *other = atomic_load_explicit(&g_vm_other, memory_order_relaxed);
+    *ver = atomic_load_explicit(&g_vm_ver, memory_order_relaxed); *infb = atomic_load_explicit(&g_vm_infb, memory_order_relaxed);
+    *gen = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
 }
 int vka_tex_id_pending_rec(int id, uint8_t dim) {   // 0 at once when the memo holds the ID (its image was made)
     if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1) && vm_hit(vm_slot(id, dim), id, dim)) return 0;

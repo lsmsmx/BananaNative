@@ -1047,7 +1047,7 @@ VkImageView placeholder(uint8_t dim, int storage) {
 
 // Where a draw's CPU time goes: the virtual counter at each phase boundary of vka_draw, in the draws timed (every draw with DM_VK_PROF=1, logged with the replay statistics;
 // else one in DM_VK_PACE_PROF for the pace line). Cumulative; each reader keeps its own last reading. g_pt_n: draws timed, g_pt_tot: their whole time
-static uint64_t g_pt_last, g_pt[9], g_ps[6], g_pt_n, g_pt_tot; static int g_pt_ph;
+static uint64_t g_pt_last, g_pt[9], g_ps[8], g_pt_n, g_pt_tot; static int g_pt_ph;
 static inline uint64_t cntvct(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
 // ---------- Set 0 from the walk ----------
 typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint64_t ad[512]; uint32_t n; } writes_t;   // ad: a guest buffer's address (0 = other)
@@ -1113,10 +1113,13 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             break; }
         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; uint64_t ti_ = g_prof ? cntvct() : 0;
+            uint64_t tw_ = 0, tv_ = 0;   // how much of an image descriptor is the ID's lookup into a view (g_ps[6]) and how much everything after it (g_ps[7])
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
+                tw_ = g_prof && tid ? cntvct() : 0;
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
+                if (tw_) { tv_ = cntvct() - tw_; g_ps[6] += tv_; }
                 if (tid && v) class_note(sh, st, &r[i], tid, storage);
                 if (tid) tex_peek(sh->key, st, &r[i], v, storage);
                 // A 2D texture in a 3D or cube slot: what the game leaves bound where a shader's branch does not sample (DKB's materials keep a 1x1 2D texture in their volume slot 12).
@@ -1135,7 +1138,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                 if (!s) s = vka_samp_default();
             }
             *ii = (VkDescriptorImageInfo){s, v, lay};
-            w->pImageInfo = ii; if (g_prof) { g_ps[4] += cntvct() - ti_; g_ps[5]++; }
+            w->pImageInfo = ii; if (g_prof) { uint64_t tt_ = cntvct() - ti_; g_ps[4] += tt_; g_ps[5]++; if (tw_) g_ps[7] += tt_ - tv_; }
             break; }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
             if (r[i].what != VKA_R_NULL) VRED_ONCE("texel buffers are not on Vulkan yet (shader %016llx binding %u): bound as null", (unsigned long long)sh->key, r[i].binding);
@@ -1661,11 +1664,11 @@ static int inst_ib(const p_draw_idx *di, VkBuffer *ib, VkDeviceSize *io, VkIndex
     if (*it == VK_INDEX_TYPE_UINT8 && !V.idx8) return 0;
     return di->count > 0 && vka_addr(di->ibuf, isz * (uint64_t)di->count, ib, io, NULL) && !(*io % isz);
 }
-typedef struct { uint64_t pt[9], ps[6], n, tot; } dprof;
+typedef struct { uint64_t pt[9], ps[8], n, tot; } dprof;
 static void dprof_take(dprof *last, dprof *d) {   // the timed draws since the reader's last reading
     dprof c; memcpy(c.pt, g_pt, sizeof c.pt); memcpy(c.ps, g_ps, sizeof c.ps); c.n = g_pt_n; c.tot = g_pt_tot;
     for (int i = 0; i < 9; i++) d->pt[i] = c.pt[i] - last->pt[i];
-    for (int i = 0; i < 6; i++) d->ps[i] = c.ps[i] - last->ps[i];
+    for (int i = 0; i < 8; i++) d->ps[i] = c.ps[i] - last->ps[i];
     d->n = c.n - last->n; d->tot = c.tot - last->tot; *last = c;
 }
 static double tick_us(void) { uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); return 1e6 / (double)f; }
@@ -1678,7 +1681,8 @@ void vka_draw_prof(char *b, size_t n, double draws) {
     size_t o = 0; for (int i = 0; i < 8 && o < n; i++) o += snprintf(b + o, n - o, "%s%s %.2f", i ? ", " : "", nm[i], d.pt[i] * us);
     if (o < n) o += snprintf(b + o, n - o, "; pushes %.0f%% skipped as the last one", g_pd_skip + g_pd_push ? 100.0 * g_pd_skip / (double)(g_pd_skip + g_pd_push) : 0.0);
     g_pd_skip = g_pd_push = 0;
-    if (o < n) o += snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (driver segments %.2f, %.1f images %.2f), push %.2f", d.ps[0] * us, d.ps[1] * us, d.ps[3] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[2] * us);
+    if (o < n) o += snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (driver segments %.2f, %.1f images %.2f: view %.2f, rest %.2f), push %.2f",
+                             d.ps[0] * us, d.ps[1] * us, d.ps[3] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[6] * us, d.ps[7] * us, d.ps[2] * us);
     if (g_inst_on && o < n) o += snprintf(b + o, n - o, "; instanced runs %llu (%.1f draws joined each, %.0f%% of them without the walk), %llu fell back to single draws",
                                           (unsigned long long)g_inst_runs, g_inst_runs ? (double)g_inst_joined / (double)g_inst_runs : 0.0,
                                           g_inst_joined ? 100.0 * (double)g_inst_fast / (double)g_inst_joined : 0.0, (unsigned long long)g_inst_falls);
@@ -1688,6 +1692,7 @@ void vka_draw_prof(char *b, size_t n, double draws) {
 // *draw_us: the mean whole time of a draw (0: none timed)
 void vka_draw_pace(char *b, size_t n, double *draw_us) {
     static dprof last; static uint64_t vk0, vb0, vk1, vb1, dh0, dm0, ds0, sh0, st0;
+    static uint64_t mh0, mo0, mv0, mi0, mg0;   // the view memo's counters at the last line
     dprof d; dprof_take(&last, &d);
     uint64_t vk = g_vin_kept - vk0, vb = g_vin_built - vb0, bk = g_vb_kept - vk1, bb = g_vb_bound - vb1, dh = g_dm_hit - dh0, dm = g_dm_miss - dm0, ds = g_dm_stamp - ds0;
     uint64_t sh = g_sm_hit - sh0, st = g_sm_try - st0;
@@ -1698,7 +1703,17 @@ void vka_draw_pace(char *b, size_t n, double *draw_us) {
         double us = tick_us() / (double)d.n; *draw_us = d.tot * us;
         o += (size_t)snprintf(b + o, n - o, "draw path %.2f us a draw (1 in %d timed:", d.tot * us, g_prof_all ? 1 : g_prof_every);
         for (int i = 0; i < 8 && o < n; i++) o += (size_t)snprintf(b + o, n - o, " %s %.2f%s", g_pt_nm[i], d.pt[i] * us, i < 7 ? "," : "");
-        if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f, driver segments %.2f), push %.2f)", d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[3] * us, d.ps[2] * us);
+        if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f: view %.2f, rest %.2f; driver segments %.2f), push %.2f)",
+                                      d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[6] * us, d.ps[7] * us, d.ps[3] * us, d.ps[2] * us);
+    }
+    {   // the view memo's own hits and misses (vka_tex.c vka_tex_memo_stats): which of its four reasons a lookup was not answered from it
+        uint64_t h, other, ver, infb, gen2; vka_tex_memo_stats(&h, &other, &ver, &infb, &gen2);
+        uint64_t dh2 = h - mh0, dot = other - mo0, dv = ver - mv0, di = infb - mi0, dg = gen2 - mg0;
+        mh0 = h; mo0 = other; mv0 = ver; mi0 = infb; mg0 = gen2;
+        uint64_t tot = dh2 + dot + dv + di + dg;
+        if (o < n && tot) o += (size_t)snprintf(b + o, n - o, "%sview memo answered %.0f %% of %llu lookups: another ID in the slot %.0f, the ID re-registered %.0f, a pass's own target %.0f, a texture dropped %.0f",
+                                               o ? "; " : "", 100.0 * (double)dh2 / (double)tot, (unsigned long long)tot, 100.0 * (double)dot / (double)tot, 100.0 * (double)dv / (double)tot,
+                                               100.0 * (double)di / (double)tot, 100.0 * (double)dg / (double)tot);
     }
     if (o < n) o += (size_t)snprintf(b + o, n - o, "%sset 0 writes kept %.0f %% of the draws that could (DM_VK_SETS_MEMO)",
                                       o ? "; " : "", st ? 100.0 * (double)sh / (double)st : 0.0);
