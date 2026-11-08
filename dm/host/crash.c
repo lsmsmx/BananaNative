@@ -135,6 +135,47 @@ static struct sigaction crash_prev[NSIG];   // the handlers before ours (crash_i
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
+    // Armv9 pointer authentication on a host that has none. Switch 2 modules
+    // ("Ounce") are built with the B key: PACIBSP in every prologue, RETAB in
+    // every epilogue (main: 117,937 PACIBSP / 92,182 RETAB). On a core without
+    // FEAT_PAuth (Armv8.2 — Cortex-A78/X1 and older, so Snapdragon 888) the
+    // HINT forms decode as NOP, so the return address is never signed; but
+    // RETAA/RETAB are not hints — they are UNDEFINED there and raise SIGILL —
+    // and the register D/I forms fault the same way. Emulate what a core
+    // without PAC does: a return branches to the (unsigned) x30, and a
+    // sign/strip is a NOP. Hosts that implement PAC never reach this.
+    if (sig == SIGILL) {
+        uint32_t insn = 0;
+        if (!plat_mem_read(PLAT_UC_PC(uc), &insn, sizeof insn)) {
+            if (insn == 0xD65F0FFFu || insn == 0xD65F0BFFu) {          // RETAB / RETAA (fallback: loader.c rewrites these to RET)
+                PLAT_UC_PC(uc) = PLAT_UC_LR(uc);
+                return;
+            }
+            if ((insn & 0xFFC0FC00u) == 0x9AC03000u) {                 // PACGA Xd, Xn, Xm
+                // Generic-key PAC. NintendoSDK hashes the register file with it
+                // (sdk: 58 sites; the digest is stored and later recomputed).
+                // The G key is random per boot and the guest never sees it, so no
+                // code can compare a result against a constant -- a deterministic
+                // stand-in keeps every in-run use identical. The real layout has
+                // the code in the upper 32 bits and zero below, which is what the
+                // callers' "lsr #32" expects.
+                const uint32_t rd = insn & 0x1Fu, rn = (insn >> 5) & 0x1Fu, rm = (insn >> 16) & 0x1Fu;
+                const uint64_t a = rn == 31 ? 0 : PLAT_UC_X(uc, rn);
+                const uint64_t b = rm == 31 ? 0 : PLAT_UC_X(uc, rm);
+                uint64_t h = a ^ (b * 0x9E3779B97F4A7C15ull);
+                h ^= h >> 33; h *= 0xC2B2AE3D27D4EB4Full; h ^= h >> 29;
+                if (rd != 31) PLAT_UC_X(uc, rd) = (h & 0xFFFFFFFFull) << 32;
+                PLAT_UC_PC(uc) += 4;
+                return;
+            }
+            switch (insn & 0xFFFFFC00u) {                              // PACIA/IB/DA/DB, AUTIA/IB/DA/DB
+            case 0xDAC10000u: case 0xDAC10400u: case 0xDAC10800u: case 0xDAC10C00u:
+            case 0xDAC11000u: case 0xDAC11400u: case 0xDAC11800u: case 0xDAC11C00u:
+                PLAT_UC_PC(uc) += 4;
+                return;
+            }
+        }
+    }
     if (sig == SIGSEGV || sig == SIGBUS) {
         int is_write = (int)((PLAT_UC_ESR(uc) >> 6) & 1);   // The WnR bit of ESR
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
