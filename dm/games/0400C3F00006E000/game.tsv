@@ -37,6 +37,11 @@ mem_alias	0x100000000
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x4000000
+# mem_map_limit (hle_svc.c): a MapPhysicalMemory that would take the process past the pool fails with ResultLimitReached, so the SDK unmaps the block nninitStartup's probe left
+# cached instead of keeping it mapped beside the game's own use, and the used memory GetInfo reports counts the pages mapped, as on Horizon. mkw-neo's 8 GB MacBook Neo run of this
+# game: the guest asks ~9.4 GB, and refusing the maps past the pool held its footprint at 3.7-4.0 GB, flat. Without it the probe's block stays mapped and the touched set runs past
+# the pool (this phone: 8.3 GB of guest file against a 9 GB pool)
+mem_map_limit	on
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
