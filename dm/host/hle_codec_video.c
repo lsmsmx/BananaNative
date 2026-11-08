@@ -19,6 +19,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_yuv.h"
