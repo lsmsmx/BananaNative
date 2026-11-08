@@ -4,6 +4,7 @@
 #include "dm.h"
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/auxv.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <limits.h>
@@ -741,7 +742,23 @@ static uint8_t *slurp(const char *path, size_t *n) {
 // valid. The cold PAC instructions stay in crash.c's SIGILL path -- the register
 // forms as NOPs, PACGA computed, since it produces a value and has no
 // single-instruction stand-in.
+// Does this host's own CPU have pointer authentication? An Armv8.2 phone (Snapdragon 865/870/888, every Cortex-A7x) does not: the modules' PAC returns are UNDEFINED there and
+// SIGILL, and loader.c rewrites them. An Armv9 phone (8 Elite, the S25 that reported this) does: it executes them itself, for code that also SIGNS with them, and pulling the
+// returns out broke that host. AT_HWCAP's PACA / PACG say which (linux/arm64 asm/hwcap.h).
+static int host_has_pac(void) {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    static int v = -1;
+    if (v < 0) { unsigned long h = getauxval(AT_HWCAP); v = (h & ((1ul << 20) | (1ul << 21))) != 0; }
+    return v;
+#else
+    return 0;
+#endif
+}
 static void pac_patch_text(module_t *m) {
+    if (host_has_pac()) {
+        static int once; if (!once) { once = 1; LOG("the host CPU has pointer authentication: the modules' PAC returns are left as they are"); }
+        return;
+    }
     uint32_t *w = (uint32_t *)m->base;
     const size_t n = (size_t)(m->text_end / 4);
     size_t cnt = 0;
