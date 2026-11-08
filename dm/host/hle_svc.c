@@ -11,7 +11,11 @@
 #include <sys/uio.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>   // statfs / fstatfs; macOS has no sys/vfs.h
+#else
 #include <sys/vfs.h>
+#endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
@@ -71,6 +75,8 @@ static void *regions_thread(void *arg);
 static int g_gf_tab[GF_MAX];     // the files, open for reading and writing
 static int g_gf_n;               // how many; 0 while the guest is anonymous
 static uint64_t g_gf_min_free;   // free disk under which the game is stopped; 0 = never
+static size_t g_gf_chunk;        // each file's size (guest_files_map): MADV_REMOVE must not cross a file's end
+static uint64_t g_gf_dirty_push; // push writeback while /proc/meminfo's Dirty is above this; 0 = never
 int dm_guest_file_backed(void) { return g_gf_n > 0; }   // guest_release and the graphics gate ask this
 
 // A size switch: bytes (decimal or 0x hex), or whole K / M / G (DM_GUEST_FILE_CHUNK=1G); 0 when unset
@@ -82,12 +88,16 @@ static size_t env_size(const char *name, size_t min, size_t align) {
         die("%s=%s: at least %zu MB, in whole %zu KB units (bytes, or whole K / M / G)", name, s, min >> 20, align >> 10);
     return (size_t)(v << sh);
 }
-static uint64_t mem_available_bytes(void) {   // /proc/meminfo MemAvailable: what the kernel thinks it can hand out
+static uint64_t meminfo_bytes(const char *field) {   // /proc/meminfo, e.g. "MemAvailable:" or "Dirty:", in bytes
     FILE *f = fopen("/proc/meminfo", "r"); if (!f) return 0;
-    char line[256]; uint64_t out = 0;
-    while (fgets(line, sizeof line, f)) { unsigned long long v = 0; if (!strncmp(line, "MemAvailable:", 13) && sscanf(line + 13, "%llu", &v) == 1) { out = v << 10; break; } }
+    const size_t n = strlen(field); char line[256]; uint64_t out = 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long v = 0;
+        if (!strncmp(line, field, n) && sscanf(line + n, "%llu", &v) == 1) { out = (uint64_t)v << 10; break; }
+    }
     fclose(f); return out;
 }
+static uint64_t mem_available_bytes(void) { return meminfo_bytes("MemAvailable:"); }
 static uint64_t proc_rss_bytes(void) {   // /proc/self/statm resident pages
     FILE *f = fopen("/proc/self/statm", "r"); if (!f) return 0;
     unsigned long sz = 0, res = 0; int ok = fscanf(f, "%lu %lu", &sz, &res) == 2; fclose(f);
@@ -135,9 +145,19 @@ static void *guest_file_thread(void *arg) {   // the free space, and every 10 s 
             LOG("[RED] [mem] guest file: %.1f GB free on its disk, under %.1f: stopping the game", avail, g_gf_min_free / G);
             _exit(87);   // a full disk leaves the kernel no room to write the guest's pages out
         }
+        // Keep the dirty set small: a file page is free to reclaim once it is clean and cannot be reclaimed while it is
+        // dirty. The game dirties the guest's memory far faster than the storage absorbs it, so without this the
+        // writeback falls behind and reclaim stalls -- and Android then kills the app on pressure, not on the guest's
+        // own working set. Async, and only above the threshold, so it never becomes a write amplifier of its own.
+#ifdef SYNC_FILE_RANGE_WRITE
+        uint64_t dirty = meminfo_bytes("Dirty:");
+        if (g_gf_dirty_push && dirty > g_gf_dirty_push)
+            for (int i = 0; i < g_gf_n; i++) sync_file_range(g_gf_tab[i], 0, 0, SYNC_FILE_RANGE_WRITE);
+#endif
         if (sec % 10) continue;
         uint64_t held = 0; for (int i = 0; i < g_gf_n; i++) { struct stat st; if (!fstat(g_gf_tab[i], &st)) held += (uint64_t)st.st_blocks * 512; }
-        LOG("%s[mem] guest file: %.2f GB on disk; process RSS %.2f GB; %.1f GB free on its disk", avail >= 0 && avail < 2 ? "[RED] " : "", held / G, proc_rss_bytes() / G, avail);
+        LOG("%s[mem] guest file: %.2f GB on disk; process RSS %.2f GB; dirty %.2f GB; %.1f GB free on its disk",
+            avail >= 0 && avail < 2 ? "[RED] " : "", held / G, proc_rss_bytes() / G, meminfo_bytes("Dirty:") / G, avail);
     }
     return NULL;
 }
@@ -152,6 +172,9 @@ static void guest_file_init(void) {
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)5 << 30;
     size_t chunk = env_size("DM_GUEST_FILE_CHUNK", (size_t)64 << 20, 0x100000); if (!chunk) chunk = (size_t)1 << 30;
     if ((g_reserve + chunk - 1) / chunk > GF_MAX) chunk = ((g_reserve + GF_MAX - 1) / GF_MAX + 0xfffff) & ~(size_t)0xfffff;
+    g_gf_chunk = chunk;
+    const char *dp = getenv("DM_GUEST_FILE_DIRTY_MB");   // push writeback above this much dirty: 512 MB, DM_GUEST_FILE_DIRTY_MB=0 never
+    g_gf_dirty_push = dp && *dp ? (uint64_t)strtoull(dp, NULL, 0) << 20 : (uint64_t)512 << 20;
     int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400]; struct statfs fs;
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);
     else { const char *t = getenv("TMPDIR"); if (t && *t) snprintf(dir, sizeof dir, "%s", t); }   // Android sets TMPDIR to the app's cache
@@ -378,13 +401,25 @@ static void maps_red(const char *what, uintptr_t a, size_t n, int err) {
 }
 static int guest_release(uintptr_t lo, uintptr_t hi) {
     if (dm_gfx_guest_release(lo, hi)) return 1;
-    // File-backed guest memory (DM_GUEST_FILE): the pages are the file's, so mprotect alone leaves the kernel free to
-    // write them out; a fresh anonymous mapping would charge them to the process again, which this mode exists to avoid.
-    // The bytes stay, so this reports 0 (not zeroed): SetHeapSize and alias_initialize zero what they open again.
-    // A PROT_NONE the kernel refuses (ENOMEM: a fragmented map table) leaves the range as it was, and says so, rather than ending the session.
+    // File-backed guest memory (DM_GUEST_FILE): the pages are the file's. Hole-punch them so the kernel drops them at
+    // once with no writeback, and they read zero afterwards -- exactly what the anonymous path leaves, so the callers
+    // that reopen a range (SetHeapSize, alias_initialize) see what they expect. Where the filesystem cannot punch holes
+    // this falls back to PROT_NONE and keeps the bytes, which those callers zero themselves (reported as "not zeroed").
+    // A PROT_NONE the kernel refuses (ENOMEM: a fragmented map table) leaves the range as it was, and says so.
     if (dm_guest_file_backed()) {
-        if (mprotect((void *)lo, hi - lo, PROT_NONE)) maps_red("guest_release mprotect (file-backed)", lo, hi - lo, errno);
-        return 0;
+        const size_t span = (size_t)(hi - lo); size_t done = 0; int punched = 1;
+#ifdef MADV_REMOVE
+        for (; done < span; ) {   // one file per chunk (guest_files_map): a range must not cross a file's end
+            uint8_t *a = (uint8_t *)lo + done; size_t n = span - done;
+            if (g_gf_chunk) { const size_t off = (size_t)(a - g_as) % g_gf_chunk; if (n > g_gf_chunk - off) n = g_gf_chunk - off; }
+            if (madvise(a, n, MADV_REMOVE)) { punched = 0; break; }
+            done += n;
+        }
+#else
+        (void)done; punched = 0;   // no hole punching here (Apple): keep the bytes, the reopening callers zero them
+#endif
+        if (mprotect((void *)lo, span, PROT_NONE)) maps_red("guest_release mprotect (file-backed)", lo, span, errno);
+        return punched;
     }
     if (mmap((void *)lo, hi - lo, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != MAP_FAILED) { plat_mem_name_guest((void *)lo, hi - lo); return 1; }   // (named: it merges with its neighbours again)
     int err = errno;
