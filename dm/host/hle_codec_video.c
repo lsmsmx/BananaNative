@@ -58,6 +58,8 @@ static cv_dec *g_cv[16];
 static int g_cv_dec_seq;
 static pthread_mutex_t g_cv_mu = PTHREAD_MUTEX_INITIALIZER;   // lock order: g_cv_mu, then a decoder's mu, then g_spt_mu
 static cv_pool *g_active_pools[64];
+static _Atomic uint32_t g_pool_gen;   // moved when a video pool joins or leaves the active set (dm_codec_pool_gen): the replay asks whether an image's storage is one
+                                      // of theirs once per generation, not once per image per submission (vka_tex_prepare)
 static pthread_mutex_t g_active_pools_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static cv_dec *cv_of(void *t) { cv_dec *d = t ? *(cv_dec **)t : NULL; return d && d->magic == CV_MAGIC ? d : NULL; }
@@ -155,6 +157,7 @@ static Result cv_pool_init(void *t, void *mem, uint64_t size, const cv_pref *p, 
     for (int i = 0; i < 64; i++) {
         if (!g_active_pools[i]) { g_active_pools[i] = o; break; }
     }
+    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     pthread_mutex_unlock(&g_active_pools_mu);
     LOG("[codec] pool registered: mem=%p size=%#llx w=%u h=%u count=%u", mem, (unsigned long long)size, p->w, p->h, o->count);
     static int once; if (!once++) LOG("[codec] image pool %ux%u format %u, tiling or mode %u, %u picture(s): the host keeps the decoded pictures", p->w, p->h, p->fmt, p->mode, o->count);
@@ -170,6 +173,7 @@ HLE_FORCE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTy
     for (int i = 0; i < 64; i++) {
         if (g_active_pools[i] == p) { g_active_pools[i] = NULL; break; }
     }
+    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
     pthread_mutex_unlock(&g_active_pools_mu);
     pthread_mutex_lock(&g_cv_mu);   // a decoder still holding a buffer of this pool keeps it, with no pool to write its picture into
     for (int k = 0; k < 16; k++) if (g_cv[k]) { pthread_mutex_lock(&g_cv[k]->mu); for (int i = 0; i < CV_BUFS; i++) if (g_cv[k]->buf[i].pool == p) g_cv[k]->buf[i].pool = NULL; pthread_mutex_unlock(&g_cv[k]->mu); }
@@ -228,6 +232,9 @@ int dm_native_image(uint32_t handle, uint8_t **mem, uint64_t *size, uint32_t *w,
     pthread_mutex_unlock(&g_cv_mu);
     return ok;
 }
+// The video pool set's generation (hle_codec_video.c): vka_tex_prepare asks an image whether its storage is a decoder pool's once per generation, not for every image of
+// every submission -- each ask is a lock and a 64-slot scan, and on the phone the sweep over ~6000 images cost about 6 ms a frame
+uint32_t dm_codec_pool_gen(void) { return atomic_load_explicit(&g_pool_gen, memory_order_acquire); }
 int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) {
     (void)size;
     if (!mem) return 0;

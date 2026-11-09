@@ -23,6 +23,7 @@
 
 __attribute__((weak)) int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) { (void)mem; (void)size; (void)stride; return 0; }
 __attribute__((weak)) uint64_t dm_codec_video_gen(const void *mem) { (void)mem; return 0; }
+__attribute__((weak)) uint32_t dm_codec_pool_gen(void) { return 1; }   // 1, not 0: an image's vchk starts 0, so a build without hle_codec_video.c asks once and never again
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }
 uint64_t vka_frame(void);
 
@@ -2405,10 +2406,15 @@ void vka_tex_prepare(VkCommandBuffer cb) {
     // Tracked images whose pages the CPU wrote since their last upload (a write to a protected page moves the dirty clock, so nothing is scanned while it stands still)
     // Sparse pools' textures also when a mapping request came since (the page table's generation moved)
     static uint64_t seen, vseen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen();
+    // Whether an image's storage belongs to a video decoder's pool is asked once per pool-set change (dm_codec_pool_gen), not of every image of every submission: each ask
+    // is a lock and a 64-slot scan, and this pass over ~6000 images measured about 6 ms a frame (the pace line's texture prepare "rest")
+    uint32_t pgen = dm_codec_pool_gen();
     int vid_new = 0;
     for (int i = 0; i < g_nlive; i++) {
         vka_img *im = g_live[i];
-        if (im && im->mem && (im->is_video || dm_codec_is_video_mem(im->mem, im->L.size, NULL))) {
+        if (!im || !im->mem || im->vchk == pgen) continue;
+        im->vchk = pgen;
+        if (dm_codec_is_video_mem(im->mem, im->L.size, NULL)) {
             uint64_t vg = dm_codec_video_gen(im->mem);
             if (vg != im->vgen) { vid_new = 1; break; }
         }
@@ -2418,8 +2424,9 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         for (int i = 0; i < g_nlive; i++) {
             vka_img *im = g_live[i];
             if (img_pool_dead(im)) continue;
-            if (!im->is_video && im->mem) {
+            if (!im->is_video && im->mem && im->vchk != pgen) {
                 uint32_t vs = 0;
+                im->vchk = pgen;
                 if (dm_codec_is_video_mem(im->mem, im->L.size, &vs)) {
                     im->is_video = 1;
                     im->d.flags |= NVN_TEXTURE_FLAGS_LINEAR;

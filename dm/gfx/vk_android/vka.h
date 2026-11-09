@@ -250,6 +250,9 @@ typedef struct vka_img {
     struct vka_img *zold;    // the zero-shared image it left while a holder had it (vka_tex.c img_own): destroyed once holds drop to 0
     // Large images (DM_VK_BIGIMG_MB, vka_tex.c "Large images"): draws that bound it for sampling, other textures found over its storage (the first serials)
     uint32_t nsamp, novl; uint64_t ovl[4];
+    // The video decoder pools' generation at which this image was last asked whether its storage is one of theirs (dm_codec_is_video_mem, a lock and a 64-slot scan), so
+    // the question is asked once per pool-set change and not for every image of every submission (vka_tex_prepare; measured at ~6 ms a frame on the phone)
+    uint32_t vchk;
 } vka_img;
 // Texture level lv as a level of im (a sparse texture's image starts at level im->base): 0 when the image does not hold it
 static inline int vka_img_lv(const vka_img *im, uint32_t *lv) { if (*lv < im->base) return 0; *lv -= im->base; return *lv < im->levels; }
