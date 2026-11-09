@@ -2050,10 +2050,14 @@ int vka_tex_id_in_pass(int id) {
     return r;
 }
 typedef struct { int id; uint8_t dim; uint32_t ver, gen; vka_img *im; VkImageView v; } vmemo;
-static vmemo g_vm[2048]; static struct { int id; uint32_t ver; VkSampler s; } g_sm[512];
-static inline vmemo *vm_slot(int id, uint8_t dim) { return &g_vm[((unsigned)id * 7u + dim) & 2047]; }
-// The memo's answers and, when it had none, why (vka_tex_memo_stats, the pace line): another ID's entry is in the slot / the ID was registered again / the image is the open pass's
-// own attachment (a view of it differs) / a texture mapping or image was dropped since (g_tgen). Counted on the recording thread only
+// Four ways per set: the hindex ((id * 7 + dim) & 2047: 7 is invertible mod 2048, so two IDs meet only 2048 apart) put every ID of the game's live ones in one of ~3 piles per
+// slot -- a direct-mapped entry was evicted by the next ID of its band, and the memo missed for the whole game's work rather than for its own (Mario Kart World: 6210 live
+// images). Empty ways are filled first, then the set's oldest is replaced in turn
+enum { VM_SETS = 2048, VM_WAYS = 4 };
+static vmemo g_vm[VM_SETS * VM_WAYS]; static uint8_t g_vm_next[VM_SETS]; static struct { int id; uint32_t ver; VkSampler s; } g_sm[512];
+static inline vmemo *vm_set(int id, uint8_t dim) { return &g_vm[(size_t)(((unsigned)id * 7u + dim) & (VM_SETS - 1)) * VM_WAYS]; }
+// The memo's answers and, when it had none, why (vka_tex_memo_stats, the pace line): no way holds the ID at all / the ID was registered again / the image is the open
+// pass's own attachment (a view of it differs) / a texture mapping or image was dropped since (g_tgen). Counted on the recording thread only
 static _Atomic uint64_t g_vm_hit, g_vm_other, g_vm_ver, g_vm_infb, g_vm_gen;
 static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
     return m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && !in_fb(m->im);
@@ -2062,20 +2066,32 @@ static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout) {
     if (layout) *layout = VK_IMAGE_LAYOUT_GENERAL;
     if (storage || id <= 0 || id >= (1 << 20) || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return id_view(id, cb, dim, storage, NULL);
-    vmemo *m = vm_slot(id, dim);
-    if (vm_hit(m, id, dim)) {
+    vmemo *s = vm_set(id, dim);
+    for (int w = 0; w < VM_WAYS; w++) if (vm_hit(&s[w], id, dim)) {
         atomic_fetch_add_explicit(&g_vm_hit, 1, memory_order_relaxed);
-        if (m->im) { m->im->last_frame = vka_frame(); m->im->last_fence = vka_fence_last(); }
-        return m->v;
+        if (s[w].im) { s[w].im->last_frame = vka_frame(); s[w].im->last_fence = vka_fence_last(); }
+        return s[w].v;
     }
     uint32_t gen = atomic_load_explicit(&g_tgen, memory_order_acquire), ver = g_tver ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0;
-    if (m->id != id || m->dim != dim) atomic_fetch_add_explicit(&g_vm_other, 1, memory_order_relaxed);
-    else if (m->ver != ver) atomic_fetch_add_explicit(&g_vm_ver, 1, memory_order_relaxed);
-    else if (in_fb(m->im)) atomic_fetch_add_explicit(&g_vm_infb, 1, memory_order_relaxed);
-    else atomic_fetch_add_explicit(&g_vm_gen, 1, memory_order_relaxed);
+    {   // why: a way of the set for this ID but for another reason, else none is (the set holds other IDs)
+        int why = 0;
+        for (int w = 0; w < VM_WAYS; w++) if (s[w].id == id && s[w].dim == dim) {
+            why = s[w].ver != ver ? 1 : in_fb(s[w].im) ? 2 : 3; break;
+        }
+        if (why == 0) atomic_fetch_add_explicit(&g_vm_other, 1, memory_order_relaxed);
+        else if (why == 1) atomic_fetch_add_explicit(&g_vm_ver, 1, memory_order_relaxed);
+        else if (why == 2) atomic_fetch_add_explicit(&g_vm_infb, 1, memory_order_relaxed);
+        else atomic_fetch_add_explicit(&g_vm_gen, 1, memory_order_relaxed);
+    }
     vka_img *im = NULL; VkImageView v = id_view(id, cb, dim, 0, &im);
     if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
-    if (v && im && g_tver && !in_fb(im)) *m = (vmemo){id, dim, ver, gen, im, v};
+    if (v && im && g_tver && !in_fb(im)) {
+        uint32_t set = ((unsigned)id * 7u + dim) & (VM_SETS - 1);
+        int w = -1;
+        for (int i = 0; i < VM_WAYS && w < 0; i++) if (!s[i].v || (s[i].id == id && s[i].dim == dim)) w = i;
+        if (w < 0) w = g_vm_next[set]++ & (VM_WAYS - 1);
+        s[w] = (vmemo){id, dim, ver, gen, im, v};
+    }
     return v;
 }
 void vka_tex_memo_stats(uint64_t *hit, uint64_t *other, uint64_t *ver, uint64_t *infb, uint64_t *gen) {
@@ -2084,7 +2100,10 @@ void vka_tex_memo_stats(uint64_t *hit, uint64_t *other, uint64_t *ver, uint64_t 
     *gen = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
 }
 int vka_tex_id_pending_rec(int id, uint8_t dim) {   // 0 at once when the memo holds the ID (its image was made)
-    if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1) && vm_hit(vm_slot(id, dim), id, dim)) return 0;
+    if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1)) {
+        const vmemo *s = vm_set(id, dim);
+        for (int w = 0; w < VM_WAYS; w++) if (vm_hit(&s[w], id, dim)) return 0;
+    }
     return vka_tex_id_pending(id);
 }
 VkSampler vka_samp_id_rec(int id) {
