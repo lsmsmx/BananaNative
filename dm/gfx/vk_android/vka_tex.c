@@ -2170,13 +2170,20 @@ int vka_tex_id_class(int id) {
 }
 // vka_tex_id_class for the recording thread: a memo by ID, valid while the ID was not registered again (its version: the class is its registration's format); the draws ask it for each texture they bind (vka_draw.c tex_masks, img_retype)
 int vka_tex_id_class_rec(int id) {
-    static struct { int id; uint32_t ver; int cls; } m[2048];
+    // Four ways: the same direct map the view and sampler memos had, with the same pile-up (every ID 2048 apart in one entry, ~6210 live IDs on Mario Kart World). This one
+    // is asked once per image record of every draw (tex_masks), and a miss takes the texture table's lock, so a collision here is a mutex on the frame path
+    enum { CL_SETS = 2048, CL_WAYS = 4 };
+    static struct { int id; uint32_t ver; int cls; } m[CL_SETS * CL_WAYS]; static uint8_t next[CL_SETS];
     if (id <= 0 || id >= (1 << 20) || !g_tver) return vka_tex_id_class(id);
     uint32_t ver = atomic_load_explicit(&g_tver[id], memory_order_acquire);
-    typeof(m[0]) *e = &m[(unsigned)id & 2047];
-    if (e->id == id && e->ver == ver) return e->cls;
+    uint32_t set = (uint32_t)((unsigned)id & (CL_SETS - 1));
+    typeof(m[0]) *s = &m[(size_t)set * CL_WAYS];
+    for (int w = 0; w < CL_WAYS; w++) if (s[w].id == id && s[w].ver == ver) return s[w].cls;
     int c = vka_tex_id_class(id);
-    e->id = id; e->ver = ver; e->cls = c;
+    {   int w = -1;
+        for (int i = 0; i < CL_WAYS && w < 0; i++) if (!s[i].id || s[i].id == id) w = i;
+        if (w < 0) w = next[set]++ & (CL_WAYS - 1);
+        s[w] = (typeof(s[0])){id, ver, c}; }
     return c;
 }
 static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage, vka_img **imo) {
