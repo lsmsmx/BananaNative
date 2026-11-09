@@ -306,6 +306,7 @@ void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64
 void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n);   // the open pass's attachments and their levels (n 0: none), for vka_tex_id_view
 int vka_tex_id_in_pass(int id);   // texture ID id's image is an attachment of the open pass (vka_tex_feedback's set)
 int vka_tex_id_target(int id);                      // the NVN target texture ID id stands for (its view's), -1 = not registered
+int vka_tex_id_target_rec(int id);                  // the same, memoized for the recording thread (the frame path asks it for every binding with no view of the shape it wants)
 int vka_tex_id_pending(int id);                     // texture ID id is registered and its image is not made yet (its first use records commands)
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout);   // the same on the recording thread, through a memo (DM_VK_TEX_MEMO)
 int vka_tex_id_pending_rec(int id, uint8_t dim);

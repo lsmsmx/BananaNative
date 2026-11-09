@@ -2298,6 +2298,24 @@ void vka_tex_id_peek(int id, char *b, size_t n) {
              v && v->set_target ? v->target : -1, v && v->set_levels ? v->base_level : 0, v && v->set_levels ? v->nlevels : 0, v && v->set_layers ? v->min_layer : 0, v && v->set_layers ? v->nlayers : 0,
              im ? "made" : m ? "refused" : "not made", (unsigned long long)ims, imm, iw, ih, il, iv, fv);
 }
+// The memoized form for the frame path (vka_draw.c): a descriptor whose texture has no view of the asked shape (the game leaves bindings whose shader branch
+// never samples them) asks for its target on every draw, and the unlocked form takes the texture table's lock. Keyed on the ID's registration version, four ways, as the
+// other memos here
+int vka_tex_id_target_rec(int id) {
+    enum { TG_SETS = 1024, TG_WAYS = 4 };
+    static struct { int id; uint32_t ver; int t; } m[TG_SETS * TG_WAYS]; static uint8_t next[TG_SETS];
+    if (id <= 0 || id >= (1 << 20) || !g_tver) return vka_tex_id_target(id);
+    uint32_t ver = atomic_load_explicit(&g_tver[id], memory_order_acquire);
+    uint32_t set = (uint32_t)((unsigned)id & (TG_SETS - 1));
+    typeof(m[0]) *s = &m[(size_t)set * TG_WAYS];
+    for (int w = 0; w < TG_WAYS; w++) if (s[w].id == id && s[w].ver == ver) return s[w].t;
+    int t = vka_tex_id_target(id);
+    {   int w = -1;
+        for (int i = 0; i < TG_WAYS && w < 0; i++) if (!s[i].id || s[i].id == id) w = i;
+        if (w < 0) w = next[set]++ & (TG_WAYS - 1);
+        s[w] = (typeof(s[0])){id, ver, t}; }
+    return t;
+}
 int vka_tex_id_target(int id) {
     pthread_mutex_lock(&g_tmu);
     int t = id > 0 && id < g_ntreg && g_treg[id].t.serial ? (g_treg[id].has_v && g_treg[id].v.set_target ? g_treg[id].v.target : g_treg[id].t.d.target) : -1;
