@@ -87,6 +87,16 @@ static void t_yuv(void) {
     // odd crop width 5: padded to 6 by repeating the last column
     nx_yuv_layout O = {NXYUV_NV12, S, SL, 0, 0, 5, 4}; uint8_t o3[6 * 4 * 3 / 2];
     CHECK(!nx_yuv_to_nv12(nv12, sizeof nv12, &O, o3) && o3[4] == 4 && o3[5] == 4, "odd width padded: %d %d", o3[4], o3[5]);
+    // Qualcomm's AV1 first picture: a 4x4 picture whose luma is padded to a slice height of 6 (two zero rows), then only the 2 chroma rows the picture has (4 * 6 + 4 * 2 bytes,
+    // not 4 * 6 + 4 * 3): taken at slice height 6, its chroma read after the padding (at 4 rows the chroma would come from the zero padding: green)
+    {   uint8_t q[4 * 6 + 4 * 2], qo[4 * 4 * 3 / 2]; memset(q, 0, sizeof q);
+        for (int i = 0; i < 16; i++) q[i] = 80;
+        for (int i = 24; i < 32; i++) q[i] = (uint8_t)(120 + i - 24);
+        nx_yuv_layout Q = {NXYUV_NV12, 4, 6, 0, 0, 4, 4};
+        CHECK(nx_yuv_bytes(&Q) == sizeof q, "the bytes the crop reads: %zu", nx_yuv_bytes(&Q));
+        CHECK(!nx_yuv_to_nv12(q, sizeof q, &Q, qo) && qo[0] == 80 && qo[16] == 120 && qo[23] == 127, "chroma after the padding: %d %d", qo[16], qo[23]);
+        CHECK(nx_yuv_to_nv12(q, sizeof q - 1, &Q, qo) == -1, "one byte short is refused");
+    }
 }
 static void t_rgba(void) {
     // limited-range white, black, and BT.601 / BT.709 red

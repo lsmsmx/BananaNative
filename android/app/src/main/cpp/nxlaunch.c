@@ -222,6 +222,12 @@ static void text_input_setup(JNIEnv *env) {
     nxhost_text_input_callback(text_input, NULL);
 }
 
+// A surface can arrive while the readiness dialog is still up, before Native.start opens the log file and applies env.txt / env-<id>.txt (DM_VK_DRIVER, DM_VK_GPL,
+// DM_VK_MESH, DM_VK_VALIDATE, ...). Hold the window here and hand it to nxhost_set_window only once Native.start has set the environment
+static ANativeWindow *g_window;
+static pthread_mutex_t g_win_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_win_ready;
+
 // start(args, env, log path, cwd): args[0] is the program name (main.c reads args[1] as the pack folder), env is KEY=VALUE strings. 0 = started; the host runs on
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_start(JNIEnv *env, jclass cls, jobjectArray args, jobjectArray envs, jstring log, jstring cwd) {
     (void)cls;
@@ -238,6 +244,10 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_start(JNIEnv *env, jclas
         if (eq) { *eq = 0; setenv(kv, eq + 1, 1); fprintf(stderr, "[nxlaunch] env %s=%s\n", kv, eq + 1); }
         free(kv);
     }
+    pthread_mutex_lock(&g_win_mu);
+    g_win_ready = 1;
+    if (g_window && nxhost_set_window) nxhost_set_window(g_window);
+    pthread_mutex_unlock(&g_win_mu);
     exit_record_install(getenv("NX_EXIT_RECORD"));   // before the host thread: the host's crash handler (crash.c) takes this one as the handler before its own
     { const char *tc = getenv("DM_TEST_CRASH"); pthread_t ct; if (tc && !strcmp(tc, "native") && !pthread_create(&ct, NULL, test_crash_thread, NULL)) pthread_detach(ct); }
     if (nxhost_env_changed) nxhost_env_changed();   // the replay's cached switches read the environment again (some were read before it, with the window)
@@ -259,13 +269,14 @@ JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_note(JNIEnv *env, jclass
 }
 
 // ---- Surface, input and lifecycle, forwarded when the host has the entry points ----
-static ANativeWindow *g_window;
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_setSurface(JNIEnv *env, jclass cls, jobject surface) {
     (void)cls;
     ANativeWindow *w = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
-    if (nxhost_set_window) nxhost_set_window(w);
+    pthread_mutex_lock(&g_win_mu);
+    if (g_win_ready && nxhost_set_window) nxhost_set_window(w);
     if (g_window) ANativeWindow_release(g_window);   // the host takes its own reference when it keeps the window
     g_window = w;
+    pthread_mutex_unlock(&g_win_mu);
 }
 JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_hasInput(JNIEnv *env, jclass cls) { (void)env; (void)cls; return nxhost_input_key != NULL; }
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_deviceAdded(JNIEnv *env, jclass cls, jint device, jstring name, jboolean labelled) {
@@ -387,6 +398,8 @@ JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_hasSelftest(JNIEnv *
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jclass cls, jobject surface, jint frames) {
     (void)cls; if (!nxhost_vk_selftest) return -1;
     ANativeWindow *w = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
+    // The selftest never calls Native.start: let setSurface forward its resizes and the null on leaving to the host, as start does for a game
+    pthread_mutex_lock(&g_win_mu); g_win_ready = 1; pthread_mutex_unlock(&g_win_mu);
     fprintf(stderr, "[nxlaunch] graphics selftest: nxhost_vk_selftest(%p, %d)\n", (void *)w, frames);
     int r = nxhost_vk_selftest(w, frames);
     fprintf(stderr, "[nxlaunch] graphics selftest returned %d: %s\n", r, r ? "FAIL" : "PASS");

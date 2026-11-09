@@ -14,10 +14,10 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
     //   the per-vertex planes, mesh: one 0x80-byte plane per output component in chunks of 32 vertices (vertex v, plane p at (v / 32) x planes x 0x80 + p x 0x80 +
     //     (v % 32) x 4), then the per-primitive values in chunks of 32 primitives (primitive t, value n at PrimitiveBaseWord x 4 + (t / 32) x values x 0x80 + n x 0x80 +
     //     (t % 32) x 4). Its stores go straight into the mesh outputs (CodeGenContext.MeshPlaneStore); the memory itself is one word nothing reads
-    //   the primitive area, mesh: byte 3 the primitive count, 4 + 3 t ... triangle t's three vertex indices. One word per byte (each store a whole word, so no
-    //     byte merging between invocations), PrimitiveWords words, addresses masked
+    //   the primitive area, mesh: byte 3 the primitive count, 4 + n t ... primitive t's n vertex indices (n = PrimitiveVertices: 3 for triangles, 1 for points: Zelda: Ocarina
+    //     of Time's point meshes store one byte at 4 + t). One word per byte (each store a whole word, so no byte merging between invocations), PrimitiveWords words, addresses masked
     // The layout (IGpuAccessor.QueryMeshShaderLayout, the job's "mesh"): max vertices, max primitives, payload bytes, the per-vertex plane codes in the order of the
-    // planes (the SPH's output map: 0-3 position x y z w, 4 + 4 g + c generic g component c), then optionally -1 and the per-primitive value codes (same numbering,
+    // planes (the SPH's output map in attribute order: PointSizePlane the point size, 0-3 position x y z w, 4 + 4 g + c generic g component c), then optionally -1 and the per-primitive value codes (same numbering,
     // generic only; -3 for a value the program writes that no output takes: the count sets the chunk stride, values x 0x80), then optionally -2 and the generic locations to declare as per-vertex outputs although the program writes none of their components (the
     // pixel shader reads them: they hold (0, 0, 0, 1))
     class MeshShaderInfo
@@ -26,6 +26,9 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
         // A per-primitive value no output takes (its stores are dropped)
         public const int NoOutput = -3;
+
+        // The point size's plane code (the SPH output map's system value at attribute 0x6c, byte 0x35 bit 3, which comes before position); per vertex only
+        public const int PointSizePlane = 4 + 4 * 32;
 
         public bool IsTask { get; }
         public bool IsMesh => !IsTask;
@@ -39,6 +42,10 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
 
         public int PrimitiveWords { get; }
 
+        // Vertices per output primitive (IGpuAccessor.QueryMeshShaderTopology, the control section's +0x5f): 3 triangles, 1 points
+        public int PrimitiveVertices { get; }
+        public bool Points => IsMesh && PrimitiveVertices == 1;
+
         // A mesh program's GL depth rewrite (IGpuAccessor.QueryMeshShaderGlDepthSpecId): the SpecId of its bool constant, -1 for none
         public int GlDepthSpecId { get; init; } = -1;
 
@@ -46,9 +53,10 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         public int PlaneMemoryId { get; private set; } = -1;
         public int PrimitiveMemoryId { get; private set; } = -1;
 
-        public MeshShaderInfo(bool isTask, int[] layout)
+        public MeshShaderInfo(bool isTask, int[] layout, int primitiveVertices = 3)
         {
             IsTask = isTask;
+            PrimitiveVertices = primitiveVertices;
 
             if (layout == null || layout.Length < 3)
             {
@@ -76,10 +84,22 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                     throw new NotSupportedException($"mesh program with {MaxVertices} vertices / {MaxPrimitives} primitives at most (1-256 each)");
                 }
 
-                if (Planes.Any(p => p < 0 || p >= 4 + 4 * 32) || PrimitivePlanes.Any(p => p != NoOutput && (p < 4 || p >= 4 + 4 * 32)) || PadLocations.Any(g => g < 0 || g >= 32) ||
+                if (Planes.Any(p => p < 0 || p > PointSizePlane) || PrimitivePlanes.Any(p => p != NoOutput && (p < 4 || p >= 4 + 4 * 32)) || PadLocations.Any(g => g < 0 || g >= 32) ||
                     Planes.Distinct().Count() != Planes.Length || PrimitivePlanes.Where(p => p != NoOutput).Distinct().Count() != PrimitivePlanes.Count(p => p != NoOutput))
                 {
                     throw new NotSupportedException($"mesh layout with a plane code out of range or repeated ({string.Join(", ", layout)})");
+                }
+
+                if (PrimitiveVertices is not (1 or 3))
+                {
+                    throw new NotSupportedException($"mesh program with {PrimitiveVertices} vertices per primitive (job \"mesh_topology\": 1 points, 3 triangles)");
+                }
+
+                // A point's size is the program's to write (VK_EXT_mesh_shader without maintenance5: a point mesh writes PointSize); a point program that writes none would
+                // take NVN's point size state, which the library does not know
+                if (Points && !Planes.Contains(PointSizePlane))
+                {
+                    throw new NotSupportedException($"point mesh program without a point size plane ({string.Join(", ", layout)})");
                 }
 
                 if (VertexLocations.Intersect(PrimitiveLocations).Any())
@@ -93,7 +113,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
 
             PayloadWords = PowerOfTwo(Math.Max(4, (PayloadBytes + 3) / 4));
-            PrimitiveWords = PowerOfTwo(4 + 3 * Math.Max(1, MaxPrimitives));
+            PrimitiveWords = PowerOfTwo(4 + PrimitiveVertices * Math.Max(1, MaxPrimitives));
         }
 
         public static int Chunks(int n)
@@ -108,7 +128,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         public int PlaneWords => PrimitiveBaseWord + Chunks(MaxPrimitives) * PrimitiveChunkWords;
 
         // The generic locations of the per-vertex outputs (the planes' and the padded ones) and of the per-primitive outputs
-        public IEnumerable<int> VertexLocations => Planes.Where(p => p >= 4).Select(p => (p - 4) >> 2).Concat(PadLocations).Distinct().OrderBy(g => g);
+        public IEnumerable<int> VertexLocations => Planes.Where(p => p >= 4 && p < PointSizePlane).Select(p => (p - 4) >> 2).Concat(PadLocations).Distinct().OrderBy(g => g);
         public IEnumerable<int> PrimitiveLocations => PrimitivePlanes.Where(p => p != NoOutput).Select(p => (p - 4) >> 2).Distinct().OrderBy(g => g);
 
         private static int PowerOfTwo(int n)
@@ -157,7 +177,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                 throw new NotSupportedException("a program cannot be both a task and a mesh program");
             }
 
-            return new MeshShaderInfo(task, gpuAccessor.QueryMeshShaderLayout()) { GlDepthSpecId = gpuAccessor.QueryMeshShaderGlDepthSpecId() };
+            return new MeshShaderInfo(task, gpuAccessor.QueryMeshShaderLayout(), task ? 3 : gpuAccessor.QueryMeshShaderTopology()) { GlDepthSpecId = gpuAccessor.QueryMeshShaderGlDepthSpecId() };
         }
     }
 }

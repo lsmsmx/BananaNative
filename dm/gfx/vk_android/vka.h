@@ -11,6 +11,7 @@
 #include "../nvn/nvn_obj.h"
 #include "../../host/dm.h"
 #include "vka_fmtlist.h"
+#include "vka_soft.h"
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 #define VRED(...) LOG("[RED] vk: " __VA_ARGS__)
@@ -111,6 +112,12 @@ extern vka_dev V;
 void *vka_driver_open(void);
 const char *vka_driver_tag(void);
 int vka_init(void);   // 1 = the device is up (idempotent, any thread); 0 = no Vulkan: every op logs and does nothing
+#include "vka_fpenv.h"
+// The host's FPCR (0) on this thread (vka_fpenv.h): who names a thread the host made, logged the first few times one started with the game's FPCR (NULL: not logged);
+// returns the FPCR the thread had, which vka_fp_back puts back. vka_fp_guest: DM_VK_GUEST_FPCR=1 (diagnostic, restart), every FPCR left as inherited (vka_dev.c)
+uint64_t vka_fp_host(const char *who);
+static inline void vka_fp_back(uint64_t was) { vka_fp_leave(was); }
+int vka_fp_guest(void);
 int vka_ok(void);
 uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal);
@@ -226,6 +233,8 @@ typedef struct vka_img {
     // Content from guest storage (vka_tex.c storage_mode): track = re-uploaded when the CPU writes its pages (write-protected after each upload, nvn_dirty.c),
     // stamp = the dirty-page generation taken before the last upload, span = the tracked pool range that holds the storage
     int track, wb_pending; uint64_t stamp; const void *span;
+    int wt;                  // the game writes it through WriteTexels (vka_tex.c mtl_tex_write_region): never tracked again
+    uint64_t edge_h[2]; int edged;
     uint64_t hash;           // DM_VK_NANSCAN: a hash of the storage at the last upload (vka_tex_id_check)
     uint64_t gw_seen; int from_mem; uint64_t head, up_fence; uint8_t *snap;   // head, up_fence: DM_VK_NANSCAN's storage watch   // the newest GPU write into guest memory its last upload included (vka_tex.c gw_t); content from guest storage (ST_TRACK / ST_FILL)
     // In a sparse virtual pool (hle_nvn.c nvn_sparse_*): the storage is read through the pool's 4 KB page table, never at mem (unmapped pages there are inaccessible);
@@ -253,9 +262,11 @@ typedef struct vka_img {
     // The video decoder pools' generation at which this image was last asked whether its storage is one of theirs (dm_codec_is_video_mem, a lock and a 64-slot scan), so
     // the question is asked once per pool-set change and not for every image of every submission (vka_tex_prepare; measured at ~6 ms a frame on the phone)
     uint32_t vchk;
+    // A soft texture's image (vka_soft.h, profile tex_soft): base 1, its finest level left out; soft_saved: the storage bytes that level takes (the stats' soft line)
+    uint8_t soft; uint64_t soft_saved;
 } vka_img;
-// Texture level lv as a level of im (a sparse texture's image starts at level im->base): 0 when the image does not hold it
-static inline int vka_img_lv(const vka_img *im, uint32_t *lv) { if (*lv < im->base) return 0; *lv -= im->base; return *lv < im->levels; }
+// Texture level lv as a level of im (a sparse or soft texture's image starts at level im->base): 0 when the image does not hold it
+static inline int vka_img_lv(const vka_img *im, uint32_t *lv) { return vksoft_lv(im->base, im->levels, lv); }
 // The layers a render target view of level lv can name: a 3D texture's slices at that level (drawn into through 2D / 2D-array views, VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT), else the array layers
 static inline uint32_t vka_img_slices(const vka_img *im, uint32_t lv) { return im->d.target == NVN_TEXTURE_TARGET_3D ? (im->depth >> lv ? im->depth >> lv : 1) : im->layers; }
 vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb);   // the texture's image, made (and filled from guest memory, or cleared) on first use in cb; NULL = no image
@@ -273,6 +284,10 @@ void vka_img_written_at(vka_img *im, const char *file, int line);
 // Before a write is recorded into im (an attachment, a clear, a copy destination, a storage image): a zero-shared image gets memory of its own, cleared (vka_tex.c img_own).
 // Call it before taking a view of im for the write. Any thread that records (takes the table lock); no render pass may be open in cb unless upload batches are on
 void vka_tex_own(vka_img *im, VkCommandBuffer cb);
+// Before a copy out of im, or into its texture level dst_level (-1: a copy out of it): a soft texture (vka_soft.h) the game copies from, or into at its finest level, is made
+// whole again from its storage and stays whole (vka_tex.c soft_harden). Any thread that records; no render pass may be open in cb unless upload batches are on
+void vka_tex_soft_copy(vka_img *im, int dst_level, VkCommandBuffer cb);
+void vka_tex_soft_stats(char *b, size_t n);          // soft textures now: how many, the storage bytes their finest levels take, and how many went whole
 void vka_tex_big_stats(char *b, size_t n);           // the largest images the GPU has not written, with what sampled them and what lies over their storage (DM_VK_BIGIMG_MB)
 int vka_rp_is_open(void);                            // a render pass is open in the replay's command buffer (vka_draw.c)
 void vka_tex_writeback(VkCommandBuffer cb);   // mtl_sub_commit, after the last pass
@@ -284,6 +299,11 @@ VkDescriptorSetLayout vka_bindless_layout(void);
 void vka_barrier_at(VkCommandBuffer cb, const char *file, int line);   // a full memory barrier (the replay orders every transfer op after the previous one)
 void vka_xp_ts(VkCommandBuffer cb, int site);   // DM_VK_XP_TS experiment (vka_tex.c)
 #define vka_barrier(cb) vka_barrier_at(cb, __FILE_NAME__, __LINE__)   // the site names the step that ends there in DM_VK_GPUPROF's report (vka_gprof.c)
+// The barrier a dispatch leaves pending (vka_draw.c vka_dispatch, "Dispatch order"): NVN orders one dispatch against the next only through the game's own barriers, so the
+// replay records the barrier after a dispatch only before other GPU work in the same command buffer (vka_disp_settle). Any full barrier recorded into it meanwhile settles it
+extern _Atomic(VkCommandBuffer) vka_disp_pend;
+void vka_disp_settle(VkCommandBuffer cb);
+void vka_disp_census(uint64_t frame);   // the dispatches since the last call by shader and call site, one log line (vka_exec.c's statistics, every 1,800 frames)
 // DM_VK_GPUPROF (vka_gprof.c): GPU timestamps between the steps of a profiled frame
 extern int vka_gp_active;
 void vka_gp_mark(VkCommandBuffer cb, const char *file, int line);
@@ -460,7 +480,13 @@ void vka_enc_switch(VkCommandBuffer cb);    // recording goes on in cb (queued r
 void vka_enc_stats(char *b, size_t n, double frames);   // the replay statistics' line (empty when unused)
 int vka_nan_split(vka_img *const *ims, int n);
 int vka_nan_probe(uint64_t fs);
-void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n);
+void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n, uint64_t stats);   // stats: DM_VK_TEX_STATS's fragment shader (level 0 scanned, every input logged), 0 = NaN scan
+void vka_rtlog_skip(const p_set_rt *rt, int has_rt, const vka_dstate *d, const char *why);   // DM_VK_RT_LOG: a draw not recorded into a logged pass
+int vka_texstats_on(void);   // DM_VK_TEX_STATS (live) is set: the encoder thread stays off
+int vka_texstats_probe(uint64_t fs);   // 1 = scan this draw's inputs (DM_VK_TEX_STATS)
+int vka_texstats_room(void);   // 1 = a `tex stats:` value line may be logged (counts it)
+int vka_texstats_desc_new(uint64_t fs, int bind, int tid);   // 1 = log this input's description (first time for this value of DM_VK_TEX_STATS)
+int vka_texstats_table_new(int tid);   // 1 = scan this texture (DM_VK_TEX_STATS): not yet scanned this frame
 vka_img *vka_tex_id_img(int id, VkCommandBuffer cb);
 void vka_tex_id_dump(int id);
 void vka_tex_id_check(int id);                      // DM_VK_NANSCAN: has texture ID id's storage changed since its upload, and does the tracker know
@@ -481,6 +507,9 @@ void vka_rw_commit(uint64_t fence);          // the submission's copies, logged 
 void vka_nan_dispatch(VkCommandBuffer cb, uint64_t key, vka_img *const *ims, int n);   // after a dispatch (its writes made visible): its float storage images, as a pass's attachments
 void vka_nan_commit(uint64_t fence);
 void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines);
+void vka_draw_run_break(void);   // an instanced run (DM_VK_INSTANCE) is not extended past this point (an occlusion query boundary)
+void vka_oq_draw(void);          // vka_exec.c Occlusion queries: a draw about to be recorded in the open pass (begins a query while counting)
+void vka_oq_pass_end(void);      // the open pass ends, or a clear is recorded inside it: its query ends
 int vka_is_ndve_key(uint64_t k);
 
 // ---------- Present (vka_present.c) ----------

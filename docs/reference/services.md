@@ -294,6 +294,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Note:** history entries repeat the newest sample; yaw drifts as on the console, with no recenter. The console's own sensor still reports no states ([SDK 20 six-axis sensor and amiibo (`nfp`) calls](#sdk-20-six-axis-sensor-and-amiibo-nfp-calls)), so motion follows the controller in docked mode.
 - **Open:** [PR #286](https://github.com/seedds/nxnative/pull/286) has iPad aiming measurements and calibration controls to compare on a device before choosing shared defaults. Related reports: [#153](https://github.com/seedds/nxnative/issues/153), [#389](https://github.com/seedds/nxnative/issues/389).
 
+### Android: the phone's sensors never started
+
+- **Symptom:** gyro aiming does nothing on Android (Splatoon Raiders); the log has no `input: phone sensors on` line and no `[RED] input: no accelerometer` either.
+- **Cause:** `GameActivity.onResume` starts the sensors (`Native.motionStart`) only when the game has started, but `start()` can run after the first `onResume` (the readiness check holds it, `readinessHold`), so the one call that starts them was skipped and nothing started them later.
+- **Fix:** `onResume` records that the screen is resumed before it checks the start, and `hostSetup()` (run by `start()` and `attach()`) starts the sensors when it is, unless the game is paused. `nxhost_motion_start` does nothing when they already run.
+- **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md) on Android, with the phone's own gyroscope. Check with `DM_MOTION_LOG=1` (the log shows the sample once a second).
+- **Open:** a controller's own gyro (a DualSense or Switch Pro on the phone) still has no source on Android; only the phone's sensors reach the game.
+
 ### The phone's motion in the picture's frame
 
 - **Symptom:** on iPhone Duo's inner display the phone's gyro is turned a quarter turn: tilting up and down moves the pointer left and right, and the other way round ([GitHub issue #569](https://github.com/seedds/nxnative/issues/569)); the outer display is right.

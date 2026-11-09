@@ -37,7 +37,6 @@ app_pool	0xCD500000
 sys_resource	0x1000000
 # Startup allocates and frees everything allocatable. The SDK releases those
 # cached pages only after a map fails at the real application-pool limit.
-mem_map_limit	on
 
 # ---- Shader split ----
 shader_groups	#arc/system_resource=system #arc/ik_effect=effect #arc/ik_pokemon=pokemon #arc/ui=layout /arc/=arc

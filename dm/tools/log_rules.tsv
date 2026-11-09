@@ -1,0 +1,46 @@
+# Rules of dm/tools/log_digest.py: what a line of an Android run log (or of its logcat) means, in one sentence a player understands. One rule a row, tab-separated:
+#   id     a short name (unique)
+#   kind   crash | fatal | red | driver | oom | hang | perf | info (the verdict uses the first matching rule of its own kind, in this file's order: specific rules first)
+#   regex  searched in each line; must be valid in both Python re and Java java.util.regex (the launcher reads this table too): no named groups, no \Z, no (?P...),
+#          no inline flags except a leading (?i) or a scoped (?i:...)
+#   cause  one plain English sentence
+#   doc    a repository-relative link to the entry that explains it (file#anchor), or empty
+id	kind	regex	cause	doc
+gpu-hang	driver	GPU hang: 	The GPU stopped responding (a frame did not finish in time), so the game had to close.	docs/reference/rendering.md#turnip-hangs-in-the-first-3d-frame-of-a-cold-run
+device-lost	driver	VK_ERROR_DEVICE_LOST|the device is lost|[Dd]evice lost	The GPU driver lost the device, so nothing more could be drawn.	docs/reference/rendering.md#turnip-hangs-in-the-first-3d-frame-of-a-cold-run
+fence-stuck	driver	\[RED\] vk: GPU: fence \d+ not reached	The GPU did not finish its work for seconds; the driver may be stuck.	docs/reference/rendering.md#present-waiting-for-a-fence-still-being-recorded-on-the-vulkan-replay
+upload-stuck	driver	upload batch \d+ not done in	A texture upload did not finish in time; the GPU or its driver was stuck.	docs/reference/rendering.md#turnip-hangs-in-the-first-3d-frame-of-a-cold-run
+scudo-oom	oom	Scudo ERROR: .*(?i:out of memory)|scudo::reportMapError	The game process ran out of memory (an allocation failed).	docs/reference/memory.md#write-tracking-of-small-textures-fills-the-processs-memory-maps-android
+bad-alloc	oom	terminating due to uncaught exception .*bad_alloc	An allocation in the host failed (std::bad_alloc): the process ran out of memory.	docs/reference/memory.md#write-tracking-of-small-textures-fills-the-processs-memory-maps-android
+lmk-kill	oom	lowmemorykiller: Kill '[^']*:game'|am_kill .*:game.*LowMem	Android's low-memory killer ended the game: the phone ran out of memory.	docs/reference/memory.md#upload-staging-grows-within-one-vulkan-submission-android
+oom-line	oom	(?i)out of memory	A line says the game or the host ran out of memory.	docs/reference/memory.md#upload-staging-grows-within-one-vulkan-submission-android
+watchdog	hang	\[RED\] watchdog: no progress	The game stopped making progress and the watchdog (DM_WATCH_STALL) ended it.	android/TESTING.md#diagnostic-switches
+sigalrm	hang	CRASH sig=14\b	The run's time limit or watchdog (SIGALRM) ended it.	android/TESTING.md#diagnostic-switches
+graceful-late	hang	\[RED\] graceful exit not done in	The game did not finish its own exit in time and was ended at once.
+game-abort	fatal	game called nn::diag abort|FATAL game aborted	The game's own code stopped itself (nn::diag abort): something it needed did not behave as on the console.	docs/agents/05-debugging.md#reading-a-crash-report
+romfs-missing	fatal	FATAL the game files .* (are missing|are not a complete RomFS image|cannot be used as a NUP package)	The game files are missing or unreadable: check the game folder or .nup in the launcher.	docs/reference/packing.md#a-stale-dm_romfs-path-crashes-the-game-soon-after-nnmain
+fatal-open	fatal	FATAL open 	A file the pack should have is missing: prepare the pack again.	android/TESTING.md#what-the-log-says-at-each-stage
+tls-slot	fatal	TLS_SLOT_APP .*another library uses the slot|thread slot layout mismatch	Another library on this phone uses the thread slot the host needs, so the host cannot run here.	android/TESTING.md#what-the-log-says-at-each-stage
+missing-symbol	fatal	FATAL missing symbol 	The game's code lacks a symbol the host needs: the pack does not fit this host.	android/TESTING.md#what-the-log-says-at-each-stage
+guest-block	fatal	\[RED\] guest block	The game's memory block could not be reserved at its address.	android/TESTING.md#what-the-log-says-at-each-stage
+save-journal	fatal	\[RED\] save swap journal 	The save folder has an unfinished swap the host refuses to touch; move the marker away to use the save.	android/TESTING.md#save-backups
+host-fatal	fatal	\[dm\] FATAL 	The game reached something the app cannot handle yet, so it was stopped.	android/TESTING.md#what-the-log-says-at-each-stage
+crash-held	crash	CRASH sig=\d+ \(stderr held	The game crashed while another thread held the log, so only the crash address was written.	docs/agents/05-debugging.md#reading-a-crash-report
+crash-segv	crash	CRASH sig=11\b	The game crashed reading or writing memory it should not (SIGSEGV).	docs/agents/05-debugging.md#reading-a-crash-report
+crash-bus	crash	CRASH sig=7\b	The game crashed on a bad memory access (SIGBUS).	docs/agents/05-debugging.md#reading-a-crash-report
+crash-ill	crash	CRASH sig=4\b	The game crashed on an instruction this CPU does not run (SIGILL).	docs/agents/05-debugging.md#reading-a-crash-report
+crash-trap	crash	CRASH sig=5\b	The game crashed on a trap instruction (SIGTRAP).	docs/agents/05-debugging.md#reading-a-crash-report
+crash-abort	crash	CRASH sig=6\b	The process aborted (SIGABRT): the lines just before the crash say who called abort.	docs/agents/05-debugging.md#reading-a-crash-report
+java-crash	crash	\[RED\] crash: uncaught exception on thread	The app ran into an error and had to close the game.	android/README.md#the-launcher
+tombstone	crash	Fatal signal \d+ \(SIG\w+\).*:game\)	Android reports a fatal signal in the game process.	docs/agents/05-debugging.md#reading-a-crash-report
+no-shader-library	red	no shader library at .*nothing is drawn|shader library .* refused	The pack has no usable shader library for this app, so nothing is drawn: update the shaders in the app.	android/SHADERS.md#versions
+old-shader-library	red	made before versioned shader updates	The pack's shaders are from before versioned updates and may draw wrong: update the shaders once in the app.	android/SHADERS.md#versions
+pack-rewrite	red	its rewrite did not finish|Prepare again remakes it	The pack's code was not finished: use Prepare again on the game.	android/README.md#pack-a-game
+dlc-problem	red	\[RED\] \[nxlaunch\] DLC: 	A DLC folder of the dump could not be linked for the game.	docs/reference/packing.md#dlc-links-in-shared-storage-android
+env-unreadable	red	\[RED\] env\.txt: .*cannot be read	env.txt exists but the app cannot read it, so the run had no switches: chmod 666 it.	android/TESTING.md#diagnostic-switches
+env-refused	red	\[RED\] env: not taken: 	Some environment lines set the game's paths and were not taken.	android/TESTING.md#diagnostic-switches
+heat-throttle	perf	\[overlay\] throttle red	The phone was hot and slowed its CPU or GPU down; frame rate drops follow.
+prepare-hot	perf	Paused: the phone is too hot	Prepare paused because the phone reported it was too hot.	docs/reference/packing.md#prepare-stays-paused-as-too-hot-on-a-phone-that-is-cool
+shader-update	info	this host's version \w+ is missing \(the app's shader update makes it\)	The pack's shaders are an older version; the app's shader update makes the current one.	android/SHADERS.md#versions
+dlc-none	info	aoc: reporting 0 add-on contents	The game sees no DLC; if you own some, check the dump's dlc folder.	docs/reference/packing.md#dlc-links-in-shared-storage-android
+graceful-exit	info	graceful exit done	The game ended by itself (a normal exit).

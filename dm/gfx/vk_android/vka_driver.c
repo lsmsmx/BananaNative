@@ -84,7 +84,7 @@ static void *driver_open(void) {
     const char *base = dir + strlen(dir) - 1; while (base > dir && base[-1] != '/') base--;   // the folder's name, else the library's
     char b[128]; snprintf(b, sizeof b, "%.*s", (int)(dir + strlen(dir) - 1 - base), base);
     set_tag(b[0] ? b : name);
-    VLOG("custom GPU driver: %s%s (hooks in %s), pipeline cache vk_pipelines-%s.bin", dir, name, hook, g_tag);
+    VLOG("custom GPU driver: %s%s (hooks in %s), pipeline cache vk_pipelines-%s" VKA_PCACHE_GEN ".bin", dir, name, hook, g_tag);
     return lib;
 }
 #endif

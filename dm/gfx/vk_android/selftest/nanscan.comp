@@ -1,15 +1,27 @@
 #version 450
 // DM_VK_NANSCAN (vka_nanscan.c): counts the NaN and infinite texels of one level / layer of a float attachment and keeps the first one's position
 layout(local_size_x = 8, local_size_y = 8) in;
+shared uint snz[4], smx[4];
 layout(set = 0, binding = 0) uniform sampler2DArray img;
-layout(set = 0, binding = 1) buffer O { uint nan; uint inf; uint first; uint pad; } o;
+layout(set = 0, binding = 1) buffer O { uint nan; uint inf; uint first; uint pad; uint nz[4]; uint mx[4]; } o;   // nz, mx: DM_VK_TEX_STATS (texels with |c| > 1/1024, max |c| as float bits)
 layout(push_constant) uniform P { uvec2 size; uint layer; uint big; } pc;   // big: DM_VK_NANSCAN_BIG's float bits (0 = off): finite texels above it count as infinite
 void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
-    if (p.x >= pc.size.x || p.y >= pc.size.y) return;
-    vec4 v = texelFetch(img, ivec3(p, pc.layer), 0);
+    bool in_ = p.x < pc.size.x && p.y < pc.size.y;
+    vec4 v = in_ ? texelFetch(img, ivec3(p, pc.layer), 0) : vec4(0.0);
     bool n = any(isnan(v)), i = any(isinf(v)) || (pc.big != 0u && any(greaterThan(abs(v), vec4(uintBitsToFloat(pc.big)))));
     if (n) atomicAdd(o.nan, 1u);
     if (i) atomicAdd(o.inf, 1u);
     if (n || i) atomicMin(o.first, p.y << 16 | p.x);
+    // Per-channel statistics, reduced in the workgroup first (one global atomic per channel and group); NaN texels count as zero here
+    uint l = gl_LocalInvocationIndex;
+    if (l < 4u) { snz[l] = 0u; smx[l] = 0u; }
+    barrier();
+    for (int c = 0; c < 4; c++) {
+        float a = abs(v[c]); if (isnan(a)) a = 0.0;
+        if (a > 1.0 / 1024.0) atomicAdd(snz[c], 1u);
+        if (a > 0.0) atomicMax(smx[c], floatBitsToUint(a));   // non-negative floats order as their bits
+    }
+    barrier();
+    if (l < 4u) { if (snz[l] != 0u) atomicAdd(o.nz[l], snz[l]); if (smx[l] != 0u) atomicMax(o.mx[l], smx[l]); }
 }

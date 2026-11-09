@@ -273,8 +273,10 @@ __attribute__((visibility("default"))) int nxhost_replay(int argc, char **argv) 
     if (!getenv("DM_VK_SHLIB") && head_get(head, hn, "vk_shlib", v, sizeof v)) setenv("DM_VK_SHLIB", v, 1);
     if (!getenv("DM_VK_PCACHE")) {   // a cache of this replayer's own beside it, seeded once from the live run's (read only: the app's file is left alone)
         char self[1024], pc[1100]; ssize_t sl = readlink("/proc/self/exe", self, sizeof self - 1);
-        if (sl > 0) { self[sl] = 0; char *s = strrchr(self, '/'); if (s) *s = 0; snprintf(pc, sizeof pc, "%s/vk_pipelines.bin", self); setenv("DM_VK_PCACHE", pc, 1);
-            if (access(pc, R_OK) && head_get(head, hn, "vk_pcache", v, sizeof v) && copy_file(v, pc)) {
+        if (sl > 0) { self[sl] = 0; char *s = strrchr(self, '/'); if (s) *s = 0; snprintf(pc, sizeof pc, "%s/vk_pipelines" VKA_PCACHE_GEN ".bin", self); setenv("DM_VK_PCACHE", pc, 1);
+            // (a live cache of the generation before, compiled with the game's FPCR (vka_fpenv.h), seeds nothing)
+            if (access(pc, R_OK) && head_get(head, hn, "vk_pcache", v, sizeof v) && !strstr(v, VKA_PCACHE_GEN ".bin")) printf("pipeline cache not seeded: the live run's %s is not of this generation (" VKA_PCACHE_GEN ")\n", v);
+            else if (access(pc, R_OK) && head_get(head, hn, "vk_pcache", v, sizeof v) && copy_file(v, pc)) {
                 printf("pipeline cache seeded from the live run's %s\n", v);
                 char sv[1100], sp[1100]; snprintf(sv, sizeof sv, "%s.lib", v); snprintf(sp, sizeof sp, "%s.lib", pc); copy_file(sv, sp);   // its library stamp (vka_pso.c)
             } }

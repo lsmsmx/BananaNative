@@ -40,15 +40,20 @@ mem_alias	0x100000000
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x4000000
-# mem_map_limit (hle_svc.c): a MapPhysicalMemory past the pool fails with ResultLimitReached, so the SDK unmaps the block nninitStartup's probe left cached instead of keeping it
-# mapped beside the game's own use, and the used memory GetInfo counts the pages mapped. Without it the touched set runs past the 9 GB pool (this phone: an 8.3 GB guest file)
-mem_map_limit	on
+# The reserve beside the heap goes to the game's virtual address heap, whose free size is what the system reports free (main+0x5a8c60 in 1.8.0: nn::os::QueryMemoryInfo
+# total - used, page-aligned, less a page; GetInfo 21 / 22). On Horizon the used memory counts the pages mapped in the alias region; without this key the host leaves them out, so
+# the heap's free size never falls and its blocks are never let go (kartnative on 1.0.0: 954 regions of 0xb1000 bytes by a fourth race, each a 512x512 R16 texture of 10 levels
+# with its GPU copy; 2.4 GB mapped vs 1.25 GB with the limit; plumber-racer-2 sets it too). With it the used memory counts them and a map past the pool fails, as on Horizon:
+# the heap (pool - used - 0x5dc00000) leaves the alias region the 1.5 GB reserve
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
 shader_note	Mario Kart World shaders
 
 # ---- Graphics ----
+# Large block-compressed textures from the game's files kept without their finest level on the Vulkan replay (Android; README, Memory): ported from plumber-racer-2 (MIT,
+# copyright seedds), where it made a race fit an iPhone 18 Pro. Textures the game copies from stay whole (its terrain arrays are filled by copies: the road went purple without it)
+tex_soft	on
 # agl's render buffer binding: Donkey Kong Bananza's clears are wrapped in render conditions; the same engine, not yet checked on this game
 render_cond	on
 # The 3D scenes' size follows the operation mode and the Switch 2 graphics scale, not the window (README, Render resolution): the Android launcher's Game resolution

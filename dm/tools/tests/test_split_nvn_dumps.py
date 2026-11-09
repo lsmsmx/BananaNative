@@ -53,7 +53,18 @@ class TaskMesh(unittest.TestCase):
         code[0x80:0x84] = struct.pack('<I', 0x1061); code[0x80 + 0x36] = 0x10    # the per-primitive header at +0x80: generic 1 x
         ctl, code = nvn2(7, bytes(code))
         ctl = bytearray(ctl); struct.pack_into('<HH', ctl, 0x58, 32, 256); struct.pack_into('<HH', ctl, 0x60, 128, 64); struct.pack_into('<I', ctl, 0x64, 0x80)
+        ctl[0x5f] = 3   # triangles
         return bytes(ctl), code
+
+    def test_points(self):   # a points program (control +0x5f = 1) with the point size (byte 0x35 bit 3) before position, as Ocarina of Time's 28f82c129deea140
+        ctl, code = self.mesh(); ctl, code = bytearray(ctl), bytearray(code)
+        ctl[0x5f] = 1; code[0x35] = 0xf8; code[0x36] = 0; struct.pack_into('<I', ctl, 0x64, 0)
+        f = ss.mesh_facts('m', 'ms', bytes(ctl), bytes(code), {}, set())
+        self.assertEqual((f['mesh'], f['mesh_topology']), ([128, 64, 256, 132, 0, 1, 2, 3], 1))
+        ctl[0x5f] = 3; self.assertNotIn('mesh_topology', ss.mesh_facts('m', 'ms', bytes(ctl), bytes(code), {}, set()))   # triangles, the default, are not written
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            ctl[0x5f] = 2; self.assertNotIn('mesh', ss.mesh_facts('m', 'ms', bytes(ctl), bytes(code), {}, set()))
+        self.assertIn('neither points (1) nor triangles (3)', log.getvalue())
 
     def test_stage_byte(self):
         ctl, code = self.mesh()

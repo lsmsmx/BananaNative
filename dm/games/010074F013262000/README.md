@@ -21,7 +21,7 @@ integrated into the base/update shader census, so DLC rendering is unvalidated.
 - The NPDM declares a 32 MB system resource. Memory is committed through address
   regions, without `SetHeapSize`. The profile uses a 5 GB guest block, including
   a 4.375 GB alias region, and the Switch application pool of `0xCD500000` bytes.
-- `mem_map_limit on`: startup attempts 1 MB physical commits until allocation
+- `mem_map_limit` (on for every game): startup attempts 1 MB physical commits until allocation
   fails, then frees its probe. An unlimited host lets it map all 60 GB; enforcing
   the hardware pool makes that probe stop at the expected physical limit.
 - **Address-space adaptation:** `nninitStartup` calls `main+0x128e58c`, reserving 60 GB.

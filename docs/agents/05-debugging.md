@@ -13,7 +13,7 @@ x0=… x28=…
 
 - `pc` and `lr` are module-relative (`main+…`, `sdk+…`) or host symbols. Module offsets are the same as in the decompressed NSO and the ELF (Ghidra adds 0x100000).
 - Look at the registers before the code: a pointer that is a valid pointer plus garbage high bits, an index of `0xfffffffe`, or `pc == lr == 0x100000000` each tell a different story. a fault at `0x74a740e114 = 0x70a740c570 + 0xfffffffe·4 + 0x1bac` was an index of −2 widened as unsigned; `pc == lr` on a nonsense value is a `ret` through an overwritten saved LR (look at the zeroed frame below `sp`).
-- The handler takes SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGALRM (the run's time limit) and SIGABRT (`abort()`: an assertion or an uncaught exception in the host or a framework; before it was handled, Big Brain Academy: Brain vs. Brain died once with exit 134, nothing in the log and no report). A run that ends with exit 137 and no `CRASH` line was killed with SIGKILL: macOS does that after a trap in a system library (`_os_unfair_lock_corruption_abort` destroying a corrupted mutex, the movie decoder entry [Input indices returned by a flush while a client holds them](../reference/movies.md#input-indices-returned-by-a-flush-while-a-client-holds-them)), and its report is in `~/Library/Logs/DiagnosticReports/dmhost-*.ips`, a JSON document whose `faultingThread` names the thread whose `frames` to read.
+- The handler takes SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGALRM (the run's time limit) and SIGABRT (`abort()`: an assertion or an uncaught exception in the host or a framework). A run that ends with exit 137 and no `CRASH` line was killed with SIGKILL: macOS does that after a trap in a system library (`_os_unfair_lock_corruption_abort` destroying a corrupted mutex, the movie decoder entry [Input indices returned by a flush while a client holds them](../reference/movies.md#input-indices-returned-by-a-flush-while-a-client-holds-them)), and its report is in `~/Library/Logs/DiagnosticReports/dmhost-*.ips`, a JSON document whose `faultingThread` names the thread whose `frames` to read.
 - When the frame-pointer backtrace is empty, the stack scan's negative offsets (below `sp`) show the return addresses of the calls the crashing function made last.
 - `[dm] *xN:` lines show the first six words each register points at (read safely, so a bad pointer is skipped). A word inside a module prints as `main+…`: the first word of an object is its vtable, which names its class, and comparing it with the class's own vtable shows whether the object was destroyed (a base-class vtable) or rebuilt.
 
@@ -156,7 +156,7 @@ To check a change to the replay layer on a frame without playing to it, or to te
 
 ## On-device diagnostics (Android)
 
-The test app (`dev.nxnative.android`) takes switches from `env.txt` in its files folder and logs each run to `files/logs/`; a crash leaves its report in logcat. See [android/TESTING.md](../../android/TESTING.md#diagnostic-switches). Never touch the play app or a real save; run the system driver and Turnip (`DM_VK_DRIVER`).
+The test app (`dev.nxnative.android`) takes switches from `env.txt` in its files folder and logs each run to `files/logs/`; a crash leaves its report in logcat ([android/TESTING.md](../../android/TESTING.md#diagnostic-switches)). Read a run log with `python3 dm/tools/log_digest.py <log>` first, then `--filter`, and the raw log only around the line numbers they print. Never touch the play app or a real save; run the system driver and Turnip (`DM_VK_DRIVER`).
 
 ## On-device diagnostics (iOS)
 

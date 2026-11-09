@@ -19,5 +19,6 @@ int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_
 int nvn_dirty_bounds_since(const void *span, const void *addr, size_t len, uint64_t stamp, size_t *lo, size_t *hi);   // the written byte range [lo, hi) since stamp, by pages; 0 = none
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // Cumulative: this module's mprotect call count, pages covered, time spent
+void nvn_dirty_mp_fail(uint64_t *fails, int *err);                 // Cumulative: failed mprotect calls of this module, and the last one's errno
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // Currently live slots, slot table high-water mark, total number of registrations
 void nvn_dirty_debug(const void *span, const void *addr, size_t len, uint64_t stamp, char *out, size_t n);   // diagnostics: the range and page states behind a span

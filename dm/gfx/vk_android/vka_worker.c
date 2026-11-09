@@ -65,7 +65,7 @@ static void aff_check(void) {
     if (r != r_was) { r_was = r; if (r) { aff_set(0, r); VLOG("DM_VK_AFF_REPLAY=%#x", r); } }
 }
 static void *worker_main(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk-replay");
+    (void)arg; pthread_setname_np(pthread_self(), "vk-replay"); vka_fp_host("vk-replay");
     for (;;) {
         uint64_t t0 = wns();
         pthread_mutex_lock(&g_mu);
@@ -128,21 +128,23 @@ static void fence_syncs(const uint8_t *p, uint64_t fence, int depth) {
 }
 
 // ---------- The mtl_* calls of the host's submit (hle_nvn.c nvnQueueSubmitCommands) and present ----------
-void mtl_queue_activate(uint64_t serial) { if (up()) g_pend_serial = serial; else vka_rp_queue_activate(serial); }
+// Replayed inline (DM_VK_WORKER=0, or no worker thread), on the game's thread: with the host's FPCR (vka_fpenv.h) for the recording and what the driver compiles
+// meanwhile, and the game's put back before the call returns to it
+void mtl_queue_activate(uint64_t serial) { if (up()) g_pend_serial = serial; else { uint64_t f = vka_fp_host(NULL); vka_rp_queue_activate(serial); vka_fp_back(f); } }
 void mtl_set_queue_origin_lower_left(int on) { if (up()) g_pend_origin = on != 0; else vka_rp_set_queue_origin(on); }
-void mtl_queue_forget(uint64_t serial) { if (up()) { job_t j = {J_FORGET}; j.serial = serial; push(&j); } else vka_rp_queue_forget(serial); }
+void mtl_queue_forget(uint64_t serial) { if (up()) { job_t j = {J_FORGET}; j.serial = serial; push(&j); } else { uint64_t f = vka_fp_host(NULL); vka_rp_queue_forget(serial); vka_fp_back(f); } }
 void mtl_sub_begin(void) {
-    if (!up()) { vka_rp_sub_begin(); return; }
+    if (!up()) { uint64_t f = vka_fp_host(NULL); vka_rp_sub_begin(); vka_fp_back(f); return; }
     g_in_sub = 1; g_cur.nh = 0;
 }
 void mtl_exec(const uint8_t *handle) {
-    if (!g_in_sub) { vka_rp_exec(handle, 0); return; }
+    if (!g_in_sub) { uint64_t f = vka_fp_host(NULL); vka_rp_exec(handle, 0); vka_fp_back(f); return; }
     if (!handle) return;
     if (g_cur.nh == g_cur_cap) { g_cur_cap = g_cur_cap ? 2 * g_cur_cap : 64; g_cur.h = realloc(g_cur.h, (size_t)g_cur_cap * sizeof *g_cur.h); }
     g_cur.h[g_cur.nh++] = handle;
 }
 uint64_t mtl_sub_commit(void) {
-    if (!g_in_sub) return vka_rp_sub_commit(0);
+    if (!g_in_sub) { uint64_t f = vka_fp_host(NULL), r = vka_rp_sub_commit(0); vka_fp_back(f); return r; }
     g_in_sub = 0;
     job_t j = {J_SUB}; j.serial = g_pend_serial; j.origin_ll = g_pend_origin; j.nh = g_cur.nh;
     j.h = malloc((size_t)(j.nh ? j.nh : 1) * sizeof *j.h); if (j.nh) memcpy(j.h, g_cur.h, (size_t)j.nh * sizeof *j.h);
@@ -152,7 +154,7 @@ uint64_t mtl_sub_commit(void) {
     return j.fence;
 }
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
-    if (!up()) return vka_present_inline(t, period_s, crop);
+    if (!up()) { uint64_t f = vka_fp_host(NULL), r = vka_present_inline(t, period_s, crop); vka_fp_back(f); return r; }
     job_t j = {J_PRESENT}; j.ticket = vka_present_reserve(); j.t = *t; j.period = period_s; j.has_crop = crop != NULL; if (crop) memcpy(j.crop, crop, sizeof j.crop);
     push(&j);
     return j.ticket;

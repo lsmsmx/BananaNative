@@ -68,4 +68,85 @@ static inline int vkmb_seg(const uint64_t *lo, const uint64_t *hi, int n, uint64
     while (l <= h) { int m = (l + h) / 2; if (lo[m] <= a) { hit = m; l = m + 1; } else h = m - 1; }
     return hit >= 0 && a < hi[hit] ? hit : -1;
 }
+
+// ---------- What the maps outside the guest block are (diagnostic, DM_VK_MAPS_HIST) ----------
+// The budget above only sheds placed memory's pieces; when the maps outside the guest block are what climbs (a 0400486024DEC000 run: 6,926 -> 49,277 in 20 s, compaction
+// covering 0 of them), the count alone does not say whose they are. So the scan can sort those lines into groups of (name, permissions, size bucket) and the maps thread
+// logs the largest. Digits in a name are folded to '#' so per-thread or per-file names ([anon:stack_and_tls:12345], a temp file with a counter) make one group.
+// No allocation: near the limit malloc may need a new mapping itself, so the table is fixed and what does not fit is counted as dropped.
+enum { VKMB_NAME = 64, VKMB_HCAP = 1024, VKMB_NBUCKET = 6 };
+static const char *const vkmb_bucket_name[VKMB_NBUCKET] = {"<=4K", "<=64K", "<=1M", "<=16M", "<=256M", ">256M"};
+static inline int vkmb_bucket(uint64_t n) {
+    return n <= 4096 ? 0 : n <= 65536 ? 1 : n <= (1u << 20) ? 2 : n <= (16u << 20) ? 3 : n <= (256u << 20) ? 4 : 5;
+}
+// A line's fields: start, end, permissions ("rw-p"), and its name (what follows the inode; empty for plain anonymous memory). 0 = not a line
+static inline int vkmb_fields(const char *ln, size_t len, uint64_t *lo, uint64_t *hi, char perms[5], const char **name, size_t *nlen) {
+    uint64_t v[2] = {0, 0}; size_t i = 0;
+    for (int f = 0; f < 2; f++) {
+        size_t s = i;
+        for (; i < len; i++) {
+            char c = ln[i]; int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) break;
+            v[f] = v[f] << 4 | (uint64_t)d;
+        }
+        if (i == s || i >= len || ln[i] != (f ? ' ' : '-')) return 0;
+        i++;
+    }
+    if (i + 4 > len) return 0;
+    memcpy(perms, ln + i, 4); perms[4] = 0; i += 4;
+    for (int f = 0; f < 3; f++) {   // offset, dev, inode
+        while (i < len && ln[i] == ' ') i++;
+        while (i < len && ln[i] != ' ') i++;
+    }
+    while (i < len && ln[i] == ' ') i++;
+    size_t e = len; while (e > i && (ln[e - 1] == ' ' || ln[e - 1] == '\r')) e--;
+    *lo = v[0]; *hi = v[1]; *name = ln + i; *nlen = e - i;
+    return 1;
+}
+typedef struct { char name[VKMB_NAME]; char perms[5]; uint8_t bucket, used; long n; uint64_t bytes; } vkmb_hent;
+typedef struct { vkmb_hent e[VKMB_HCAP]; long lines, dropped; uint64_t bytes; } vkmb_hist;
+static inline void vkmb_hist_reset(vkmb_hist *h) { memset(h, 0, sizeof *h); }
+// A name with its digit runs folded to one '#', cut to VKMB_NAME - 1 bytes; "(anonymous)" for an empty one
+static inline void vkmb_norm(const char *s, size_t n, char out[VKMB_NAME]) {
+    if (!n) { strcpy(out, "(anonymous)"); return; }
+    size_t o = 0;
+    for (size_t i = 0; i < n && o < VKMB_NAME - 1; i++) {
+        if (s[i] >= '0' && s[i] <= '9') { if (!o || out[o - 1] != '#') out[o++] = '#'; }
+        else out[o++] = s[i];
+    }
+    out[o] = 0;
+}
+// One line into the table (open addressing on the key's hash)
+static inline void vkmb_hist_add(vkmb_hist *h, const char *ln, size_t len) {
+    uint64_t lo, hi; char perms[5]; const char *nm; size_t nl;
+    if (!vkmb_fields(ln, len, &lo, &hi, perms, &nm, &nl) || hi < lo) return;
+    char key[VKMB_NAME]; vkmb_norm(nm, nl, key);
+    uint64_t sz = hi - lo; int b = vkmb_bucket(sz);
+    uint32_t x = 2166136261u;
+    for (const char *p = key; *p; p++) x = (x ^ (uint8_t)*p) * 16777619u;
+    for (int i = 0; i < 4; i++) x = (x ^ (uint8_t)perms[i]) * 16777619u;
+    x = (x ^ (uint32_t)b) * 16777619u;
+    h->lines++; h->bytes += sz;
+    for (int k = 0; k < VKMB_HCAP; k++) {
+        vkmb_hent *e = &h->e[(x + (uint32_t)k) % VKMB_HCAP];
+        if (!e->used) { e->used = 1; strcpy(e->name, key); memcpy(e->perms, perms, 5); e->bucket = (uint8_t)b; }
+        else if (e->bucket != b || memcmp(e->perms, perms, 4) || strcmp(e->name, key)) continue;
+        e->n++; e->bytes += sz; return;
+    }
+    h->dropped++;
+}
+// The indexes of the (at most k) largest groups by maps, largest first; how many there are
+static inline int vkmb_hist_top(const vkmb_hist *h, int *idx, int k) {
+    int n = 0;
+    if (k <= 0) return 0;
+    for (int i = 0; i < VKMB_HCAP; i++) {
+        if (!h->e[i].used) continue;
+        int j;
+        if (n < k) idx[j = n++] = i;
+        else if (h->e[i].n > h->e[idx[k - 1]].n) idx[j = k - 1] = i;
+        else continue;
+        while (j > 0 && h->e[idx[j - 1]].n < h->e[idx[j]].n) { int t = idx[j - 1]; idx[j - 1] = idx[j]; idx[j] = t; j--; }
+    }
+    return n;
+}
 #endif

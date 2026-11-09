@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -128,7 +129,10 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
 
 
 // ---------- The pipeline cache ----------
-// DM_VK_PCACHE (restart): unset = $DM_TEMP/vk_pipelines[-<driver>].bin; a path = that file; 0 = no file (the run starts empty and keeps nothing: a cold run). Before 2026-11-03 "0"
+// DM_VK_PCACHE (restart): unset = $DM_TEMP/vk_pipelines[-<driver>]-fp0.bin (-fp0: the cache's generation, vka_fpenv.h VKA_PCACHE_GEN); a path = that file, as named; 0 = no
+// file (the run starts empty and keeps nothing: a cold run). DM_VK_GUEST_FPCR=1 keeps no file either: its pipelines are compiled with the game's FPCR, and no later run
+// may read them (vka_fpenv.h). The files of the generation before (vk_pipelines[-<driver>].bin, pipelines compiled with the game's flush-to-zero FPCR before 2026-11-08)
+// are removed when the default file is opened, with their stamps. Before 2026-11-03 "0"
 // was taken as a file named 0 in the working folder, so a second "cold" run read the first one's pipelines back (stutter-agent cold2gpl: 10 MB read, warm)
 // The file is kept for one shader library at a time: its stamp <file>.lib (vka_pckeep.h; written with each save) names the library it was saved with (vka_shader_lib_id) and
 // lists the shaders whose pipelines it holds with their entry hashes. A file of another library is read when its shaders are mostly byte for byte the same in this one
@@ -157,11 +161,15 @@ static void pc_open_once(void) {
     // through the media daemon, while the app's own internal files are ext4/f2fs directly. The driver tag stays, so switching drivers still leaves the other's cache alone
     const char *cd = getenv("DM_VK_PCACHE_DIR");
     if (cd && *cd) { t = cd; static int made; if (!made++) mkdir(cd, 0777); }
-    if (e && !strcmp(e, "0")) g_pc_path[0] = 0;
+    if ((e && !strcmp(e, "0")) || vka_fp_guest()) g_pc_path[0] = 0;
     else if (e && *e) snprintf(g_pc_path, sizeof g_pc_path, "%s", e);
     else if ((t && *t) || (home && *home)) {   // a custom driver (DM_VK_DRIVER) keeps its own file, so switching drivers leaves the system driver's cache alone
-        const char *dt = vka_driver_tag();
-        snprintf(g_pc_path, sizeof g_pc_path, "%s/vk_pipelines%s%s.bin", t && *t ? t : home, dt ? "-" : "", dt ? dt : "");
+        const char *dt = vka_driver_tag(), *dir = t && *t ? t : home;
+        vka_pcache_name(g_pc_path, sizeof g_pc_path, dir, dt, VKA_PCACHE_GEN);
+        char old[1024], olds[1100]; vka_pcache_name(old, sizeof old, dir, dt, "");   // the generation before: never read again
+        snprintf(olds, sizeof olds, "%s.lib", old);
+        if (!unlink(old)) VLOG("pipeline cache %s of the generation before " VKA_PCACHE_GEN " (compiled with the game's FPCR) removed", old);
+        unlink(olds);
     }
     // The prewarm list (pw_*): the pipeline keys of earlier runs, whatever the driver (a key names shaders and state, not driver code). DM_VK_PREWARM_FILE overrides
     const char *pf = getenv("DM_VK_PREWARM_FILE");
@@ -215,7 +223,7 @@ static void pc_open_once(void) {
     VkResult r = vk.vkCreatePipelineCache(V.dev, &ci, NULL, &g_pc);
     if (r && n) { ci.initialDataSize = 0; ci.pInitialData = NULL; r = vk.vkCreatePipelineCache(V.dev, &ci, NULL, &g_pc); vka_pck_free(&g_pck); n = 0; }   // (started empty after all)
     if (r) { g_pc = VK_NULL_HANDLE; VRED("vkCreatePipelineCache %d: pipelines are built without a cache", r); }
-    else VLOG("pipeline cache %s: %zu bytes read (its stamp lists %zu shaders, %llu stale)", g_pc_path[0] ? g_pc_path : e && !strcmp(e, "0") ? "(none: DM_VK_PCACHE=0)" : "(not kept: no DM_TEMP or HOME)", n,
+    else VLOG("pipeline cache %s: %zu bytes read (its stamp lists %zu shaders, %llu stale)", g_pc_path[0] ? g_pc_path : e && !strcmp(e, "0") ? "(none: DM_VK_PCACHE=0)" : vka_fp_guest() ? "(none: DM_VK_GUEST_FPCR=1)" : "(not kept: no DM_TEMP or HOME)", n,
               g_pck.n, (unsigned long long)g_pck.dead);
     free(data);
     pw_load();
@@ -264,7 +272,7 @@ static void save_now(void) {
     free(d);
 }
 static void *saver_main(void *a) {
-    (void)a; pthread_setname_np(pthread_self(), "vk-pcache");
+    (void)a; pthread_setname_np(pthread_self(), "vk-pcache"); vka_fp_host("vk-pcache");
     for (;;) {
         pthread_mutex_lock(&g_sv_mu); while (!g_sv_want) pthread_cond_wait(&g_sv_cv, &g_sv_mu); g_sv_want = 0; pthread_mutex_unlock(&g_sv_mu);
         pthread_mutex_lock(&g_save_mu); save_now(); pthread_mutex_unlock(&g_save_mu);
@@ -454,7 +462,57 @@ static int build_begin(const char *what, uint64_t vs, uint64_t fs) {
         atomic_store(&g_build[i].what, what); atomic_store(&g_build[i].vs, vs); atomic_store(&g_build[i].fs, fs); atomic_store(&g_build[i].t0, now_ns()); atomic_store(&g_build[i].tid, gettid()); return i; } }
     return -1;
 }
-static void build_end(int i) { if (i >= 0) atomic_store(&g_build[i].tid, 0); }
+// Shaders (pre-rasterization or compute keys) whose build took DM_VK_PREWARM_HEAVY_MS or more on this driver, kept beside its pipeline cache (<cache file>.heavy, a hex key
+// a line, appended as they are found). Turnip compiles some of them again every run, cache hit or not (Ocarina of Time: vertex b1f06157308e3b22 8.6-18 s in each of four
+// runs), and prewarm threads that start them in the same second all pass the age check of pw_heavy_hold: three at once took 58,619 maps of 65,530. A known one is held
+// from its start
+enum { NHEAVY = 1024 };
+static uint64_t g_heavy[NHEAVY]; static _Atomic int g_heavy_n; static char g_heavy_path[1100]; static pthread_mutex_t g_heavy_mu = PTHREAD_MUTEX_INITIALIZER;
+static int heavy_has(uint64_t k) { int n = atomic_load(&g_heavy_n); for (int i = 0; i < n; i++) if (g_heavy[i] == k) return 1; return 0; }
+static void heavy_add(uint64_t k, int save) {
+    pthread_mutex_lock(&g_heavy_mu);
+    int n = atomic_load(&g_heavy_n);
+    if (k && n < NHEAVY && !heavy_has(k)) {
+        g_heavy[n] = k; atomic_store(&g_heavy_n, n + 1);
+        if (!g_heavy_path[0] && g_pc_path[0]) snprintf(g_heavy_path, sizeof g_heavy_path, "%s.heavy", g_pc_path);
+        FILE *f = save && g_heavy_path[0] ? fopen(g_heavy_path, "a") : NULL;
+        if (f) { fprintf(f, "%016llx\n", (unsigned long long)k); fclose(f); }
+    }
+    pthread_mutex_unlock(&g_heavy_mu);
+}
+static void heavy_load(void) {
+    if (!g_pc_path[0]) return;
+    pthread_mutex_lock(&g_heavy_mu); snprintf(g_heavy_path, sizeof g_heavy_path, "%s.heavy", g_pc_path); pthread_mutex_unlock(&g_heavy_mu);
+    FILE *f = fopen(g_heavy_path, "r"); if (!f) return;
+    char ln[64]; while (fgets(ln, sizeof ln, f)) { uint64_t k = strtoull(ln, NULL, 16); if (k) heavy_add(k, 0); }
+    fclose(f);
+    VLOG("long compiles: %d shaders of earlier runs on this driver (%s): prewarm makes them one at a time (DM_VK_PREWARM_HEAVY_MS)", atomic_load(&g_heavy_n), g_heavy_path);
+}
+static void build_end(int i) {
+    if (i < 0) return;
+    uint64_t vs = atomic_load(&g_build[i].vs), age = now_ns() - atomic_load(&g_build[i].t0); const char *what = atomic_load(&g_build[i].what);
+    atomic_store(&g_build[i].tid, 0);
+    int ms = VKA_ENV("DM_VK_PREWARM_HEAVY_MS", 1000);
+    if (vs && ms > 0 && age >= (uint64_t)ms * 1000000ull && !heavy_has(vs)) {
+        heavy_add(vs, 1);
+        VLOG("long compile: %s of shader %016llx took %.1f s: remembered (%s), prewarm makes such shaders one at a time", what, (unsigned long long)vs, age / 1e9, g_heavy_path[0] ? g_heavy_path : "this run only");
+    }
+}
+// The same list in the log, with each thread's name (the memory maps thread's histogram, vka_mem.c maps_hist_log, DM_VK_MAPS_HIST): which compiles run while the maps
+// outside the guest block climb
+void vka_pso_builds_log(void) {
+    uint64_t t = now_ns(); int n = 0;
+    for (int i = 0; i < NBUILD; i++) {
+        pid_t id = atomic_load(&g_build[i].tid); if (id <= 0) continue;
+        char path[64], comm[32] = "?"; snprintf(path, sizeof path, "/proc/self/task/%d/comm", (int)id);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) { ssize_t k = read(fd, comm, sizeof comm - 1); close(fd); if (k > 0) { comm[k] = 0; if (comm[k - 1] == '\n') comm[k - 1] = 0; } }
+        VLOG("  being made now: %s by thread %d '%s' for %.1f s (shaders %016llx %016llx)", atomic_load(&g_build[i].what), (int)id, comm,
+             (t - atomic_load(&g_build[i].t0)) / 1e9, (unsigned long long)atomic_load(&g_build[i].vs), (unsigned long long)atomic_load(&g_build[i].fs));
+        n++;
+    }
+    if (!n) VLOG("  being made now: no pipeline");
+}
 // The whole pipeline (optimized), with creation feedback (core in 1.3) for the line of a slow one: whether the pipeline cache had it and each stage's share. how: NULL = on the
 // frame path (counted as the frame's), else where it was made (" in the background", " (prewarm)")
 static VkPipeline full_pipeline(pstate *P, vka_shader *const sh[VKA_NSTAGE], const char *how) {
@@ -708,7 +766,7 @@ typedef struct opt_job { struct opt_job *next; gval *g; vka_shader *sh[VKA_NSTAG
 static opt_job *g_opt_head, **g_opt_tail = &g_opt_head; static pthread_mutex_t g_opt_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_opt_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_opt_waiting;
 static void *opt_main(void *a) {
-    (void)a; pthread_setname_np(pthread_self(), "vk-psopt");
+    (void)a; pthread_setname_np(pthread_self(), "vk-psopt"); vka_fp_host("vk-psopt");
     for (;;) {
         pause_point();
         pthread_mutex_lock(&g_opt_mu);
@@ -911,9 +969,31 @@ static uint64_t mem_avail_mb(void) {
     if (f) fclose(f);
     return kb >> 10;
 }
-static _Atomic uint64_t g_pw_memwait_ns;
+static _Atomic uint64_t g_pw_memwait_ns, g_pw_heavywait_ns;
+// Whether a prewarm thread holds its next compile: while a build anywhere in the process (frame path, asynchronous, prewarm) has run for heavy_ns or more, or while
+// another build of the same pre-rasterization or compute shader (key) runs. Turnip's compiler keeps thousands of 64 KiB-1 MiB blocks for the length of a multi-second
+// compile, and Android's allocator (scudo's secondary) maps each block apart with a guard: two process memory maps a block, 4.1 GB in 27,000 blocks for three compiles
+// at once. Ocarina of Time (0400486024DEC000, Turnip Gen8 V39 on the Adreno 830): a 13 s mesh compile and two of vertex shader b1f06157308e3b22 at once took the
+// maps outside the guest block from 6,000 to 59,662 in 10 s, past vm.max_map_count (65,530); the driver's next allocation failed (SIGSEGV at 0, std::bad_alloc).
+// Open: why these shaders take Turnip 8-22 s and that much memory (a driver matter); the hold only keeps them from piling up
+// A key known to be long (heavy_has: an earlier build of it took heavy_ns or more, this run or an earlier one) also holds while any other known one is being built, from
+// its first millisecond: the age check alone let three start together. (Prewarm builds themselves never overlap: g_pw_one, in pw_main)
+static int pw_heavy_hold(uint64_t key, uint64_t heavy_ns) {
+    uint64_t t = now_ns(); int mine = key && heavy_has(key);
+    for (int i = 0; i < NBUILD; i++) {
+        if (atomic_load(&g_build[i].tid) <= 0) continue;
+        uint64_t vs = atomic_load(&g_build[i].vs);
+        if (t - atomic_load(&g_build[i].t0) >= heavy_ns || (key && vs == key) || (mine && vs && heavy_has(vs))) return 1;
+    }
+    return 0;
+}
+// One prewarm build at a time on VK_DRIVER_ID_MESA_TURNIP (DM_VK_PREWARM_OVERLAP=1: as before, one a thread; the default on other drivers). A build's cost is known only
+// after it, and four unknown ones that started within one second (Ocarina of Time on Turnip: e963ef2241a51be8, cf04467527cbcf8f, 171409a493cf5268, 11-12 s each) took
+// the process past vm.max_map_count again with the hold above in place. The threads still look up and prepare their keys in parallel; a warm run's cache hits take
+// milliseconds each. Qualcomm's driver's compiler does not take the maps with it (21,450 at most, same phone and game), so its threads keep building side by side
+static pthread_mutex_t g_pw_one = PTHREAD_MUTEX_INITIALIZER;
 static void *pw_main(void *a) {
-    (void)a; pthread_setname_np(pthread_self(), "vk-prewarm");
+    (void)a; pthread_setname_np(pthread_self(), "vk-prewarm"); vka_fp_host("vk-prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // this thread (Linux: per-thread nice), under the game's threads
     uint32_t max = (uint32_t)VKA_ENV("DM_VK_PREWARM_MAX", 8192);
     size_t *offs = NULL;   // walked once by each thread to find the record of index i: built here (the list is small)
@@ -930,6 +1010,9 @@ static void *pw_main(void *a) {
     // with the game's first 3D scene loaded the phone had 1.1-1.9 GB left; four threads then ran it out (Turnip run t-tur1c: MemAvailable 0.38 GB, mprotect failing with
     // ENOMEM, a crash at 83 s). The first thread goes on as the frame path would make the same pipelines one at a time anyway
     uint32_t mem_mb = (uint32_t)VKA_ENV("DM_VK_PREWARM_MEM_MB", 2048);
+    // Each thread holds its next compile while a long one runs (DM_VK_PREWARM_HEAVY_MS, default 1000; 0 never), or another build of the same shader (pw_heavy_hold)
+    int heavy_ms = VKA_ENV("DM_VK_PREWARM_HEAVY_MS", 1000); uint64_t heavy_ns = heavy_ms > 0 ? (uint64_t)heavy_ms * 1000000ull : 0;
+    int overlap = VKA_ENV("DM_VK_PREWARM_OVERLAP", V.driver_id != VK_DRIVER_ID_MESA_TURNIP) != 0;   // 1: each thread builds on its own (default off Turnip); 0: g_pw_one
     for (;;) {
         pause_point();
         if (me > 0 && mem_mb) { uint64_t t0 = 0, av; while ((av = mem_avail_mb()) && av < mem_mb && atomic_load(&g_pw_next) < n) { if (!t0) t0 = now_ns(); usleep(250000); pause_point(); }
@@ -954,6 +1037,13 @@ static void *pw_main(void *a) {
         int skip = 0;   // an instanced run's pipeline with instancing off: not made, kept in the list
         for (int s = 0; s < 2 && !bad && !skip && r.kind == VKA_PW_GFX; s++) if (r.inst[s] && !(sh[s] = vka_inst_variant(sh[s], sh[s]->e->stage * DMSH_VK_STAGE_BINDINGS + r.inst[s] - 1u))) skip = 1;
         if (skip) continue;
+        int one = !bad && !overlap; if (one) pthread_mutex_lock(&g_pw_one);   // one prewarm build at a time (g_pw_one)
+        if (!bad && heavy_ns) {   // hold while a long compile runs, or another of this shader (pw_heavy_hold)
+            const vka_shader *pre = r.kind == VKA_PW_CS ? sh[5] : r.kind == VKA_PW_MESH ? sh[7] : sh[0];
+            uint64_t key = pre ? pre->key : 0, t0 = 0;
+            while (pw_heavy_hold(key, heavy_ns)) { if (!t0) t0 = now_ns(); usleep(50000); pause_point(); }
+            if (t0) atomic_fetch_add(&g_pw_heavywait_ns, now_ns() - t0);
+        }
         int made = 0;
         if (bad) { atomic_fetch_add(&g_pw_bad, 1); pw_mark_bad(offs[i]); }
         else if (r.kind == VKA_PW_CS) { cs_obtain(sh[5], &lay, 1, &made, 0, 0); }
@@ -966,15 +1056,17 @@ static void *pw_main(void *a) {
                 gfx_obtain(&fk, fnv(&fk, len, 1469598103934665603ull), len, sh, &lay, &k, 1, &made);
             }
         }
+        if (one) pthread_mutex_unlock(&g_pw_one);
         if (made) atomic_fetch_add(&g_pw_made, 1); else if (!bad) atomic_fetch_add(&g_pw_had, 1);
         setpriority(PRIO_PROCESS, 0, 10);   // back under the game's threads if a waiting frame path raised it (busy_wait)
     }
     free(offs);
     if (atomic_fetch_add(&g_pw_done, 1) + 1 == (uint32_t)g_pw_threads)
         VLOG("prewarm: %u of %u pipeline keys in %.1f s on %d threads: %u made, %u already there, %u dropped (shaders no longer in the library, another device's keys); the frame path waited %.0f ms for them; "
-             "threads waited %.1f s for memory (DM_VK_PREWARM_MEM_MB)",
+             "threads waited %.1f s for memory (DM_VK_PREWARM_MEM_MB), %.1f s for a long compile (DM_VK_PREWARM_HEAVY_MS)",
              (unsigned)(atomic_load(&g_pw_made) + atomic_load(&g_pw_had) + atomic_load(&g_pw_bad)), n, (now_ns() - g_pw_t0) / 1e9, g_pw_threads, (unsigned)atomic_load(&g_pw_made),
-             (unsigned)atomic_load(&g_pw_had), (unsigned)atomic_load(&g_pw_bad), atomic_load(&g_pw_wait_ns) / 1e6, atomic_load(&g_pw_memwait_ns) / 1e9);
+             (unsigned)atomic_load(&g_pw_had), (unsigned)atomic_load(&g_pw_bad), atomic_load(&g_pw_wait_ns) / 1e6, atomic_load(&g_pw_memwait_ns) / 1e9,
+             atomic_load(&g_pw_heavywait_ns) / 1e9);
     return NULL;
 }
 // DM_VK_PREWARM threads (default 4, at most 4; 2 before 2026-11-08). With the pipeline cache warm a key costs a few milliseconds (297 in 0.1 s on 2 threads); with it
@@ -984,6 +1076,7 @@ static void pw_start(void) {
     int nt = VKA_ENV("DM_VK_PREWARM", 4);
     if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (DM_VK_PREWARM=0): %u keys not made ahead", g_pw_load_n); return; }
     if (nt > 4) nt = 4;
+    heavy_load();   // the shaders earlier runs found long on this driver (build_end)
     g_pw_t0 = now_ns(); g_pw_threads = 0;
     for (int i = 0; i < nt; i++) { pthread_t th; if (!pthread_create(&th, NULL, pw_main, NULL)) { pthread_detach(th); g_pw_threads++; } }
     VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %d background threads (DM_VK_PREWARM=0 off)", g_pw_load_n, g_pw_threads);
@@ -1011,7 +1104,7 @@ static as_job *g_as_head, **g_as_tail = &g_as_head; static pthread_mutex_t g_as_
 static _Atomic uint64_t g_as_queued, g_as_made, g_as_skips, g_as_ns, g_as_lat_max_ns; static _Atomic int g_as_depth, g_as_depth_max;
 static void gfx_build(gval *g, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int async, uint64_t t_make);
 static void *as_main(void *a) {
-    (void)a; pthread_setname_np(pthread_self(), "vk-psoasync");
+    (void)a; pthread_setname_np(pthread_self(), "vk-psoasync"); vka_fp_host("vk-psoasync");
     setpriority(PRIO_PROCESS, 0, 10);   // under the game's threads, as the prewarm threads: no frame waits for these builds (their draws are skipped instead)
     for (;;) {
         pause_point();

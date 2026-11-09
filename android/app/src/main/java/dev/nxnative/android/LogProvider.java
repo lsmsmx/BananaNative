@@ -14,9 +14,11 @@ import java.io.FileNotFoundException;
 import java.util.Arrays;
 import java.util.Comparator;
 
-/** The run logs (<external files>/logs/*.log), read-only, for the Share log button: content://<application ID>.logs/<file name> */
+/** The run logs (<external files>/logs/*.log) and their digests (*.digest.txt, ExitWatch), read-only, for the Share log button: content://<application ID>.logs/<file name> */
 public final class LogProvider extends ContentProvider {
     static final String AUTHORITY = BuildConfig.APPLICATION_ID + ".logs";
+    /** The suffix of a run log's digest (<log name without .log>.digest.txt) */
+    static final String DIGEST = ".digest.txt";
 
     static File dir(Context c) {
         File d = new File(c.getExternalFilesDir(null), "logs");
@@ -38,7 +40,7 @@ public final class LogProvider extends ContentProvider {
 
     private File file(Uri uri) throws FileNotFoundException {
         String n = uri.getLastPathSegment();
-        if (n == null || n.contains("/") || !n.endsWith(".log")) throw new FileNotFoundException(String.valueOf(uri));
+        if (n == null || n.contains("/") || !(n.endsWith(".log") || n.endsWith(DIGEST))) throw new FileNotFoundException(String.valueOf(uri));
         File f = new File(dir(getContext()), n);
         if (!f.isFile()) throw new FileNotFoundException(f.getPath());
         return f;

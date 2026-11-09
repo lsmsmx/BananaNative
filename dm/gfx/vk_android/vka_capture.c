@@ -473,7 +473,7 @@ static void cap_head(void) {
     KV("format\t%u\n", CAP_VERSION); KV("backend\tvulkan\n"); KV("iface\t%d\n", VCAP_IFACE); KV("chain\t%s\n", DMSH_CHAIN); KV("vk_chain\t%s\n", DMSH_VK_CHAIN);
     KV("commit\t%s\n", commit && *commit ? commit : "unknown"); KV("title\t%s\n", DM_GAME_ID); KV("build\t%s\n", dm_main_build());
     KV("frame\t%d\n", g_cap_frame); KV("frames\t1\n"); KV("mtl_frame\t%llu\n", (unsigned long long)vka_frame()); KV("vk_shlib\t%s\n", lib);
-    if (pc && *pc) KV("vk_pcache\t%s\n", pc); else if (tmp && *tmp) KV("vk_pcache\t%s/vk_pipelines.bin\n", tmp);
+    if (pc && *pc) KV("vk_pcache\t%s\n", pc); else if (tmp && *tmp) { char dp[1100]; vka_pcache_name(dp, sizeof dp, tmp, vka_driver_tag(), VKA_PCACHE_GEN); KV("vk_pcache\t%s\n", dp); }   // (vka_pso.c's default)
     KV("device\t%s\n", V.props.deviceName);
     for (char **e = environ; e && *e; e++) if (!strncmp(*e, "DM_", 3) && strncmp(*e, "DM_NVN_CAPTURE=", 15)) KV("env\t%s\n", *e);
 #undef KV

@@ -38,7 +38,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         //   2 0x923 / 0x3800  mesh: the task memory its task wrote (word 0 the mesh workgroup's index, records from 0x10)
         //   3 0x927 / 0xb800  task: the task memory (+4 = the mesh workgroups to launch)
         //   4 0x927 / 0xf800  mesh: the per-vertex planes (one 0x80-byte plane per output component, 32 vertices a chunk), then the per-primitive values
-        //   5 0x927 / 0x8000  mesh: the primitive index bytes (4 + 3 t ...), 8-bit stores
+        //   5 0x927 / 0x8000  mesh: the primitive index bytes (4 + n t ..., n the vertices per primitive: MeshShaderInfo.PrimitiveVertices), 8-bit stores
         //   6 0x927 / 0x8800  mesh: the counts header (byte 3 = the primitive count), 8-bit stores
         private enum AStageWindow
         {

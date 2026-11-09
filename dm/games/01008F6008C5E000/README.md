@@ -21,7 +21,7 @@ builder takes the newest version and derives a profile without these checks.
 
 The same keys as Scarlet's profile, for the same reasons
 ([Scarlet, Memory](../0100A3D008C5C000/README.md#memory)): the alias region
-for the host's StandardAllocator cap, `mem_map_limit on` for the startup
+for the host's StandardAllocator cap, `mem_map_limit` (now every game's default) for the startup
 probe of all allocatable memory, `depth_mode zero` for the game's
 near = 0 depth mode, and `pad_layout full`. The 62 MB node-area cut and the
 alignment of large regions come with the `sdk` build (`dm/tools/sdk_patches.py`

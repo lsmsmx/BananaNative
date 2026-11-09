@@ -2537,6 +2537,10 @@ int mtl_tex_gpu_owned(uint64_t serial) {
     if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) return 0;
     return (((id<MTLTexture>)o).usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
 }
+void mtl_tex_write_region(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+    (void)level; (void)layer0; (void)r; (void)src; (void)row; (void)img;
+    mtl_tex_cpu_written(t);
+}
 void mtl_tex_cpu_written(const tex_t *t) {
     uint64_t serial = t->serial;
     if (!serial) return;

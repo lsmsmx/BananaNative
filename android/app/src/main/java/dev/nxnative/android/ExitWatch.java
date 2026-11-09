@@ -8,9 +8,11 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.RandomAccessFile;
 import java.io.StringWriter;
@@ -29,7 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * installed here, "state=native" by nxlaunch.c's signal handler (NX_EXIT_RECORD), "state=host_exit" when the host returns. The launcher reads it when it comes to the
  * front, and every 2 s while it shows and the record says a game is running (so a game that dies while the launcher shows is noticed at once); once the game's process is
  * gone it adds Android's ApplicationExitInfo for that process and the end of the run's log, and shows "The game stopped unexpectedly" with the cause, Share log and OK,
- * once per exit ("shown=1" is appended).
+ * once per exit ("shown=1" is appended). LogDigest reads the end of that log with dm/tools/log_digest.py's rules: the notice adds the likely cause and "What it means"
+ * (the rule's doc) when a rule matched, and Share log sends the digest's text beside the log.
  */
 final class ExitWatch {
     private ExitWatch() {}
@@ -160,23 +163,69 @@ final class ExitWatch {
 
     private static long num(String s) { try { return Long.parseLong(s); } catch (RuntimeException e) { return -1; } }
 
-    /** The record's cause, or null (nothing to tell, or the process still runs). waitForAndroid: a run the app did not see end has no cause until Android has its exit info */
-    static String cause(Context c, Map<String, String> rec, boolean waitForAndroid) {
+    /** A run's end as the notice tells it: the cause sentence and Android's exit info it came from (reason ExitNotice.NONE without one) */
+    static final class End {
+        final String why, desc; final int reason, status; final boolean background;
+        End(String why, int reason, int status, String desc, boolean background) { this.why = why; this.reason = reason; this.status = status; this.desc = desc; this.background = background; }
+    }
+
+    /** The record's end, or null (nothing to tell, or the process still runs). waitForAndroid: a run the app did not see end has no cause until Android has its exit info */
+    static End end(Context c, Map<String, String> rec, boolean waitForAndroid) {
         if (!ExitNotice.pending(rec)) return null;
         int pid = (int) num(rec.get("pid"));
         if (pid == android.os.Process.myPid() || pid > 0 && alive(c, pid)) return null;
         ApplicationExitInfo e = exitInfo(c, pid, num(rec.get("start")) - 1000);
         if (e == null && waitForAndroid && !ExitNotice.selfExplained(rec)) return null;
         boolean bg = e != null && e.getImportance() > ActivityManager.RunningAppProcessInfo.IMPORTANCE_VISIBLE;
-        return ExitNotice.cause(rec, e == null ? ExitNotice.NONE : e.getReason(), e == null ? 0 : e.getStatus(), e == null ? null : e.getDescription(), bg,
-                tail(logOf(c, rec), 32 * 1024));
+        int reason = e == null ? ExitNotice.NONE : e.getReason(), status = e == null ? 0 : e.getStatus();
+        String desc = e == null ? null : e.getDescription();
+        String why = ExitNotice.cause(rec, reason, status, desc, bg, tail(logOf(c, rec), 32 * 1024));
+        return why == null ? null : new End(why, reason, status, desc, bg);
     }
+
+    /** The record's cause sentence, or null (as end) */
+    static String cause(Context c, Map<String, String> rec, boolean waitForAndroid) {
+        End e = end(c, rec, waitForAndroid);
+        return e == null ? null : e.why;
+    }
+
+    // ---- The log's digest (LogDigest, with dm/tools/log_rules.tsv and log_noise.tsv from the APK's assets) ----
+    private static List<LogDigest.Row> rules, noise;
+
+    private static String asset(Context c, String name) throws IOException {
+        try (InputStream in = c.getAssets().open(name); ByteArrayOutputStream o = new ByteArrayOutputStream()) {
+            byte[] b = new byte[16384];
+            for (int k; (k = in.read(b)) > 0; ) o.write(b, 0, k);
+            return o.toString("UTF-8");
+        }
+    }
+
+    /** The digest of the run's log for this end, its text written beside the log (<log name without .log>.digest.txt, for Share log); null when it cannot be made */
+    static LogDigest.Verdict digest(Context c, File log, Map<String, String> rec, End end) {
+        if (log == null) return null;
+        try {
+            synchronized (ExitWatch.class) {
+                if (rules == null) { rules = LogDigest.rules(asset(c, LogDigest.RULES_ASSET)); noise = LogDigest.noise(asset(c, LogDigest.NOISE_ASSET)); }
+            }
+            LogDigest d = new LogDigest(rules, noise);
+            d.readTail(log, LogDigest.TAIL_BYTES);
+            LogDigest.Verdict v = d.verdict(rec, end.reason, end.status, end.desc, end.background);
+            Files.write(digestOf(log).toPath(), d.render(v).getBytes(StandardCharsets.UTF_8));
+            return v;
+        } catch (IOException | RuntimeException e) {
+            return null;   // no digest: the notice keeps its sentence
+        }
+    }
+
+    /** The digest file beside a run's log */
+    static File digestOf(File log) { return new File(log.getParentFile(), log.getName().replaceFirst("\\.log$", "") + LogProvider.DIGEST); }
 
     // ---- The launcher ----
     private static final Handler UI = new Handler(Looper.getMainLooper());
     private static Runnable poll;
     private static int waits;
     private static AlertDialog showing;
+    private static boolean digesting;   // a notice's digest is being made (off the main thread): no second check meanwhile
 
     /** MainActivity.onResume: a check now, and every 2 s while it shows and a game runs */
     static void resume(MainActivity a) {
@@ -198,27 +247,41 @@ final class ExitWatch {
 
     /** One check; true: look again later (a game runs, or its end is not known to Android yet) */
     private static boolean check(MainActivity a) {
-        if (showing != null && showing.isShowing()) return false;
+        if (showing != null && showing.isShowing() || digesting) return false;
         Map<String, String> rec = read(a);
         if (!ExitNotice.pending(rec)) return false;
         int pid = (int) num(rec.get("pid"));
         if (pid > 0 && alive(a, pid)) return true;   // still running
         // Gone: Android writes its exit info as the process dies; a run the app did not see end waits for it up to about 6 s, then is told without it
         boolean wait = waits++ < 3;
-        String why = cause(a, rec, wait);
-        if (why != null) { show(a, rec, why); return false; }
+        End end = end(a, rec, wait);
+        if (end != null) { show(a, rec, end); return false; }
         if (wait) return true;
         shown(a);   // nothing to tell (the player swiped it away, an update, the game's own exit): not read again
         return false;
     }
 
-    private static void show(MainActivity a, Map<String, String> rec, String why) {
-        shown(a);
+    /** The notice, once the log's digest is made on a thread of its own (the end of a log of many MB is read): its likely cause and doc link when a rule matched.
+     *  Marked shown only when it shows (a launcher gone meanwhile tells it at its next resume) */
+    private static void show(MainActivity a, Map<String, String> rec, End end) {
         File log = logOf(a, rec);
-        AlertDialog.Builder b = new AlertDialog.Builder(a).setTitle(ExitNotice.TITLE).setMessage(ExitNotice.message(rec.get("name"), why))
-                .setPositiveButton("OK", null);
-        if (log != null) b.setNeutralButton("Share log", (d, w) -> a.shareLog(log));
-        showing = b.show();
+        digesting = true;
+        new Thread(() -> {
+            LogDigest.Verdict v = digest(a, log, rec, end);
+            UI.post(() -> {
+                digesting = false;
+                if (a.isFinishing() || a.isDestroyed()) return;
+                shown(a);
+                File dg = log == null ? null : digestOf(log);
+                String url = v == null ? null : v.docUrl();
+                String likely = LogDigest.likely(v, end.why);
+                AlertDialog.Builder b = new AlertDialog.Builder(a).setTitle(ExitNotice.TITLE).setMessage(ExitNotice.message(rec.get("name"), end.why, likely))
+                        .setPositiveButton("OK", null);
+                if (log != null) b.setNeutralButton("Share log", (d, w) -> a.shareLog(log, dg != null && dg.isFile() ? dg : null));
+                if (likely != null && url != null) b.setNegativeButton("What it means", (d, w) -> a.openLink(url));
+                showing = b.show();
+            });
+        }, "exit-digest").start();
     }
 
     /** The game's screen restored into a new process (GameActivity.onCreate): the cause of the end before, when the record has one, else null; marked shown */

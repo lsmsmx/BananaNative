@@ -96,6 +96,9 @@ class ExitNotice(unittest.TestCase):
         self.assertEqual(self.java('message', 'Test Game', 'It closed without saying why.'),
                          'Test Game: It closed without saying why.\\n\\nShare log sends the log of that run, which says more.')
         self.assertTrue(self.java('message', 'null', 'x').startswith('The game: x'))
+        self.assertEqual(self.java('message', 'Test Game', 'The game ran into an error and crashed.', 'The game crashed on a bad memory access (SIGBUS).'),
+                         'Test Game: The game ran into an error and crashed.\\n\\nLikely cause: The game crashed on a bad memory access (SIGBUS).'
+                         '\\n\\nShare log sends the log of that run, which says more.')
         trace = 'java.lang.NullPointerException: boom\n\tat a.B.c(B.java:1)\n\tat a.B.d(B.java:2)\n\tat a.B.e(B.java:3)\n'
         self.assertEqual(self.java('block', 'main', self.file(trace), 2),
                          '[RED] crash: uncaught exception on thread main, the game process ends\\n[RED] crash: java.lang.NullPointerException: boom\\n'

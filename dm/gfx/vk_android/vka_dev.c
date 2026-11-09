@@ -52,6 +52,38 @@ uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropert
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 
 static void *completion_main(void *arg);
+// ---------- The host's floating-point environment (vka_fpenv.h) ----------
+int vka_fp_guest(void) {
+    static _Atomic int v = -1;
+    int g = atomic_load_explicit(&v, memory_order_relaxed);
+    if (g < 0) {
+        g = vka_fp_guest_env(getenv("DM_VK_GUEST_FPCR"));
+        if (atomic_exchange(&v, g) < 0 && g) VLOG("DM_VK_GUEST_FPCR=1: the replay's threads and the driver's compiles keep the FPCR they inherit from the game; the pipeline cache keeps no file");
+    }
+    return g;
+}
+uint64_t vka_fp_host(const char *who) {
+    uint64_t was = vka_fp_enter(vka_fp_guest());
+    static _Atomic int n;
+    if (who && was != VKA_HOST_FPCR && atomic_fetch_add(&n, 1) < 8)
+        VLOG("%s: started with the game's FPCR %#llx%s", who, (unsigned long long)was, vka_fp_guest() ? ", kept (DM_VK_GUEST_FPCR=1)" : ", the host's (0) set");
+    return was;
+}
+// The calls of vk.* that compile go through these, so they compile with the host's FPCR on whatever thread calls them (the replay, presents, the NaN scan, NDSR,
+// a replay run inline on the game's thread), and the caller's FPCR is put back afterwards
+static PFN_vkCreateShaderModule g_csm; static PFN_vkCreateGraphicsPipelines g_cgp; static PFN_vkCreateComputePipelines g_ccp;
+static VkResult VKAPI_CALL fp_csm(VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *m) {
+    uint64_t f = vka_fp_host(NULL); VkResult r = g_csm(d, ci, a, m); vka_fp_back(f); return r; }
+static VkResult VKAPI_CALL fp_cgp(VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *p) {
+    uint64_t f = vka_fp_host(NULL); VkResult r = g_cgp(d, c, n, ci, a, p); vka_fp_back(f); return r; }
+static VkResult VKAPI_CALL fp_ccp(VkDevice d, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *p) {
+    uint64_t f = vka_fp_host(NULL); VkResult r = g_ccp(d, c, n, ci, a, p); vka_fp_back(f); return r; }
+static void fp_wrap_compiles(void) {
+    if (vka_fp_guest()) return;
+    if ((g_csm = vk.vkCreateShaderModule)) vk.vkCreateShaderModule = fp_csm;
+    if ((g_cgp = vk.vkCreateGraphicsPipelines)) vk.vkCreateGraphicsPipelines = fp_cgp;
+    if ((g_ccp = vk.vkCreateComputePipelines)) vk.vkCreateComputePipelines = fp_ccp;
+}
 static int init_once(void) {
     void *lib = vka_driver_open();   // DM_VK_DRIVER: a custom driver through libadrenotools (vka_driver.c); NULL = the system's
     if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
@@ -176,6 +208,7 @@ static int init_once(void) {
 #define D(f) vk.f = (PFN_##f)vk.vkGetDeviceProcAddr(V.dev, #f);
     VKA_DEVICE_FNS(D)
 #undef D
+    fp_wrap_compiles();
     if (!vk.vkMapMemory2KHR) vk.vkMapMemory2KHR = (PFN_vkMapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkMapMemory2");   // core in 1.4
     if (!vk.vkUnmapMemory2KHR) vk.vkUnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkUnmapMemory2");
     if (!vk.vkMapMemory2KHR || !vk.vkUnmapMemory2KHR) V.placed = V.placed_range = 0;
@@ -266,7 +299,8 @@ static int init_once(void) {
 int vka_init(void) {
     if (__atomic_load_n(&g_state, __ATOMIC_ACQUIRE)) return g_state > 0;
     pthread_mutex_lock(&g_init_mu);
-    if (!g_state) __atomic_store_n(&g_state, init_once() ? 1 : -1, __ATOMIC_RELEASE);
+    // With the host's FPCR: the driver compiles at device creation, and the threads it makes here inherit this thread's FPCR (often a game thread's)
+    if (!g_state) { uint64_t f = vka_fp_host(NULL); __atomic_store_n(&g_state, init_once() ? 1 : -1, __ATOMIC_RELEASE); vka_fp_back(f); }
     pthread_mutex_unlock(&g_init_mu);
     return g_state > 0;
 }
@@ -372,7 +406,7 @@ static void hang_declare(uint64_t want, uint64_t at, double s, const char *what)
 }
 
 static void *completion_main(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk-complete"); void vka_perf_thread(int nice); vka_perf_thread(-8);   // vka_perf.c
+    (void)arg; pthread_setname_np(pthread_self(), "vk-complete"); vka_fp_host("vk-complete"); void vka_perf_thread(int nice); vka_perf_thread(-8);   // vka_perf.c
     uint64_t stall_t0 = 0, stall_at = 0; int stall_logged = 0;
     for (;;) {
         pthread_mutex_lock(&g_fmu);

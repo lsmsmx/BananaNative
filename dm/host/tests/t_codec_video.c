@@ -25,6 +25,7 @@ void mav1_free(mav1 *a) { assert(a == (mav1 *)&g_av1_live); g_av1_live--; }
 void mav1_reset(mav1 *a) { (void)a; }
 int mav1_decode(mav1 *a, const uint8_t *data, size_t n, mav1_picture *out) { (void)a; (void)data; (void)n; (void)out; return 0; }
 const char *mav1_backend(const mav1 *a) { (void)a; return "none (test)"; }
+void mav1_set_time(mav1 *a, int64_t ts) { (void)a; (void)ts; }
 
 static const uint8_t vp8[] = {
     0xf0,0x02,0x00,0x9d,0x01,0x2a,0x10,0x00,0x10,0x00,0x00,0x47,0x08,0x85,0x85,0x88,
@@ -46,6 +47,7 @@ static const uint8_t vp9[] = {
 int main(void) {
     _Alignas(16) static uint8_t dec[0x400], pool[3][0x40], spt[0x80], mem[16 * 16 * 4];
     uint64_t size, align, id; uint32_t idx; cv_sync sync; uint16_t w, h, cw, ch; int64_t ts; bool eos;
+    setenv("DM_CODEC_THREAD", "0", 1);   // the protocol below on the submitting thread, where a picture is in its buffer when Submit returns; the decode thread at the end
 
     // Pools: one picture each, NV12 (format 3, as Bananza asks)
     cv_pref pref = h_cv_pref(16, 16, 3, 0);
@@ -194,6 +196,29 @@ int main(void) {
         for (int i = 0; i < 4096; i++) assert(abs(yuv[i] - 81) <= 4);
         for (int i = 4096; i < 6144; i += 2) { assert(abs(yuv[i] - 90) <= 6); assert(abs(yuv[i + 1] - 240) <= 6); }
         assert(!h_cv_h264fin(dh) && !cv_of(dh)); h_cv_poolfin(ph);
+    }
+    // The decode thread (the default): Submit returns at once and the picture comes from the thread; pictures waiting and packets not yet decoded count together, Submit
+    // refuses at CV_HOLD of them; a flush drops the queued packets and waits for a decode running; finalize ends the thread
+    unsetenv("DM_CODEC_THREAD");
+    {   _Alignas(16) static uint8_t dt[0x400], pt[0x40], mt[16 * 16 * 4];
+        assert(!h_cv_poolsize(&size, &align, &pref, 1) && !h_cv_pool(pt, mt, size, &pref, 1, 0));
+        assert(!h_cv_vp9init2(dt, 0x10000, 16, 16, 1, 1, 3) && cv_of(dt) && cv_of(dt)->th_ok);
+        assert(!h_cv_vp9reg(dt, 0, pt, 0) && !h_cv_vp9acq(&idx, &sync, dt) && idx == 0);
+        for (int i = 0; i < 4; i++) {
+            h_cv_vp9rel(dt, 0, sync); assert(!h_cv_vp9acq(&idx, &sync, dt) && idx == 0);
+            assert(!h_cv_vp9submit(&id, dt, vp9, sizeof vp9, 50000 + i, false));
+            for (int k = 0; k < 5000 && !h_gs_trywait(&sync); k++) usleep(1000);
+            assert(h_gs_trywait(&sync) && !h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dt, 0) && w == 16 && ts == 50000 + i && !eos);
+        }
+        int n = 0; while (n < 64 && !h_cv_vp9submit(&id, dt, vp9, sizeof vp9, 60000 + n, false)) n++;   // buffer 0 holds a picture the game has not released
+        assert(n == CV_HOLD && h_cv_vp9submit(&id, dt, vp9, sizeof vp9, 70000, false) == CV_BUSY);
+        assert(!h_cv_vp9flush(dt) && !cv_of(dt)->nq && !cv_of(dt)->busy && !cv_of(dt)->nheld);
+        h_cv_vp9rel(dt, 0, sync); assert(!h_cv_vp9acq(&idx, &sync, dt) && idx == 0);   // after the flush the stream starts again at the next key frame
+        assert(!h_cv_vp9submit(&id, dt, vp9, sizeof vp9, 80000, false));
+        for (int k = 0; k < 5000 && !h_gs_trywait(&sync); k++) usleep(1000);
+        assert(h_gs_trywait(&sync) && !h_cv_vp9props(&w, &h, &cw, &ch, &ts, &eos, dt, 0) && ts == 80000);
+        for (int i = 0; i < 3; i++) (void)h_cv_vp9submit(&id, dt, vp9, sizeof vp9, 90000 + i, false);   // finalize with packets still queued
+        assert(!h_cv_vp9fin(dt) && !cv_of(dt)); h_cv_poolfin(pt);
     }
     {   _Alignas(16) uint8_t da[0x400]; memset(da, 0xab, sizeof da);   // AV1: a host decoder (VideoToolbox or dav1d; the stand-ins here), freed with it
         assert(!h_cv_av1init2(da, 0x10000, 16, 16, 1, 1, 3) && cv_of(da) && cv_of(da)->codec == CV_AV1 && !h_cv_av1fin(da) && !cv_of(da) && !g_av1_live); }

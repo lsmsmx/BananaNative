@@ -29,6 +29,16 @@ Never commit or attach game files, keys, title keys or anything extracted from a
 - **Tests.** CI runs the host tests, the CPU-only graphics tests, the tool tests and the builds ([Continuous integration](docs/development.md#continuous-integration)). GitHub's runners have no Metal 4, so run the GPU tests on an Apple-silicon Mac: `make -C dm/gfx/tests GAME=<id> run`.
 - **The PR text.** Fill in the template: what and why, what was checked (tests, games, devices), and which docs changed.
 
+## Pull requests to the Android branch (Banana Native)
+
+The Android branch is `android` on the mirror. The same rules as above, plus:
+
+- **Start from the current `android`** and cherry-pick your own commits onto it. A branch forked before a history rewrite carries old copies of public commits and cannot be merged, whatever the merge button says.
+- **Source only.** No binaries of any kind: no translator DLLs (`dm/gfx/tools/dmsh_xlate_bin`), no `.so`, APK, GPU driver, shader library or prewarm seed. The maintainer builds every binary from source. A translator change is the `.cs` diff plus the shaders it fixes; do not change `dm/gfx/tools/dmsh_chain.lock` or the chain headers, they are regenerated here.
+- **Nothing under `dm/third_party/`.** Vendored code is pinned at a version; describe the change you need and the maintainer applies it as a documented version bump.
+- **Tests run on macOS** here: new tests must pass there (no `-no-pie`, no AddressSanitizer leak detection, no Linux-only flags such as `MAP_FIXED_NOREPLACE` in a test).
+- **Phone runs** on the system driver and a Turnip driver, about 20 s of play each, in the PR text ([docs/agents/06-dev-loop.md](docs/agents/06-dev-loop.md#checking-a-change-for-android)).
+
 ## Large changes and other platforms
 
 - **Agree on the scope first.** Open an issue before writing a change that adds a platform or device class, adds a second implementation of an existing path (for example a rendering path for GPUs without Metal 4), or runs to more than about 1,000 lines. A large PR built on an older `main` can rarely be reviewed or merged, however well it was tested.

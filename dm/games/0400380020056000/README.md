@@ -10,6 +10,7 @@ A Switch 2 game: update v65536 over the base game, SDK 21.4.4 built for the Swit
 | `mem_stack 0x10000000`, `app_pool 0x240000000` | `game.tsv` | as Donkey Kong Bananza, the Switch 2's 9 GB |
 | `sys_resource 0x2000000` | `game.tsv` | the NPDM declares 32 MB, so virtual address memory is on |
 | `render_cond on` | `game.tsv` | agl wraps its clears in render conditions; when those clears ran, the lit scene was wiped: the black dialogue scene ([Report tables that dropped entries](../../../docs/reference/rendering.md#report-tables-that-dropped-entries)) |
+| `gpu_timestamps segment` | `game.tsv` | agl's `MaintainGpuPercentage` dynamic resolution controller reads GPU segment timestamps |
 | `pad_layout full` | `game.tsv` | the game asks for most of the controller at once |
 
 ## Files
@@ -96,9 +97,12 @@ The work folder's `run/drive.sh <name> <secs> "<sec> <control line>"…` boots i
 - [Built-in fonts and the audio device notification of SDK 21](../../../docs/reference/services.md#built-in-fonts-and-the-audio-device-notification-of-sdk-21).
 - [An SDK 21 Switch 2 game with a 4.5 GB alias region](../../../docs/reference/memory.md#an-sdk-21-switch-2-game-with-a-45-gb-alias-region).
 - [Report tables that dropped entries](../../../docs/reference/rendering.md#report-tables-that-dropped-entries): the black dialogue scene.
+- [`WriteTexels` subregion updates on the Vulkan replay](../../../docs/reference/nvn-objects.md#writetexels-subregion-updates-on-the-vulkan-replay): `texture prepare` fell from 80–165 ms to 0.6 ms and the CPU texture uploads to ~0 on an AYN Thor (Adreno 740, Turnip) at the original resolution; the 40–60 fps at 720p also needs the profile's graphics-scale rows.
+- [Band-granular re-uploads of a tracked texture](../../../docs/reference/nvn-objects.md#band-granular-re-uploads-of-a-tracked-texture): the small CPU writes beside the 8192x8192 atlas, before the atlas moved to `ST_FILL` and `WriteTexels` region copies.
 - [Query slots running out inside a pass](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#query-slots-running-out-inside-a-pass).
 - [Setting the same targets again continues the pass](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#setting-the-same-targets-again-continues-the-pass), [Inline updates of a running submission refused uniform shadows](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#inline-updates-of-a-running-submission-refused-uniform-shadows) and [A render area for passes on very large targets](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#a-render-area-for-passes-on-very-large-targets): about 6 fps in the first level, and the water's grey blocks on the way.
 - [A store only a dispatch's first invocation makes](https://github.com/seedds/nxnative/blob/main/docs/reference/shaders.md#a-store-only-a-dispatchs-first-invocation-makes): the flickering plants.
 - [A submission past 8,192 queued writes counted as writing everywhere](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#a-submission-past-8192-queued-writes-counted-as-writing-everywhere): the first boss fight's third stage at 1-2 fps.
 - [Same-pass feedback read from the tile](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#same-pass-feedback-read-from-the-tile): each ink stamp's one-draw pass and whole-map snapshot ([#1063](https://github.com/seedds/nxnative/issues/1063)).
 - [An upscaler's colour read from its code](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#an-upscalers-colour-read-from-its-code): the washed-out picture with upstream's DM_UPSCALER=metalfx at the time, a switch this repository never had (its Mac host's MetalFX present scaling is `DM_PRESENT_UPSCALE`; [#1156](https://github.com/seedds/nxnative/issues/1156)).
+- [Android: the phone's sensors never started](../../../docs/reference/services.md#android-the-phones-sensors-never-started): gyro aiming did nothing because `onResume` ran before the start; resolved, to check on a phone with `DM_MOTION_LOG=1`.

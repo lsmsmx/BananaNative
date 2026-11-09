@@ -106,9 +106,12 @@ final class ExitNotice {
     }
 
     /** The notice's text: the game's name and the sentence, then where to find the details */
-    static String message(String name, String cause) {
+    static String message(String name, String cause) { return message(name, cause, null); }
+
+    /** The same with the log's likely cause (LogDigest.likely: what a line of the log means, from dm/tools/log_rules.tsv), when one was found */
+    static String message(String name, String cause, String likely) {
         String n = name == null || name.isEmpty() || name.equals("null") ? "The game" : name;
-        return n + ": " + cause + "\n\nShare log sends the log of that run, which says more.";
+        return n + ": " + cause + (likely == null || likely.isEmpty() ? "" : "\n\nLikely cause: " + likely) + "\n\nShare log sends the log of that run, which says more.";
     }
 
     /** The log's block for an uncaught Java exception: "[RED] crash: " before every line of the trace, at most maxLines lines */

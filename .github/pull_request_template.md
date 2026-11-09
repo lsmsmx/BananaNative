@@ -19,3 +19,4 @@
 - [ ] The finding is in its game note or its `docs/reference/<subsystem>.md` entry, and `python3 dm/tools/docs_symptoms.py` was run (the symptom index)
 - [ ] A chain tool changed: `dmsh_chain.py --header` (and `vk_android_build.py --header`) was run and `dm/gfx/nvn/dmsh_chain.h` / `dmsh_chain_vk.h` are part of the change
 - [ ] No game files, keys or data extracted from a game in the change or the attachments
+- [ ] Source only: no binaries, nothing under `dm/third_party/`, no change to `dmsh_chain.lock`; the branch starts from the current `android` ([CONTRIBUTING.md](../CONTRIBUTING.md))

@@ -1245,13 +1245,30 @@ public final class MainActivity extends Activity {
         shareLog(log);
     }
 
-    /** One log file (ExitWatch's notice: the log of the run that ended) */
-    void shareLog(File log) {
+    /** One log file */
+    void shareLog(File log) { shareLog(log, null); }
+
+    /** One log file, with its digest beside it when there is one (ExitWatch's notice: the log of the run that ended and LogDigest's text of it) */
+    void shareLog(File log, File digest) {
         Uri uri = LogProvider.uri(log);
-        Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM, uri).putExtra(Intent.EXTRA_SUBJECT, "nxnative log " + log.getName());
-        send.setClipData(ClipData.newRawUri(log.getName(), uri));
+        Intent send;
+        if (digest == null) send = new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_STREAM, uri);
+        else {
+            Uri du = LogProvider.uri(digest);
+            send = new Intent(Intent.ACTION_SEND_MULTIPLE).setType("text/plain").putParcelableArrayListExtra(Intent.EXTRA_STREAM, new ArrayList<>(List.of(uri, du)));
+        }
+        send.putExtra(Intent.EXTRA_SUBJECT, "nxnative log " + log.getName());
+        ClipData clip = ClipData.newRawUri(log.getName(), uri);
+        if (digest != null) clip.addItem(new ClipData.Item(LogProvider.uri(digest)));
+        send.setClipData(clip);
         send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
         startActivity(Intent.createChooser(send, "Share " + log.getName()));
+    }
+
+    /** A web page (a rule's doc from ExitWatch's notice) in the phone's browser */
+    void openLink(String url) {
+        try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url))); }
+        catch (android.content.ActivityNotFoundException e) { error("No app can open " + url); }
     }
 
     void error(String msg) { new AlertDialog.Builder(this).setMessage(msg).setPositiveButton("OK", null).show(); }

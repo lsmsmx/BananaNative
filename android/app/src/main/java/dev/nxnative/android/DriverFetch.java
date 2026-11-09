@@ -42,6 +42,7 @@ final class DriverFetch {
         {"whitebelyash/freedreno_turnip-CI", "whitebelyash Turnip CI"},
         {"Weab-chan/freedreno_turnip-CI", "Weab-chan Freedreno CI"},
         {"crueter/GameHub-8Elite-Drivers", "GameHub Adreno 8xx"},
+        {"StevenMXZ/Adreno-Tools-Drivers", "StevenMXZ Turnip and Qualcomm"},
     };
 
     private static final long MAX_ZIP = 512L << 20;

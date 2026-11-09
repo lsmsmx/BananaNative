@@ -1056,6 +1056,7 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } size_t sz = hostseg_size(CB(c), !pl, n); cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return; }
     if (!pl->mem) { LOG("[RED] AddCommandMemory: pool has no CPU storage"); return; }
     hostseg_release((uintptr_t)(pl->mem + off), (uintptr_t)(pl->mem + off + n));
+    dm_guest_write_prepare(pl->mem + off, n);
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
     { static int cblog = -1; if (cblog < 0) cblog = getenv("DM_NVN_CBLOG") != NULL; static uint64_t ng; if (cblog && (++ng <= 60 || ng % 500 == 0)) LOG("[nvn] AddCommandMemory #%llu cmd=%p pool %p +%#lx length %#zx (recording %d)", (unsigned long long)ng, (void *)c, (const void *)pl, (long)off, n, CB(c)->recording); }
     cmd_new_segment(CB(c), pl->mem + off, n);
@@ -1799,7 +1800,8 @@ static void tsummary(uint64_t frame) {
       pi = ci; pc = cc; pd = dr_; pf = frame; }
     uint64_t up, re, es = mtl_pkg_edge_skips(), fa, pr, miss = mtl_pkg_miss(); mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
     unsigned cpu_tex = mtl_cpu_tex_count();   // (read before LOG: its arguments are read with stderr's lock held, and this takes the replay's texture lock)
-    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu; missed %llu (cumulative); CPU-written textures alive %u", up, re, es, fa, pr, miss, cpu_tex);
+    uint64_t mpf; int mpe; nvn_dirty_mp_fail(&mpf, &mpe);
+    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu; missed %llu (cumulative); CPU-written textures alive %u; mprotect failures %llu (last errno %d)", up, re, es, fa, pr, miss, cpu_tex, (unsigned long long)mpf, mpe);
     memset(g_tn, 0, sizeof g_tn);
 }
 // DM_SLOWFRAME=1 (test switch, read over the log port on a real device): per-frame timings are first stored in a ring of the last 16 frames; dropped frames are judged 8 frames late (GPU / on-screen present times are back by then),
@@ -2983,10 +2985,16 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth ? r->depth : 1;
     if (!is3d) {
         size_t wb0 = (size_t)((r->width + bw - 1) / bw) * bpb, row0 = row ? row : wb0, img0 = img ? img : row0 * (size_t)((r->height + bh - 1) / bh);
-        dm_guest_write_prepare(t->mem, t->L.size);
+        uint64_t lo = nvn_tex_level_offset(&t->d, level), hi = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
+        for (int z = 0; z < nz; z++) {
+            unsigned ly = layer0 + (unsigned)(r->zoffset + z);
+            if (hi > lo && (uint64_t)ly * t->L.layer_size + hi <= t->L.size)
+                dm_guest_write_prepare(t->mem + (uint64_t)ly * t->L.layer_size + lo, hi - lo);
+            else { dm_guest_write_prepare(t->mem, t->L.size); break; }   // a range not worked out: prepare all of it, as before
+        }
         int ok = 1;
         for (int z = 0; z < nz && ok; z++) ok = !write_region_bl(t, level, layer0 + (unsigned)(r->zoffset + z), r, src + (size_t)z * img0, row0, bw, bh, bpb);
-        if (ok) { mtl_tex_cpu_written(t); return; }
+        if (ok) { mtl_tex_write_region(t, level, layer0, r, src, row0, img0); return; }
     }
     uint32_t lw = t->d.width >> level ? t->d.width >> level : 1, lh = t->d.height >> level ? t->d.height >> level : 1, lz = is3d ? (t->d.depth >> level ? t->d.depth >> level : 1) : 1;
     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;

@@ -5,7 +5,18 @@
 // DM_VK_NANSCAN_STEP draws (default 64), in passes into the image DM_VK_NANSCAN_SERIAL (default any), of the game's pass whose index is in DM_VK_NANSCAN_DRAWS=<from>-<to> (default all), at most MAXSPLIT times a submission,
 // and only the scans after which an attachment has more NaN / infinite texels than at its previous scan in the submission are logged, with the pass's draw range.
 // Bisect with a coarse step over the whole pass, then step 1 over the range it names. Costs a dispatch per attachment per pass (per split with 2): for finding a
-// cause, not for play
+// cause, not for play.
+// DM_VK_TEX_STATS=<fragment shader key>[,…] (live, needs no DM_VK_NANSCAN): the first draw of each frame with one of those fragment shaders has level 0 of each sampled texture
+// (each layer up to 6, a 3D texture whole) scanned before it with the same dispatch, which also counts per channel the texels with |c| > 1/1024 and keeps the largest |c|;
+// the completion thread logs one `tex stats:` line per texture and layer: to see which input of a lit material is zero (missing light) without a capture. The encoder thread
+// is off while it is set (the scans record on the replay thread). DM_VK_TEX_STATS_LINES (live, default 200) bounds the value lines; each texture's description line (with the fragment key) is logged once a value; a new value starts again
+// DM_VK_TEX_STATS_DRAWS=<n> (live, default 1): the first n draws of each frame with such a fragment shader are scanned, not only the first.
+// DM_VK_TEX_STATS_TABLE=<sb>,<base ub>:<word>,<bias ub>:<word>,<index ub>:<word>[/<word>…],<offset>[/<offset>…] (live): also the bindless textures the draw reads through
+// a record table in a storage buffer, as agl / gsys lit materials do (Zelda: Ocarina of Time's 1e4d2630d24846d0: its lightmap and baked-occlusion handles). Per index word v
+// (a fragment-stage uniform word: a guest uniform buffer, or a driver segment such as c0, read as vka_drv_fill writes it): the record is ((v & 0xFFFFF) + bias) << 5 bytes into the table when (v & 0xC0000000) == 0x80000000, else record 0 (the shader's
+// fallback); the table starts at the storage binding's address plus (base & 63), base being the uniform word that holds the table's address (c0[84].x there); each
+// offset's word is a combined handle: texture ID = low 20 bits, sampler ID = the rest. One `tex stats table:` line per draw and index (the record's eight words and the
+// handles), then each texture not yet scanned this frame is scanned as an input, logged with binding 1000 + 100 × the index's place + the offset
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vka_selftest_spv.h"
@@ -13,14 +24,16 @@
 #include <string.h>
 
 enum { NBATCH = 16, MAXR = 1024, NKEY = 8, MAXSPLIT = 256 };
-typedef struct { uint32_t nan, inf, first, pad; } res_t;
-typedef struct { uint64_t frame, serial; uint32_t pass, fmt, w, h, lv, layer, d0, ndraws, nkeys; uint64_t vs[NKEY], fs[NKEY]; int bind, tid; } rec_t;
+typedef struct { uint32_t nan, inf, first, pad, nz[4], mx[4]; } res_t;   // nz, mx: per channel, texels with |c| > 1/1024 and the largest |c| (float bits)
+typedef struct { uint64_t frame, serial; uint32_t pass, fmt, w, h, lv, layer, d0, ndraws, nkeys; uint64_t vs[NKEY], fs[NKEY]; int bind, tid; uint32_t dz; uint64_t stats; } rec_t;   // stats: DM_VK_TEX_STATS's fragment shader (0: a NaN scan)
 typedef struct { rec_t r[MAXR]; int n; res_t *res; VkDeviceSize off; } batch_t;
 static batch_t g_b[NBATCH]; static unsigned g_bi; static vka_span g_res;
 static VkPipeline g_pipe, g_pipe3, g_fetch; static VkPipelineLayout g_lay; static VkDescriptorSetLayout g_dsl;
 static uint32_t g_pass; static uint64_t g_pvs[NKEY], g_pfs[NKEY]; static uint32_t g_pn, g_pdraws, g_d0;   // g_pdraws: draws of the game's pass so far, g_d0: the segment's first
 static uint64_t g_probe, g_from_frame; static uint32_t g_big; static int g_split, g_nsplit; static uint32_t g_step = 64, g_from, g_to = UINT32_MAX; static uint64_t g_only;
 static _Atomic int g_lines; static int g_maxl = 200;
+static uint32_t g_ts_gen = UINT32_MAX; static uint64_t g_ts_keys[NKEY], g_ts_last[NKEY]; static int g_ts_n; static _Atomic int g_ts_lines;   // DM_VK_TEX_STATS (replay thread)
+static struct { uint64_t fs; int bind, tid; } g_ts_seen[512]; static int g_ts_nseen;   // DM_VK_TEX_STATS: descriptions logged
 
 int vka_nan_on(void) {
     static int v = -1; if (v >= 0) return v;
@@ -116,15 +129,15 @@ static void astc_check(VkCommandBuffer cb) {
     g_astc_state = 1;
 }
 // One dispatch: level lv, layer l0 of im into the batch's next result
-static int scan_one(VkCommandBuffer cb, batch_t *b, vka_img *im, uint32_t lv, uint32_t l0, uint32_t pass, int bind, int tid) {
+static int scan_one(VkCommandBuffer cb, batch_t *b, vka_img *im, uint32_t lv, uint32_t l0, uint32_t pass, int bind, int tid, uint64_t stats) {
     if (b->n == MAXR) return 0;
     int v3 = im->d.target == NVN_TEXTURE_TARGET_3D;   // a whole level of a 3D texture (inputs only)
     VkImageView v = vka_view(im, im->f.view, v3 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, v3 ? 0 : l0, 1, NULL);
     if (!v) return 0;
     uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, dz = v3 ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
     int k = b->n++;
-    b->res[k] = (res_t){0, 0, 0xffffffffu, 0};
-    b->r[k] = (rec_t){vka_frame(), im->serial, pass, (uint32_t)im->d.format, w, h, lv, l0, g_d0, g_pdraws, g_pn, {0}, {0}, bind, tid};
+    b->res[k] = (res_t){0, 0, 0xffffffffu, 0, {0}, {0}};
+    b->r[k] = (rec_t){vka_frame(), im->serial, pass, (uint32_t)im->d.format, w, h, lv, l0, g_d0, g_pdraws, g_pn, {0}, {0}, bind, tid, dz, stats};
     memcpy(b->r[k].vs, g_pvs, sizeof g_pvs); memcpy(b->r[k].fs, g_pfs, sizeof g_pfs);
     VkDescriptorImageInfo ii = {vka_samp_default(), v, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorBufferInfo bi = {g_res.buf, b->off + (VkDeviceSize)k * sizeof(res_t), sizeof(res_t)};
@@ -145,7 +158,53 @@ int vka_nan_probe(uint64_t fs) {
     if (!key || fs != key || last == vka_frame()) return 0;
     last = vka_frame(); return 1;
 }
-void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n) {
+// DM_VK_TEX_STATS: 1 = set (its keys parsed again after each live change)
+int vka_texstats_on(void) {
+    uint32_t g = atomic_load_explicit(&vka_env_gen, memory_order_relaxed);
+    if (g != g_ts_gen) {
+        g_ts_gen = g; char b[256]; int n = 0;
+        if (vka_env_str("DM_VK_TEX_STATS", b, sizeof b)) for (const char *q = b; *q && n < NKEY;) { char *e; unsigned long long k = strtoull(q, &e, 16); if (e == q) break; g_ts_keys[n++] = k; q = *e == ',' ? e + 1 : e; }
+        static uint64_t prev[NKEY]; static int nprev = -1; int changed = n != nprev; for (int i = 0; !changed && i < n; i++) changed = prev[i] != g_ts_keys[i];
+        if (changed) {
+            memcpy(prev, g_ts_keys, sizeof prev); nprev = n; atomic_store(&g_ts_lines, 0); memset(g_ts_last, 0xff, sizeof g_ts_last); g_ts_nseen = 0;
+            if (n) VLOG("tex stats: from frame %llu, the inputs of %d fragment shader(s) (first %016llx) are scanned before their first draw of each frame (DM_VK_TEX_STATS)", (unsigned long long)vka_frame(), n, (unsigned long long)g_ts_keys[0]);
+        }
+        g_ts_n = n;
+    }
+    return g_ts_n > 0 && V.push_desc;
+}
+// DM_VK_TEX_STATS: 1 = this draw's fragment shader is one, its first draw this frame, and lines are left (the caller ends the pass and calls vka_nan_inputs)
+int vka_texstats_probe(uint64_t fs) {
+    if (!vka_texstats_on() || vka_enc_on() || atomic_load(&g_ts_lines) >= VKA_ENV("DM_VK_TEX_STATS_LINES", 200)) return 0;
+    static uint32_t ndr[NKEY];   // DM_VK_TEX_STATS_DRAWS (live, default 1): draws of this fragment shader scanned this frame so far
+    for (int i = 0; i < g_ts_n; i++) if (g_ts_keys[i] == fs) {
+        if (g_ts_last[i] != vka_frame()) { g_ts_last[i] = vka_frame(); ndr[i] = 0; }
+        if (ndr[i] >= (uint32_t)VKA_ENV("DM_VK_TEX_STATS_DRAWS", 1)) return 0;
+        ndr[i]++; return 1;
+    }
+    return 0;
+}
+int vka_texstats_room(void) {   // counts a line only while below the limit, so a larger DM_VK_TEX_STATS_LINES set later gives room again
+    int lim = VKA_ENV("DM_VK_TEX_STATS_LINES", 200), n = atomic_load(&g_ts_lines);
+    while (n < lim) if (atomic_compare_exchange_weak(&g_ts_lines, &n, n + 1)) return 1;
+    return 0;
+}
+// DM_VK_TEX_STATS: 1 = texture ID tid has not been scanned yet this frame (at most 256 a frame), noted now
+int vka_texstats_table_new(int tid) {
+    static uint64_t fr = ~0ull; static int seen[256], n;
+    if (fr != vka_frame()) { fr = vka_frame(); n = 0; }
+    for (int i = 0; i < n; i++) if (seen[i] == tid) return 0;
+    if (n == 256) return 0;
+    seen[n++] = tid; return 1;
+}
+// DM_VK_TEX_STATS: 1 = the first time this (fragment shader, binding, texture ID) is seen since the switch was set: its description line is logged once (no line budget;
+// at most 512 a value)
+int vka_texstats_desc_new(uint64_t fs, int bind, int tid) {
+    for (int i = 0; i < g_ts_nseen; i++) if (g_ts_seen[i].fs == fs && g_ts_seen[i].bind == bind && g_ts_seen[i].tid == tid) return 0;
+    if (g_ts_nseen == 512) return 0;
+    g_ts_seen[g_ts_nseen].fs = fs; g_ts_seen[g_ts_nseen].bind = bind; g_ts_seen[g_ts_nseen].tid = tid; g_ts_nseen++; return 1;
+}
+void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n, uint64_t stats) {
     batch_t *b = &g_b[g_bi % NBATCH];
     if (!ready()) return;
     int any = 0;
@@ -153,9 +212,11 @@ void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, c
         vka_img *im = ims[i];
         if (!im || im->f.kind != 0 || im->samples > 1 || !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) continue;
         uint32_t nl = im->d.target == NVN_TEXTURE_TARGET_3D ? 1 : im->layers;
-        for (uint32_t lv = 0; lv < im->levels && lv < 14; lv++) for (uint32_t l = 0; l < nl && l < 6; l++) any |= scan_one(cb, b, im, lv, l, g_pass, binds[i], tids[i]);
+        uint32_t nlv = stats ? 1 : im->levels;   // DM_VK_TEX_STATS: level 0 only
+        for (uint32_t lv = 0; lv < nlv && lv < 14; lv++) for (uint32_t l = 0; l < nl && l < 6; l++) any |= scan_one(cb, b, im, lv, l, g_pass, binds[i], tids[i], stats);
     }
     if (any) vka_barrier(cb);
+    if (stats) return;
     static _Atomic int k; if (atomic_fetch_add(&k, 1) < 2) VLOG("NaN scan: frame %llu: %d inputs of fragment shader %016llx scanned before its first draw (only those with NaN / infinite texels are logged)", (unsigned long long)vka_frame(), n, (unsigned long long)g_probe);
 }
 // After a pass ends (its writes made visible by the caller's barrier): one dispatch per float colour attachment
@@ -170,7 +231,7 @@ void vka_nan_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, 
     for (int i = 0; i < n; i++) {
         vka_img *im = ims[i];
         if (!im || im->f.kind != 0 || im->samples > 1 || im->d.target == NVN_TEXTURE_TARGET_3D || !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || b->n == MAXR) continue;
-        any |= scan_one(cb, b, im, lvs[i], l0s[i], pass, -1, 0);
+        any |= scan_one(cb, b, im, lvs[i], l0s[i], pass, -1, 0, 0);
     }
     if (any) vka_barrier(cb);
     g_pn = 0;
@@ -188,7 +249,7 @@ void vka_nan_dispatch(VkCommandBuffer cb, uint64_t key, vka_img *const *ims, int
         for (int j = 0; j < i; j++) dup |= ims[j] == im;
         if (!im || dup || im->f.kind != 0 || im->samples > 1 || !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) continue;
         uint32_t nl = im->d.target == NVN_TEXTURE_TARGET_3D ? 1 : im->layers;
-        for (uint32_t l = 0; l < nl && l < 6; l++) any |= scan_one(cb, b, im, 0, l, g_pass, -1, 0);
+        for (uint32_t l = 0; l < nl && l < 6; l++) any |= scan_one(cb, b, im, 0, l, g_pass, -1, 0, 0);
     }
     if (any) vka_barrier(cb);
     memcpy(g_pvs, pvs, sizeof pvs); memcpy(g_pfs, pfs, sizeof pfs); g_pn = pn; g_pdraws = pd; g_d0 = d0;
@@ -197,6 +258,15 @@ static void report(void *arg) {
     batch_t *b = arg;
     for (int k = 0; k < b->n; k++) {
         const res_t *r = &b->res[k]; const rec_t *c = &b->r[k];
+        if (c->stats) {   // DM_VK_TEX_STATS: every texture and layer, NaN or not
+            if (!vka_texstats_room()) return;
+            uint64_t nt = (uint64_t)c->w * c->h * (c->dz ? c->dz : 1); float mx[4]; memcpy(mx, r->mx, sizeof mx);
+            char dims[32]; snprintf(dims, sizeof dims, c->dz ? "%ux%ux%u" : "%ux%u", c->w, c->h, c->dz);
+            VLOG("tex stats: frame %llu fragment %016llx binding %d texture ID %d serial %llu (format %#x %s level 0 layer %u): %llu texels; above 1/1024 x %.1f%% y %.1f%% z %.1f%% w %.1f%%; max x %g y %g z %g w %g; %u NaN + %u infinite",
+                 (unsigned long long)c->frame, (unsigned long long)c->stats, c->bind, c->tid, (unsigned long long)c->serial, c->fmt, dims, c->layer, (unsigned long long)nt,
+                 100.0 * r->nz[0] / (double)nt, 100.0 * r->nz[1] / (double)nt, 100.0 * r->nz[2] / (double)nt, 100.0 * r->nz[3] / (double)nt, mx[0], mx[1], mx[2], mx[3], r->nan, r->inf);
+            continue;
+        }
         if (!r->nan && !r->inf) continue;
         if (c->bind >= 0) {
             if (atomic_fetch_add(&g_lines, 1) >= g_maxl) return;

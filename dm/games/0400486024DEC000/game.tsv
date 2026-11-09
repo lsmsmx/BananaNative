@@ -28,7 +28,6 @@ romfs_substitute	Tex/CmnTex_Map_Soil_FairyFountain_Floor_D_Nrm.bntx.zs=Tex/Dummy
 # 8 GB alias region stops OptimizeChangeBanc thread freeze in Kokiri Forest.
 mem_reserve	0x468000000
 mem_alias	0x200000000
-mem_map_limit	on
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000

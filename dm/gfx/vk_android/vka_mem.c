@@ -953,8 +953,10 @@ uint64_t vka_mem_placed_bytes(uint64_t *peak) { pthread_rwlock_rdlock(&g_rw); ui
 // instead of waiting, as during a give-back (unplace)
 typedef struct { long total, guest, placed, out_kgsl; } mscan;
 static uint64_t *g_ms_lo, *g_ms_hi; static int *g_ms_pc, g_ms_cap;   // the segments as the scan saw them, their pieces (the maps thread's own)
-static int maps_scan(mscan *o, int nseg, uintptr_t glo, uintptr_t ghi) {
+static vkmb_hist g_ms_hist;   // the maps outside the guest block by (name, permissions, size), when DM_VK_MAPS_HIST is on (the maps thread's own)
+static int maps_scan(mscan *o, int nseg, uintptr_t glo, uintptr_t ghi, vkmb_hist *hist) {
     memset(o, 0, sizeof *o); if (nseg) memset(g_ms_pc, 0, (size_t)nseg * sizeof *g_ms_pc);
+    if (hist) vkmb_hist_reset(hist);
     int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC); if (fd < 0) return 0;
     static char b[131072]; size_t have = 0; ssize_t k = 0;
     for (;;) {
@@ -966,7 +968,7 @@ static int maps_scan(mscan *o, int nseg, uintptr_t glo, uintptr_t ghi) {
             if (vkmb_line(b + s, i - s, &a, &kg)) {
                 o->total++;
                 if (a >= glo && a < ghi) { o->guest++; int g = vkmb_seg(g_ms_lo, g_ms_hi, nseg, a); if (g >= 0) { o->placed++; g_ms_pc[g]++; } }
-                else o->out_kgsl += kg;
+                else { o->out_kgsl += kg; if (hist) vkmb_hist_add(hist, b + s, i - s); }
             }
             s = i + 1;
         }
@@ -1001,6 +1003,27 @@ static int compact(uintptr_t lo, uintptr_t hi) {
     nvn_dirty_unhold();
     return 1;
 }
+// The largest groups of maps outside the guest block (vka_mapbudget.h vkmb_hist), from DM_VK_MAPS_HIST percent of vm.max_map_count (40, the share where the dirty
+// tracker starts coarsening; 0 off): when the count climbs past it, at each further 10 % step, and every 30 s while it stays over. The count falls and climbs again
+// in cycles, so each climb past the share gets its own lines
+static void maps_hist_log(const mscan *m, int pct, int step, int hist_pct, uint64_t now) {
+    static int armed = 1, last_step = -1; static uint64_t last_ns;
+    if (hist_pct <= 0) return;
+    if (pct < hist_pct) { armed = 1; last_step = -1; return; }
+    if (!armed && step <= last_step && now - last_ns < 30000000000ull) return;
+    const vkmb_hist *h = &g_ms_hist; int idx[10], n = vkmb_hist_top(h, idx, 10), groups = 0;
+    for (int i = 0; i < VKMB_HCAP; i++) groups += h->e[i].used;
+    VLOG("memory maps outside the guest block: %ld of %ld in all (%d %% of the limit), %.0f MiB, in %d groups of (name, permissions, size)%s; the largest by maps (DM_VK_MAPS_HIST):",
+         m->total - m->guest, m->total, pct, h->bytes / 1048576.0, groups, h->dropped ? ", some not sorted: the table is full" : "");
+    for (int j = 0; j < n; j++) {
+        const vkmb_hent *e = &h->e[idx[j]];
+        VLOG("  maps outside #%d: %ld maps (%.1f %%), %.1f MiB: %s %s %s", j + 1, e->n, h->lines ? e->n * 100.0 / h->lines : 0.0, e->bytes / 1048576.0,
+             e->perms, vkmb_bucket_name[e->bucket], e->name);
+    }
+    if (h->dropped) VLOG("  maps outside: %ld maps not sorted (more than %d groups)", h->dropped, VKMB_HCAP);
+    void vka_pso_builds_log(void); vka_pso_builds_log();   // the compiles running now (the driver's compiler is the suspect for the scudo secondary maps)
+    armed = 0; last_step = step; last_ns = now;
+}
 static void maps_tick(int *line_due) {
     static uint64_t last_compact_ns, last_line_ns; static int last_step = -1, nred_read, nred_cover;
     int mx = 0; plat_maps_count(&mx);   // (vm.max_map_count, read once)
@@ -1010,8 +1033,9 @@ static void maps_tick(int *line_due) {
     if (nseg > g_ms_cap) { int c = nseg + nseg / 2 + 64; g_ms_lo = realloc(g_ms_lo, (size_t)c * 8); g_ms_hi = realloc(g_ms_hi, (size_t)c * 8); g_ms_pc = realloc(g_ms_pc, (size_t)c * sizeof *g_ms_pc); g_ms_cap = c; }
     for (int i = 0; i < nseg; i++) { g_ms_lo[i] = g_sg[i].lo; g_ms_hi[i] = g_sg[i].hi; }
     pthread_rwlock_unlock(&g_rw);
+    int hist_pct = VKA_ENV("DM_VK_MAPS_HIST", 40);
     mscan m; uint64_t t0 = mono_ns();
-    if (!maps_scan(&m, nseg, (uintptr_t)gb, (uintptr_t)gb + gs) || !m.total) { if (!nred_read++) VRED("memory maps: /proc/self/maps could not be read: the maps budget is off"); return; }
+    if (!maps_scan(&m, nseg, (uintptr_t)gb, (uintptr_t)gb + gs, hist_pct > 0 ? &g_ms_hist : NULL) || !m.total) { if (!nred_read++) VRED("memory maps: /proc/self/maps could not be read: the maps budget is off"); return; }
     double scan_ms = (mono_ns() - t0) / 1e6;
     atomic_store(&g_maps_n, (int)m.total); atomic_store(&g_maps_max, mx);
     int pct = (int)(m.total * 100 / mx), step = pct / 10, act = 0;
@@ -1042,6 +1066,7 @@ static void maps_tick(int *line_due) {
              nvn_dirty_block_bytes() ? "blocks of " : "pages of ", nvn_dirty_block_bytes() ? nvn_dirty_block_bytes() >> 10 : (size_t)getpagesize() >> 10, scan_ms);
         last_line_ns = now; last_step = step; *line_due = 0;
     }
+    maps_hist_log(&m, pct, step, hist_pct, now);
 }
 static void *maps_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-maps");
@@ -1062,4 +1087,10 @@ static void maps_start(void) { static pthread_once_t o = PTHREAD_ONCE_INIT; pthr
 
 // The hook hle_svc.c calls when it gives guest memory back (weak no-op there for the Apple builds; its region and open hooks stay the weak no-ops)
 int dm_gfx_guest_release(uintptr_t lo, uintptr_t hi) { return vka_mem_release(lo, hi); }
+// A guest code address as module and offset (log lines; vka_draw.c's dispatch census): 0 = in no module
+int vka_mod_off(uint64_t addr, const char **name, uint64_t *off) {
+    module_t *m = addr ? module_of((const void *)(uintptr_t)addr) : NULL;
+    if (!m) return 0;
+    *name = m->name; *off = addr - (uint64_t)(uintptr_t)m->base; return 1;
+}
 #endif

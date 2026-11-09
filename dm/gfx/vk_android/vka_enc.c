@@ -416,7 +416,7 @@ int vka_enc_tid(void) { return atomic_load_explicit(&g_enc_tid, memory_order_rel
 static inline uint64_t enc_cnt(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
 #define KADD(a, i, v) __atomic_store_n(&(a)[i], (a)[i] + (v), __ATOMIC_RELAXED)
 static void *enc_main(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk-enc");
+    (void)arg; pthread_setname_np(pthread_self(), "vk-enc"); vka_fp_host("vk-enc");
     vka_perf_thread(-8);   // the ADPF session and the replay thread's priority
     atomic_store(&g_enc_tid, gettid());
     uint64_t t = 0, tpub = 0; unsigned samp = 0;
@@ -485,7 +485,7 @@ void vka_enc_sync(void) {
 void vka_enc_start(VkCommandBuffer cb) {
     vka_enc_sync();
     extern int vka_gp_active;
-    if (!VKA_ENV("DM_VK_ENC", 1) || vka_gp_active || vka_nan_on() || !up()) { atomic_store(&g_ecb, VK_NULL_HANDLE); return; }
+    if (!VKA_ENV("DM_VK_ENC", 1) || vka_gp_active || vka_nan_on() || vka_texstats_on() || !up()) { atomic_store(&g_ecb, VK_NULL_HANDLE); return; }
     { int bt = VKA_ENV("DM_VK_ENC_BATCH", 4096); g_batch = bt < 0 ? 0 : bt > (1 << 20) ? (1 << 20) : (uint32_t)bt; }   // live: from this submission
     { int us = VKA_ENV("DM_VK_ENC_SPIN", 200); atomic_store_explicit(&g_spin_ns, (uint64_t)(us < 0 ? 0 : us > 100000 ? 100000 : us) * 1000, memory_order_relaxed); }   // live: from this submission
     { int tb = VKA_ENV("DM_VK_ENC_TAIL", 16384); atomic_store_explicit(&g_tail_every, tb <= 0 ? 0 : tb > (1 << 20) ? (1u << 20) : (uint32_t)tb, memory_order_relaxed); }   // live: from this submission

@@ -12,9 +12,10 @@
 //           Android Vulkan only (absent for Apple): "subgroup_size": n, "ssbo_align": bytes, "gs_passthrough": false, "shared_max": bytes,
 //           Switch 2 task / mesh programs (Android Vulkan): "stage": "ts|ms", "arch": "sm86", "code" the code area with its 0x80-byte SPH (as a graphics stage's) cut to
 //           the instruction length, "local": [threads, 1, 1] (control +0x58), "mesh": [max vertices, max primitives, payload bytes, per-vertex plane codes ...
-//           (0-3 position x y z w, 4 + 4 g + c generic g component c: the SPH's output map in order), and optionally -1, per-primitive value codes ... (all the
+//           (132 the point size, 0-3 position x y z w, 4 + 4 g + c generic g component c: the SPH's output map in order), and optionally -1, per-primitive value codes ... (all the
 //           values the program writes, in order, -3 for one no output takes: their count is the stride of a 32-primitive chunk), and
-//           optionally -2, generic locations to declare as (0, 0, 0, 1) per-vertex outputs ...] (task: [0, 0, payload bytes]), "gl_depth_spec": SpecId (mesh, optional:
+//           optionally -2, generic locations to declare as (0, 0, 0, 1) per-vertex outputs ...] (task: [0, 0, payload bytes]), "mesh_topology": vertices per primitive
+//           (mesh, optional: 1 points, 3 triangles, the default), "gl_depth_spec": SpecId (mesh, optional:
 //           the GL depth rewrite under a bool specialization constant). Translated as compute and emitted as a TaskEXT / MeshEXT entry point (Ryujinx
 //           StructuredIr/MeshShaderInfo.cs, CodeGen/Spirv/SpirvMeshEntry.cs) }]
 //   Output: <key>.spv and <key>.res.json (offsets of storage buffer slots in c0, etc.; a mesh program's "mesh": its output locations, per vertex and per primitive; decoding texture handle → slot number is done in the script that builds the metallib;
@@ -78,6 +79,7 @@ static class SwshXlate
         public int[] QueryAmpereComputeC0Layout() => _job["nvn2_cs"] is JsonArray l ? l.Select(v => (int)v).ToArray() : null;
         // A task / mesh program's layout (job "mesh", see the file header) and its GL depth constant
         public int[] QueryMeshShaderLayout() => _job["mesh"] is JsonArray m ? m.Select(v => (int)v).ToArray() : null;
+        public int QueryMeshShaderTopology() => _job["mesh_topology"] is JsonNode mt ? (int)mt : 3;
         public int QueryMeshShaderGlDepthSpecId() => _job["gl_depth_spec"] is JsonNode n ? (int)n : -1;
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 read out of bounds +{offset:X} (c1 length {_c1.Length})"); return 0; }
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
@@ -212,7 +214,7 @@ static class SwshXlate
     {
         int prim = Array.IndexOf(layout, -1, 3), pad = Array.IndexOf(layout, -2, 3);
         int planeEnd = prim >= 0 ? prim : pad >= 0 ? pad : layout.Length, primEnd = pad >= 0 ? pad : layout.Length;
-        var vertex = layout[3..planeEnd].Where(c => c >= 4).Select(c => (c - 4) >> 2).Concat(pad >= 0 ? layout[(pad + 1)..] : Array.Empty<int>()).Distinct().OrderBy(g => g);
+        var vertex = layout[3..planeEnd].Where(c => c >= 4 && c < 132).Select(c => (c - 4) >> 2).Concat(pad >= 0 ? layout[(pad + 1)..] : Array.Empty<int>()).Distinct().OrderBy(g => g);
         var primitive = prim >= 0 ? layout[(prim + 1)..primEnd].Where(c => c >= 4).Select(c => (c - 4) >> 2).Distinct().OrderBy(g => g) : Enumerable.Empty<int>();
         return new JsonObject
         {

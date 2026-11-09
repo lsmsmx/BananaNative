@@ -1,0 +1,50 @@
+# Routine lines of an Android run log that `dm/tools/log_digest.py --filter` leaves out: lines that repeat in a healthy run and say nothing about what went wrong.
+# A deny-list: a line no row matches is kept, and a line that is a [RED], crash, FATAL, abort, signal, warning or error line, matches dm/tools/log_rules.tsv or is a stage
+# milestone is kept even when a row matches it. Same regex rules as log_rules.tsv (Python re and Java java.util.regex). Columns: id, regex, note.
+id	regex	note
+env-echo	^\[nxlaunch\] env [A-Z_][A-Z0-9_]*=	the environment the host got (the digest's header lists the switches)
+arg-echo	^\[nxlaunch\] arg \d+: 	the host's arguments
+longframe	^\[dm\] \[longframe\] frame \d+	periodic: a frame over its budget (summarised at the end)
+vk-fps	^\[dm\] \[vk\] fps: 	periodic: frames a second every 15 s (summarised at the end)
+nvn-periodic	^\[dm\] \[nvn\] (timing|on-screen|frame interval|vertex bindings|packaged textures|pipelines|translation) up to frame	periodic: NVN statistics every 300 frames (summarised at the end)
+nvn-counters	^\[dm\] \[nvn\] (packaged textures: first uploads|pipelines up to frame|translation up to frame)	periodic: NVN counters
+nvn-interval	^\[dm\] \[nvn\] the game sets present interval	the game changing its present interval
+vk-replay-stats	^\[dm\] \[vk\] (replay|replay worker) up to (frame|present) \d+	periodic: replay statistics
+vk-encoder	^\[dm\] \[vk\] command encoder per frame	periodic: command encoder statistics
+vk-descriptors	^\[dm\] \[vk\] descriptors: driver segments	periodic: descriptor statistics
+vk-barriers	^\[dm\] \[vk\] game barriers inside a draw pass	periodic: barrier statistics
+vk-pace	^\[dm\] \[vk\] pace (cost )?up to frame	periodic: frame pacing
+vk-gpuprof	^\[dm\] \[vk\] gpu prof: 	GPU profile steps
+vk-pool-placed	^\[dm\] \[vk\] memory pool 0x[0-9a-f]+\+0x[0-9a-f]+ placed	a memory pool placed in Vulkan memory
+vk-placed-memory	^\[dm\] \[vk\] placed memory: 	placed-memory statistics
+vk-placed-gib	^\[dm\] \[vk\] [\d.]+ GiB of memory pools is placed	placed-memory total
+vk-memory	^\[dm\] \[vk\] memory: placed pools 	periodic: GPU memory in use (summarised at the end)
+vk-pool-back	^\[dm\] \[vk\] pool memory 0x\S+ given back	pool memory given back
+vk-zero-shared	^\[dm\] \[vk\] zero-shared image	zero-shared image bookkeeping
+vk-texture	^\[dm\] \[vk\] (linear |large )?(texture|image) serial \d+	texture uploads and storage changes
+vk-large-image	^\[dm\] \[vk\] large image: 	a large image made
+vk-target	^\[dm\] \[vk\] target \d+x\d+ VkFormat	a render target made
+vk-image-cache	^\[dm\] \[vk\] (image cache pruned|finalized pool 0x)	image cache eviction
+vk-pipeline-took	^\[dm\] \[vk\] (graphics|compute) pipeline( library)? .*took \d+ ms	a pipeline or pipeline library made
+vk-pipeline-frame	^\[dm\] \[vk\] pipeline made on the frame path	a pipeline the cache lacked, made during a frame
+vk-shader-subgroup	^\[dm\] \[vk\] shader [0-9a-f]{16}: subgroup operations rewritten	a shader's subgroup rewrite
+vk-binding-fallback	^\[dm\] \[vk\] 3D binding fallback	a 2D texture bound where a 3D one was declared
+vk-pass-samples	^\[dm\] \[vk\] a pass samples the texture it renders	a feedback pass
+vk-display	^\[dm\] \[vk\] (display refresh [\d.]+ Hz|window frame rate \d+ fps)	display refresh and window rate changes
+vk-framegen-idle	^\[dm\] \[vk\] frame generation: not generating	frame generation idle
+vk-ctl	^\[dm\] \[vk\] ctl: env 	in-game panel changes queued or applied
+audio-callbacks	^\[dm\] audio #\d+ device callbacks \d+: 	periodic: audio device statistics
+audren-stats	^\[dm\] audren: (render time mean|rendered \d+ frames|no frame rendered before update)	periodic: audio renderer statistics
+keys-press	^\[dm\] DM_KEYS: frame [\d.]+ (press|release|stick)	scripted key presses
+mem-alias	^\[dm\] \[mem\] alias region mapped	alias region growth
+loader-weak	^\[dm\] (main|sdk|subsdk\d*|rtld): (undefined weak \w+ bound to 0|\w+ bound to an earlier module's definition)	symbol binding during loading
+codec-routine	^\[dm\] \[codec\] (pool registered|\w+ decoder \d+: (first picture|end of stream|\d+x\d+, input format))	movie decoder bookkeeping
+fs-nup	^\[dm\] fs NUP: \d+ decompressions	NUP decompression counters
+hid-styles	^\[dm\] hid supported controller (styles|ids) 	the game's controller styles
+onscreen-controls	^\[(nxlaunch|dm)\] (input: )?on-screen controls: 	on-screen control layout
+picture-fit	^\[nxlaunch\] picture: fitted at 	picture fit
+thread-dump-detail	^\[dm\]   0x[0-9a-f]+ (waited-for object|guest stack:|registers pc=|backtrace:)	detail lines of a thread dump (the thread lines themselves are kept)
+host-thread	^\[dm\] host thread 0x[0-9a-f]+: 	host thread stacks of a dump
+crash-registers	^x\d+=(0x[0-9a-f]+|0) 	register rows of a crash (the digest's crash block has pc, lr and the backtrace; --context N shows them)
+crash-targets	^\[dm\] \*x\d+: 	what the registers of a crash point at
+crash-stack-words	^\[dm\]   [0-9a-f]+ [0-9a-f]+ [0-9a-f]+ [0-9a-f]+$	stack words below sp of a crash

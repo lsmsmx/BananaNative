@@ -89,6 +89,9 @@ static int rk_load(void) {
 #define ROT_LOAD(f) rk.f = (PFN_##f)vk.vkGetDeviceProcAddr(V.dev, #f); if (!rk.f) { VRED("present: no %s", #f); return ok = 0; }
     ROT_FNS(ROT_LOAD)
 #undef ROT_LOAD
+    // The compiling calls through the replay's table: its wrappers compile with the host's FPCR on any thread, an inline present's on the game's included (vka_dev.c)
+    if (vk.vkCreateShaderModule) rk.vkCreateShaderModule = vk.vkCreateShaderModule;
+    if (vk.vkCreateGraphicsPipelines) rk.vkCreateGraphicsPipelines = vk.vkCreateGraphicsPipelines;
     return ok = 1;
 }
 // The rotated copy's pipeline for a swapchain format (g_rot's layout): blend 0 writes the picture as it is, 1 draws a premultiplied source over the image (the overlay)
@@ -735,7 +738,12 @@ static int present_one(const pq_item *it) {
     // sends the switches through DM_CTL and gives the launcher's touch mapping the same rectangle, PictureFit.rect)
     int fr[4]; vka_fit_rect(ew, eh, cw, ch, stretch_wanted(), picture_size(), g_place_x, g_place_y, fr);
     int dx = fr[0], dy = fr[1], dw = fr[2], dh = fr[3];
-    VkFormatProperties fp = {0}; if (im) vk.vkGetPhysicalDeviceFormatProperties(V.pd, im->f.vk, &fp);
+    static VkFormat s_last_fmt; static VkFormatProperties s_last_fp;
+    VkFormatProperties fp = {0};
+    if (im) {
+        if (im->f.vk != s_last_fmt) { vk.vkGetPhysicalDeviceFormatProperties(V.pd, im->f.vk, &s_last_fp); s_last_fmt = im->f.vk; }
+        fp = s_last_fp;
+    }
     int blit = im && im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind == 0 && im->samples == 1 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
     // FSR in place of the blit or the rotated copy for a picture scaled up; switched on live, the swapchain has no attachment views yet: blitted once, and the next swapchain has them.
     // A view that failed on a swapchain made for FSR is not asked for again: each present would make a new swapchain (a queue idle) and fail the same way
@@ -818,7 +826,7 @@ static int present_one(const pq_item *it) {
 
 void vka_perf_thread(int nice); void vka_perf_frame(double period_s);   // vka_perf.c
 static void *present_main(void *arg) {
-    (void)arg; pthread_setname_np(pthread_self(), "vk-present"); vka_perf_thread(-8);
+    (void)arg; pthread_setname_np(pthread_self(), "vk-present"); vka_fp_host("vk-present"); vka_perf_thread(-8);
     pthread_mutex_lock(&g_pmu);
     for (;;) {
         while (g_pq_read == g_pq_fill && g_win_ack == g_win_gen) pthread_cond_wait(&g_pcv, &g_pmu);
@@ -902,5 +910,5 @@ int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns) { (void)ticks; (void)tim
 int mtl_snap_on(void) { return 0; }
 uint64_t mtl_snap_acquire_wait(void) { return 0; }
 
-static void *selftest_main(void *arg) { int r = nxhost_vk_selftest(NULL, (int)(intptr_t)arg); VLOG("selftest (NXHOST_VK_SELFTEST) ended: %s", r ? "FAILED" : "passed"); return NULL; }
+static void *selftest_main(void *arg) { vka_fp_host("vk-selftest"); int r = nxhost_vk_selftest(NULL, (int)(intptr_t)arg); VLOG("selftest (NXHOST_VK_SELFTEST) ended: %s", r ? "FAILED" : "passed"); return NULL; }
 #endif

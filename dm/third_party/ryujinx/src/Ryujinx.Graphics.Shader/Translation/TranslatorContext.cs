@@ -160,8 +160,21 @@ namespace Ryujinx.Graphics.Shader.Translation
 
         internal int GetDepthRegister()
         {
-            // The depth register is always two registers after the last color output.
-            return BitOperations.PopCount((uint)Definitions.OmapTargets) + 1;
+            // The colour outputs take four registers for each render target with any component enabled, a component in its own slot of the four
+            // (EmitterContext.PrepareForReturn's loop), and the depth is two registers after the last of them: 4 x (enabled targets) + 1. Upstream counted
+            // components (PopCount(OmapTargets) + 1), which is that only when every enabled target writes all four: with OmapTargets 0x100 (RT2 R) the depth
+            // is R5 and the count read R2 (docs/reference/shaders.md#a-pixel-shader-with-partial-colour-masks-wrote-the-wrong-depth).
+            int targets = 0;
+
+            for (int rt = 0; rt < 8; rt++)
+            {
+                if ((Definitions.OmapTargets & (0xf << (rt * 4))) != 0)
+                {
+                    targets++;
+                }
+            }
+
+            return targets * 4 + 1;
         }
 
         public void SetLayerOutputAttribute(int attr)

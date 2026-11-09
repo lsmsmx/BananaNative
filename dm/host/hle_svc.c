@@ -858,7 +858,8 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped
         // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
         // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
-        // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
+        // On for every game (profile mem_map_limit off turns it off): Mario Kart World's heap sizes its free space by total − used and let no block go without it, so mapped memory grew race by race.
+        // Ace Attorney Investigations Collection (Switch 1, not supported) maps a little more than the 1 GB pool its profile reports
         if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
             int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + DM_GAME_MEM_USED + big_bss_bytes()) - atomic_load(&g_alias_mapped);
             if (need && need > room) {

@@ -35,7 +35,6 @@ mem_alias	0x110000000
 mem_stack	0x10000000
 app_pool	0xCD500000
 # nninitStartup allocates and frees all it can (pool − 64 MB) and the SDK keeps those pages mapped until a map fails: the pool is enforced as on Horizon, so it gives them back (hle_svc.c)
-mem_map_limit	on
 
 # ---- Shader split ----
 # Game Freak's Trinity engine: every shader is a BNSH inside the Oodle-compressed packs of arc/data.trpfs (shader_split.py trpfs_jobs), named by the pack's first file:

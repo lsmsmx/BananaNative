@@ -117,10 +117,14 @@ static inline int nx_yuv_kind(int color_format) {
     }
 }
 typedef struct { int kind, stride, slice, cl, ct, cw, ch; } nx_yuv_layout;
-// Bytes of a picture of this layout (the last chroma row needs only its own bytes)
+// Bytes a picture of this layout must have: the luma at its slice height, then the chroma rows the crop reads (nx_yuv_to_nv12), not the slice height's. Qualcomm's AV1 decoder
+// (c2.qti.av1.decoder) gives the first picture of a stream with its luma padded to a slice height of 1088 and 540 chroma rows after it (3,125,760 bytes for 1920x1080):
+// counted at 544 chroma rows the buffer looked short, the copy fell back to a slice height of 1080 and read its chroma from the luma's zero padding, which showed as green
+// stripes at the top of the first picture of every movie (Ocarina of Time, Galaxy S25)
 static inline size_t nx_yuv_bytes(const nx_yuv_layout *L) {
-    size_t y = (size_t)L->stride * L->slice, rows = (size_t)(L->slice + 1) / 2;
-    return L->kind == NXYUV_I420 ? y + 2 * rows * (size_t)((L->stride + 1) / 2) : y + rows * (size_t)L->stride;
+    size_t y = (size_t)L->stride * L->slice, plane = (size_t)(L->slice + 1) / 2, rows = (size_t)(L->ct / 2) + (size_t)((L->ch + 1) / 2);
+    if (rows > plane) rows = plane;
+    return L->kind == NXYUV_I420 ? y + (plane + rows) * (size_t)((L->stride + 1) / 2) : y + rows * (size_t)L->stride;   // I420: all of U, then the V rows read
 }
 // The cropped picture as tight NV12 of an even size (W = cw rounded up to even, H likewise): Y stride W, then UV at W * H, stride W.
 // Returns 0, or -1 when the buffer is smaller than the layout says
