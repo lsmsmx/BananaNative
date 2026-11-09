@@ -698,8 +698,9 @@ static void window_apply(module_t *m) {
 }
 
 // The rows of DM_FPS_LOCK (loader.c fps_lock_apply): the main build, and the three instructions of its frame-pacing function -- the interval store, its minimum, its maximum
-static const struct { const char *build; uint64_t store[3]; } k_fps_lock[] = {
-    { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc } },   // add w9,w8,#1 (the interval), movz w8,#1 (its minimum), movz w8,#2 (its maximum)
+static const struct { const char *build; uint64_t store[3], max[2]; } k_fps_lock[] = {
+    { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc }, { 0x69cdd4, 0x69cddc } },
+    // store: add w9,w8,#1 (the interval), movz w8,#1 (its minimum), movz w8,#2 (its maximum); max: cmp w8,#2 and that maximum's movz
 };
 // DM_FPS_LOCK=<fps> (Android and the Mac; the game's own pacing unless set): a frame-rate controller compiled with its present-interval bounds as *immediates* has no
 // field for hle_fpslock.c to write, so the bound itself is rewritten here, while main's text is still writable (before the mprotect below), the same window DM_WINDOW_SIZE
@@ -710,6 +711,26 @@ static const struct { const char *build; uint64_t store[3]; } k_fps_lock[] = {
 // each instruction is checked to be a movz before anything is written
 static void fps_lock_apply(module_t *m) {
     if (strcmp(m->name, "main") || m->nro) return;
+    // DM_FPS_MIN=<fps>: the game's own pacing, but its interval may go up to 60/fps vsyncs -- so it can reach that frame rate at full speed when frames run long
+    // (instead of being pinned at its compiled-in maximum of 30 with the logic in slow motion), and still runs at 60 or 30 when it can. DM_FPS_LOCK below fixes it.
+    // 60 divided into whole vsyncs only: 60, 30, 20, 15 (25 is not one)
+    const char *mn = getenv("DM_FPS_MIN");
+    if (mn && *mn) {
+        int fps = atoi(mn);
+        unsigned iv = fps > 0 ? (unsigned)((60 + fps / 2) / fps) : 0;
+        int r = -1;
+        for (size_t i = 0; i < sizeof k_fps_lock / sizeof *k_fps_lock; i++) if (!strcmp(k_fps_lock[i].build, m->build_id)) r = (int)i;
+        if (r < 0) { LOG("[RED] DM_FPS_MIN=%s: no row for main build %s; the game's own pacing stays", mn, m->build_id); return; }
+        else if (iv < 1 || iv > 4) { LOG("[RED] DM_FPS_MIN=%s: must be 60, 30, 20 or 15 (whole vsyncs; 60 / interval); the game's own pacing stays", mn); return; }
+        else {
+            uint32_t cmp = *(const uint32_t *)(m->base + k_fps_lock[r].max[0]), mov = *(const uint32_t *)(m->base + k_fps_lock[r].max[1]);
+            if ((cmp & 0xFFC0001Fu) != 0x7100001Fu || (mov & 0xFFE00000u) != 0x52800000u) { LOG("[RED] fps min: main+%#llx / +%#llx are %08x %08x, not cmp w8,#imm / movz w8,#imm; the game's own pacing stays",
+                                                                                                 (unsigned long long)k_fps_lock[r].max[0], (unsigned long long)k_fps_lock[r].max[1], cmp, mov); return; }
+            *(uint32_t *)(m->base + k_fps_lock[r].max[0]) = 0x71000000u | (iv << 10) | (8u << 5) | 31u;   // cmp w8, #iv
+            *(uint32_t *)(m->base + k_fps_lock[r].max[1]) = 0x52800000u | (iv << 5) | (mov & 0x1Fu);     // movz w<n>, #iv
+            LOG("frame rate floor: interval up to %u, %u fps at full speed (DM_FPS_MIN=%s), in main build %s", iv, 60 / iv, mn, m->build_id);
+        }
+    }
     const char *e = getenv("DM_FPS_LOCK");
     if (!e || !*e) return;
     int fps = atoi(e);
