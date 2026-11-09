@@ -19,6 +19,9 @@
 
 static VkCommandBuffer g_cb; static unsigned g_slot; static int g_prof, g_dyn_filter = 1, g_pass_keep = 1, g_vb_filter = 1;   // g_prof: this draw is timed (vka_draw)
 static int g_prof_all, g_prof_every;   // DM_VK_PROF: every draw timed; the pace line's sample (DM_VK_PACE_PROF): one draw in g_prof_every
+// DM_VK_PROF_IMG (diagnostic, default 0): the image descriptors' own split in the pace line (how much of them is the ID's view lookup and how much everything after it).
+// It costs two counter reads per image descriptor -- six or so a draw -- which was a tenth of a draw's recording time, so it is off unless asked for
+static int g_prof_img;
 static int g_vin_skip = 1;             // DM_VK_VIN_SKIP (vin_build_kept)
 static int g_inst_on;   // DM_VK_INSTANCE (the instanced runs below)
 uint64_t vka_n_rp;   // render passes the draws opened (vka_exec.c replay statistics)
@@ -128,7 +131,7 @@ void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
-    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
+    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_prof_img = VKA_ENV("DM_VK_PROF_IMG", 0); g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
     g_vin_skip = VKA_ENV("DM_VK_VIN_SKIP", 1);
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
     g_cur_dp[g_slot] = 0;
@@ -1117,7 +1120,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
-                tw_ = g_prof && tid ? cntvct() : 0;
+                tw_ = g_prof && g_prof_img && tid ? cntvct() : 0;
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
                 if (tw_) { tv_ = cntvct() - tw_; g_ps[6] += tv_; }
                 if (tid && v) class_note(sh, st, &r[i], tid, storage);
@@ -1704,8 +1707,10 @@ void vka_draw_pace(char *b, size_t n, double *draw_us) {
         double us = tick_us() / (double)d.n; *draw_us = d.tot * us;
         o += (size_t)snprintf(b + o, n - o, "draw path %.2f us a draw (1 in %d timed:", d.tot * us, g_prof_all ? 1 : g_prof_every);
         for (int i = 0; i < 8 && o < n; i++) o += (size_t)snprintf(b + o, n - o, " %s %.2f%s", g_pt_nm[i], d.pt[i] * us, i < 7 ? "," : "");
-        if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f: view %.2f, rest %.2f; driver segments %.2f), push %.2f)",
-                                      d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[6] * us, d.ps[7] * us, d.ps[3] * us, d.ps[2] * us);
+        char vs[64] = "";
+        if (g_prof_img) snprintf(vs, sizeof vs, ": view %.2f, rest %.2f", d.ps[6] * us, d.ps[7] * us);
+        if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f%s; driver segments %.2f), push %.2f)",
+                                      d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, vs, d.ps[3] * us, d.ps[2] * us);
     }
     {   // the view memo's own hits and misses (vka_tex.c vka_tex_memo_stats): which of its four reasons a lookup was not answered from it
         uint64_t h, other, ver, infb, gen2; vka_tex_memo_stats(&h, &other, &ver, &infb, &gen2);
