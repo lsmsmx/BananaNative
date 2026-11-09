@@ -211,26 +211,18 @@ static void map_put(uint64_t s, vka_img *im) {
 }
 typedef struct { tex_t t; view_t v; uint8_t has_v, img; uint64_t pgen; } treg_ent;   // pgen: the texture's pool's Initialize serial at registration (nvn_pool_live)
 static treg_ent *g_treg; static int g_ntreg;   // indexed by host texture ID
-// A serial's mapping went away: the texture IDs that named it resolve to nothing now, so the view memo's entries for them are stale. Their registration version is bumped,
-// which is what the memo keys each ID on, instead of the global generation: that one made *every* ID of the game resolve again after any pool was finalized, and the pace line
-// showed 15 % of the memo's lookups missing for exactly that ("a texture dropped"), at the full id_view path each (2.7 us). The caller holds g_tmu
-static void rev_bump(uint64_t s) {
-    if (!s || !g_treg || !g_tver) return;
-    for (int i = 0; i < g_ntreg; i++) if (g_treg[i].t.serial == s) atomic_fetch_add_explicit(&g_tver[i], 1, memory_order_release);
-}
-static void map_del(uint64_t s) { smap_ent *e = map_get(s); if (e) { e->serial = ~0ull; e->im = NULL; atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); rev_bump(s); } }   // a tombstone (never a valid serial)
+static void map_del(uint64_t s) { smap_ent *e = map_get(s); if (e) { e->serial = ~0ull; e->im = NULL; atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); } }   // a tombstone (never a valid serial)
 static void map_del_im(vka_img *im) {
     if (!g_mapcap || !im) return;
-    int del = 0; uint64_t gone[8]; int ngone = 0;
+    int del = 0;
     for (size_t i = 0; i < g_mapcap; i++) {
         if (g_map[i].serial && g_map[i].serial != ~0ull && g_map[i].im == im) {
-            if (ngone < 8) gone[ngone++] = g_map[i].serial;
             g_map[i].serial = ~0ull;
             g_map[i].im = NULL;
             del = 1;
         }
     }
-    if (del) { atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); for (int k = 0; k < ngone; k++) rev_bump(gone[k]); }
+    if (del) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
 }
 static int cpuw_take(uint64_t s, int add) {   // add: insert; else: remove and say whether it was there
     if (add && (g_cpuwn + 1) * 2 > g_cpuwcap) {
@@ -1968,7 +1960,7 @@ static int img_storage_upgrade(vka_img *im, VkCommandBuffer cb, VkFormat need) {
     if (im->holds) { n->zold = im->zold; im->zold = n; }
     else vka_after(vka_fence_last() + 1, img_destroy, n);
     // Views made of the old image are gone with it: the memo's entries for the IDs that name this serial (their registration version) and the registered pool slots are made again
-    atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); rev_bump(im->serial);
+    atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
     int named = 0;
     for (int id = 1; id < g_ntreg; id++) { smap_ent *e = g_treg[id].t.serial ? map_get(g_treg[id].t.serial) : NULL; if (e && e->im == im) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); named++; } }
     static _Atomic int k; if (atomic_fetch_add(&k, 1) < 16)
@@ -2081,7 +2073,7 @@ static inline vmemo *vm_set(int id, uint8_t dim) { return &g_vm[(size_t)(((unsig
 // again, its texture mapping dropped, or its image remade for storage use) / the image is the open pass's own attachment (a view of it differs). Counted on the recording thread
 static _Atomic uint64_t g_vm_hit, g_vm_other, g_vm_ver, g_vm_infb, g_vm_gen;
 static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
-    return m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && !in_fb(m->im);
+    return m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && !in_fb(m->im);
 }
 // vka_tex_id_view for the recording thread (one thread at a time: the replay worker, or the submitting thread inline), with the memo; storage images take the full path
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout) {

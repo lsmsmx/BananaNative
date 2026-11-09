@@ -1720,7 +1720,7 @@ void vka_draw_pace(char *b, size_t n, double *draw_us) {
         uint64_t dh2 = h - mh0, dot = other - mo0, dv = ver - mv0, di = infb - mi0, dg = gen2 - mg0;
         mh0 = h; mo0 = other; mv0 = ver; mi0 = infb; mg0 = gen2;
         uint64_t tot = dh2 + dot + dv + di + dg;
-        if (o < n && tot) o += (size_t)snprintf(b + o, n - o, "%sview memo answered %.0f %% of %llu lookups: another ID in the slot %.0f, the ID's version moved (registered again, its texture dropped or its image remade) %.0f, a pass's own target %.0f, other %.0f",
+        if (o < n && tot) o += (size_t)snprintf(b + o, n - o, "%sview memo answered %.0f %% of %llu lookups: another ID in the slot %.0f, the ID's version moved (registered again, its texture dropped or its image remade) %.0f, a pass's own target %.0f, a texture dropped since %.0f",
                                                o ? "; " : "", 100.0 * (double)dh2 / (double)tot, (unsigned long long)tot, 100.0 * (double)dot / (double)tot, 100.0 * (double)dv / (double)tot,
                                                100.0 * (double)di / (double)tot, 100.0 * (double)dg / (double)tot);
     }
