@@ -16,6 +16,8 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
+#include <errno.h>
 
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
 void dm_guest_thread_join(void *tt);
@@ -28,7 +30,19 @@ void dm_pcmout_wait(void *k, int ms);
 
 // P_SIZE: bytes of the game's AudioRendererParameter copied before the two fields are changed. SDK 16's struct is 0x38 bytes; SDK 8's (Link's Awakening) has one more word,
 // its revision at +0x38: copying only 0x38 left the revision uninitialized and the SDK rejected it (CheckValidRevision, Result 0x499). The SDK reads only its own size of the copy
-enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF = 4 };
+enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF_MAX = 16 };
+// DM_AUDIO_BUFS (default 8): how many 5 ms blocks the render thread keeps in flight. Each block is slack against the render (or the sound card) being late: at 4 that is
+// 20 ms, which a cycle of 25-320 ms walks straight through (hle_audren.c's own DM_AUDIO_RENDER_STALL_MS lines on the phone), at 8 it is 40. It costs that much audio latency
+static int aud_bufs(void) { const char *e = getenv("DM_AUDIO_BUFS"); int n = e ? atoi(e) : 8; if (n < 2) n = 2; if (n > NBUF_MAX) n = NBUF_MAX; return n; }
+// DM_AUDIO_AFF=<mask> (default 0, off; 128 = the last core): pins this render thread, so the game's own threads cannot crowd it off a core. The replay thread has the same
+// kind of switch (DM_VK_AFF_REPLAY, vka_worker.c); this one is for the thread an AudioOut underrun is counted against
+static void aud_affinity(void) {
+    const char *e = getenv("DM_AUDIO_AFF"); unsigned m = e ? (unsigned)strtoul(e, NULL, 0) : 0;
+    if (!m) return;
+    cpu_set_t cs; CPU_ZERO(&cs); for (int c = 0; c < CPU_SETSIZE && c < 32; c++) if (m >> c & 1) CPU_SET(c, &cs);
+    if (sched_setaffinity(0, sizeof cs, &cs)) LOG("[RED] audren: DM_AUDIO_AFF=%#x refused (errno %d)", m, errno);
+    else LOG("audren: render thread pinned to the cores of %#x", m);
+}
 static void *gsym(const char *n) { void *p = guest_sym(n); if (!p) die("audren: missing SDK symbol %s", n); return p; }
 static void cpu_manual(uint8_t *dst, const uint8_t *src) { memcpy(dst, src, P_SIZE); *(int32_t *)(dst + P_DEVICE) = 1; *(int32_t *)(dst + P_MODE) = 1; }
 
@@ -101,10 +115,11 @@ static void render_main(void *arg) {
     (void)arg;
     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
     void *out = dm_pcmout_open(2);
-    static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
-    for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+    static int16_t data[NBUF_MAX][FRAME_MAX * 2]; static gbuf bufs[NBUF_MAX]; gbuf *free_list[NBUF_MAX]; int nb = aud_bufs(), nfree = nb;
+    for (int i = 0; i < nb; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+    aud_affinity();
     dm_pcmout_start(out);
-    LOG("audren: render thread started (%d buffers in flight, paced by the output)", NBUF);
+    LOG("audren: render thread started (%d buffers in flight, paced by the output; DM_AUDIO_BUFS)", nb);
     uint64_t lim_ms = render_stall_ms(), tlast = now_ns(); int nstall = 0;
     while (atomic_load(&g_open)) {
         uint64_t tw0 = now_ns(), wait_ns = 0; int waited = 0;
