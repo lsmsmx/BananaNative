@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <errno.h>
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -152,6 +153,10 @@ static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;   // one save at a
 static pthread_mutex_t g_sv_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sv_cv = PTHREAD_COND_INITIALIZER; static int g_sv_want, g_sv_up;
 static void pc_open_once(void) {
     const char *e = getenv("DM_VK_PCACHE"), *t = getenv("DM_TEMP"), *home = getenv("HOME");
+    // DM_VK_PCACHE_DIR: the same per-driver file name in another directory. Android's /storage/emulated is the FUSE view of /data/media: a 112 MB cache write there goes
+    // through the media daemon, while the app's own internal files are ext4/f2fs directly. The driver tag stays, so switching drivers still leaves the other's cache alone
+    const char *cd = getenv("DM_VK_PCACHE_DIR");
+    if (cd && *cd) { t = cd; static int made; if (!made++) mkdir(cd, 0777); }
     if (e && !strcmp(e, "0")) g_pc_path[0] = 0;
     else if (e && *e) snprintf(g_pc_path, sizeof g_pc_path, "%s", e);
     else if ((t && *t) || (home && *home)) {   // a custom driver (DM_VK_DRIVER) keeps its own file, so switching drivers leaves the system driver's cache alone
