@@ -930,7 +930,15 @@ static uint8_t *unmapped_content(const tex_t *t) {
                                                               (unsigned long long)u, (unsigned long long)((t->L.size + 4095) >> 12), (const void *)t->mem);
     return c;
 }
+// DM_GUEST_FILE: the guest's pages are a file's, and the kernel evicts them under pressure -- the phone's logs show 5,000-8,000 major faults inside one frame. An upload
+// reads a whole texture at once, so each missing page is a random 4 KB read faulted one at a time; asking for the range first lets the kernel read it ahead in one go
+int dm_guest_file_backed(void);
+static void guest_prefetch(const void *p, uint64_t n) {
+    if (!p || n < (1u << 20) || !dm_guest_file_backed()) return;
+    madvise((void *)((uintptr_t)p & ~(uintptr_t)0xFFF), (size_t)n + 0x1000, MADV_WILLNEED);
+}
 static void upload_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // stamp, protect, then read (nvn_mtl.m pkg_upload): a write during the copy is seen at the next check
+    guest_prefetch(t->mem, t->L.size);
     im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
     if (vka_nan_on()) im->hash = mem_hash(t->mem, t->L.size);
     uint8_t *c = im->vpool ? NULL : gw_content(t->mem, t->L.size, &im->gw_seen);   // (a sparse pool's storage is read through its page table: upload_)
@@ -940,6 +948,7 @@ static void upload_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   
         if (!im->snap) im->snap = malloc(256); if (im->snap) memcpy(im->snap, t->mem, t->L.size < 256 ? t->L.size : 256); }
 }
 static void upload_fill(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // the same without tracking (ST_FILL)
+    guest_prefetch(t->mem, t->L.size);
     uint8_t *c = im->vpool ? NULL : gw_content(t->mem, t->L.size, &im->gw_seen);
     if (!c && !im->vpool) c = unmapped_content(t);
     if (c) { tex_t tc = *t; tc.mem = c; upload(im, &tc, cb); free(c); g_gw_over++; } else upload(im, t, cb);
