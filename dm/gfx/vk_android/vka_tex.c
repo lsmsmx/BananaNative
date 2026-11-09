@@ -1383,7 +1383,8 @@ static void vka_tex_prune_locked(void) {
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
     for (int i = 0; i < g_nlive; i++) {
         vka_img *im = g_live[i];
-        if (vktl_evictable(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, im->last_fence && done_fence < im->last_fence))
+        if (vktl_evictable2(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, im->last_fence && done_fence < im->last_fence,
+                            (unsigned)VKA_ENV("DM_VK_IMG_KEEP_FRAMES", 2)))
             c[nc++] = (prune_ent){im, im->last_frame, im->gpu_owned != 0};
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
