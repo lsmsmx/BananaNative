@@ -1045,10 +1045,53 @@ int vka_mdx_args(uint64_t ind, VkBuffer *b, VkDeviceSize *o) {
     *b = g_mdx[i].buf; *o = g_mdx[i].off; return 1;
 }
 
+// DM_VK_REC_PROF=1 (diagnostic, live): the record walk (exec, below) timed and counted by record kind, and the pace line naming the three kinds that took the most
+// since its last line. It exists because a 2.6 s freeze on the phone landed wholly in the pace line's "other records" -- what is left of the recording after draws,
+// texture prepare and commit, which is this walk -- and nothing here was measured: the log could say where but not what. The reads are cntvct (a few cycles), so even a
+// 100k-record frame pays under a millisecond
+static uint64_t g_rk_t[OP_COUNT_], g_rk_n[OP_COUNT_], g_rk_lt[OP_COUNT_], g_rk_ln[OP_COUNT_];
+static int g_rec_prof_on = -1;   // DM_VK_REC_PROF, read at the first walk
+static inline uint64_t rk_cnt(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+static double rk_hz(void) { static double f; if (!f) { uint64_t h; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(h)); f = h ? (double)h : 1.0; } return f; }
+static const char *const k_op_nm[OP_COUNT_] = {
+    "end", "jump", "begin", "call", "signal", "report", "copy-b2b", "update-ub", "set-rt", "clear-color", "clear-ds", "viewport", "scissor", "depth-range",
+    "bind-program", "bind-state", "bind-vattr", "bind-vstream", "bind-vbuf", "bind-ubo", "bind-ssbo", "bind-tex", "bind-samp", "stencil", "poly-offset",
+    "draw", "draw-idx", "dispatch", "barrier", "set-tex-pool", "set-samp-pool", "copy-b2t", "copy-stride", "blend-color", "copy-t2b", "bind-img", "copy-t2t",
+    "reset-counter", "clear-tex", "clear-buf", "depth-clamp", "render-cond", "fence-sync", "tf-bind", "tf-state", "rast-discard", "vp-swizzle", "bind-tex1",
+    "prim-restart", "bind-ubo-small", "bind-vbuf1", "draw-tex", "alpha-ref", "push-const" };
+// The pace line's share of it: the three kinds that took the most since the last call, in ms on the replay thread, with the records each. Nothing when off
+void vka_rec_prof_line(char *b, size_t n) {
+    if (!n) return;
+    b[0] = 0;
+    if (g_rec_prof_on != 1) return;
+    static uint64_t dk[OP_COUNT_], dn[OP_COUNT_];
+    uint64_t tot = 0;
+    for (int i = 0; i < OP_COUNT_; i++) {
+        dk[i] = g_rk_t[i] - g_rk_lt[i]; dn[i] = g_rk_n[i] - g_rk_ln[i];
+        g_rk_lt[i] = g_rk_t[i]; g_rk_ln[i] = g_rk_n[i];
+        tot += dk[i];
+    }
+    if (!tot) return;
+    static uint8_t used[OP_COUNT_];
+    for (int i = 0; i < OP_COUNT_; i++) used[i] = 0;
+    size_t o = 0;
+    o += (size_t)snprintf(b + o, n - o, "; records (DM_VK_REC_PROF):");
+    for (int k = 0; k < 3; k++) {
+        int best = -1;
+        for (int i = 0; i < OP_COUNT_; i++) if (!used[i] && (best < 0 || dk[i] > dk[best])) best = i;
+        if (best < 0 || !dk[best]) break;
+        used[best] = 1;
+        if (o < n) o += (size_t)snprintf(b + o, n - o, " %s %.1f ms (%llu),", k_op_nm[best], (double)dk[best] * 1000.0 / rk_hz(), (unsigned long long)dn[best]);
+    }
+    if (o < n && o && b[o - 1] == ',') b[o - 1] = 0;
+    if (o < n) snprintf(b + o, n - o, " of %.1f ms", (double)tot * 1000.0 / rk_hz());
+}
 static void seg_write(const void *a) { struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w; memcpy(&w, a, sizeof w); qf.write(w.cb, w.st, g_sqp, w.q); }
 static void exec(const uint8_t *p, int depth) {
+    if (g_rec_prof_on < 0) g_rec_prof_on = VKA_ENV("DM_VK_REC_PROF", 0) != 0;
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
+        uint64_t rk0 = g_rec_prof_on == 1 ? rk_cnt() : 0;
         const void *a = p + 8;
         int bar_kept = 0;   // a game barrier taken inside the open pass (vka_rp_game_barrier): no pass end, no full barrier
         switch (h.op) {   // GPU work other than a dispatch: after the barrier the dispatches before it left pending (vka_draw.c "Dispatch order"), and before a part ends at a draw
@@ -1115,6 +1158,7 @@ static void exec(const uint8_t *p, int depth) {
         default: break;   // state: taken by vka_state_op above
         }
         if (g_rcl) rcl_op(h.op, a);
+        if (rk0 && h.op < OP_COUNT_) { g_rk_t[h.op] += rk_cnt() - rk0; g_rk_n[h.op]++; }
         if (h.size < 8) { VRED("command record of size %u at %p (op %u): the list is cut here", h.size, (const void *)p, h.op); return; }
         p += h.size;
     }

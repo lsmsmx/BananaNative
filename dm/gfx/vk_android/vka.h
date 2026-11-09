@@ -76,6 +76,7 @@ void vka_gpu_floor(void);               // mtl_sub_begin: DM_VK_GPU_FLOOR's GPU 
 void vka_ctl_sub(void);                 // mtl_sub_begin: live switches queued since the last frame are applied
 void vka_ctl_frame(uint64_t f);         // mtl_set_frame: per-frame counters for "capture" and "stats"
 void vka_exec_counts(uint64_t *ops, uint64_t *subs, uint64_t *rec_ns);   // vka_exec.c: clears / copies, submissions, recording time so far
+void vka_rec_prof_line(char *b, size_t n);   // DM_VK_REC_PROF: the record walk by record kind since the last call, for the pace line
 
 // ---------- Device (vka_dev.c) ----------
 typedef struct {
