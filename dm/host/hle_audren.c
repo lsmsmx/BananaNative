@@ -122,6 +122,7 @@ static void render_main(void *arg) {
     LOG("audren: render thread started (%d buffers in flight, paced by the output; DM_AUDIO_BUFS)", nb);
     uint64_t lim_ms = render_stall_ms(), tlast = now_ns(); int nstall = 0;
     while (atomic_load(&g_open)) {
+        struct timespec ct0; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct0);   // this thread's own CPU time: a cycle that took 300 ms of wall time with 5 ms of it on the CPU
         uint64_t tw0 = now_ns(), wait_ns = 0; int waited = 0;
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
@@ -143,10 +144,12 @@ static void render_main(void *arg) {
         b->size = (uint64_t)n * 4;
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
         {   uint64_t t2 = now_ns(), cycle = t2 - tlast; tlast = t2;
+            struct timespec ct1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct1);
+            double cpu_ms = ((double)(ct1.tv_sec - ct0.tv_sec) * 1e3 + (double)(ct1.tv_nsec - ct0.tv_nsec) / 1e6);
             if (lim_ms && cycle > lim_ms * 1000000ull && nstall++ < 24)
                 LOG("audren: %.1f ms between frames (%.0f frames so far): %.1f ms waiting for the output to hand a block back (%d wait(s) of up to 10 ms), "
-                    "the render and the append %.1f ms -- a cycle this long is what an underrun looks like from the output's side",
-                    cycle / 1e6, (double)g_frames, wait_ns / 1e6, waited, (t2 - t1) / 1e6);
+                    "the render and the append %.1f ms, of the cycle %.1f ms on this thread's CPU -- a cycle this long is what an underrun looks like from the output's side",
+                    cycle / 1e6, (double)g_frames, wait_ns / 1e6, waited, (t2 - t1) / 1e6, cpu_ms);
         }
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
