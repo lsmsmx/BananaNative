@@ -697,6 +697,36 @@ static void window_apply(module_t *m) {
         (unsigned long long)fn[0], (unsigned long long)fn[1], rows[r].w, rows[r].h, was[0], was[1]);
 }
 
+// DM_FPS_LOCK=<fps> (Android and the Mac; the game's own pacing unless set): a frame-rate controller compiled with its present-interval bounds as *immediates* has no
+// field for hle_fpslock.c to write, so the bound itself is rewritten here, while main's text is still writable (before the mprotect below), the same window DM_WINDOW_SIZE
+// uses. Mario Kart World 1.8.0 (main build d00e4f399e411d0613aa8d26b1c02fef): the frame-pacing function at main+0x69cbb0 computes `interval = elapsed / frame + 1` and
+// stores it at [x19+0x214], then clamps with `movz w8,#1` (+0x69ccec) as the minimum and `cmp w8,#2` / `movz w8,#2` (+0x69cdd4 / +0x69cddc) as the maximum, so it only
+// ever runs at interval 1 (60) or 2 (30) -- the logs show 1 -> 2 -> 1 and never 3. Writing the same immediate into all three stores holds it at 60/fps: the game keeps
+// its own pacing and steps its logic by the interval it picked, so 15, 20 and 30 stay the right speed (no slow motion). Each row is the main build it was found in, and
+// each instruction is checked to be a movz before anything is written
+static void fps_lock_apply(module_t *m) {
+    if (strcmp(m->name, "main") || m->nro) return;
+    const char *e = getenv("DM_FPS_LOCK");
+    if (!e || !*e) return;
+    int fps = atoi(e);
+    if (fps < 1 || fps > 60) { LOG("[RED] DM_FPS_LOCK=%s: must be 1 to 60; the game's own pacing stays", e); return; }
+    unsigned iv = (unsigned)((60 + fps / 2) / fps); if (iv < 1) iv = 1; if (iv > 8) iv = 8;
+    static const struct { const char *build; uint64_t store[3]; } rows[] = {
+        { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc } },   // the interval store, its minimum, and its maximum
+    };
+    int r = -1;
+    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) if (!strcmp(rows[i].build, m->build_id)) r = (int)i;
+    if (r < 0) { LOG("[RED] DM_FPS_LOCK=%s: no row for main build %s; the game's own pacing stays", e, m->build_id); return; }
+    for (int i = 0; i < 3; i++) {
+        uint64_t off = rows[r].store[i];
+        if (off + 4 > m->text_end) { LOG("[RED] frame lock: main+%#llx is outside main's text; the game's own pacing stays", (unsigned long long)off); return; }
+        uint32_t w = *(const uint32_t *)(m->base + off);
+        if ((w & 0xFFE0001Fu) != 0x52800000u) { LOG("[RED] frame lock: main+%#llx is %08x, not movz; the game's own pacing stays", (unsigned long long)off, w); return; }
+    }
+    for (int i = 0; i < 3; i++) { uint32_t *p = (uint32_t *)(m->base + rows[r].store[i]); *p = 0x52800000u | (iv << 5) | (*p & 0x1Fu); }   // movz w<n>, #iv
+    LOG("frame lock: interval %u, %u fps (DM_FPS_LOCK=%s), in main build %s", iv, 60 / iv, e, m->build_id);
+}
+
 // Switch 2 SDKs (Ounce) compile with APIBKey (pacibsp / autibsp / retab) and APGAKey (pacga), both process-wide on Linux arm64, except in
 // nn::os::detail::FiberImplByHorizon::Initialize (pacia x16, x9; pacia x17, x9) and nn::os::detail::DispatchFiberContext (autiasp), which sign and authenticate
 // a newly initialized fiber's entry with APIAKey. On Android, Bionic's pthread_create resets APIAKey to a fresh random key per thread (PR_PAC_RESET_KEYS), so a
@@ -775,7 +805,7 @@ static void map_image(module_t *m, const char *dir) {
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
-        free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m);
+        free(raw); install_key_page(m); window_apply(m); fps_lock_apply(m); fiber_pac_apply(m); pac_patch_text(m);
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
@@ -786,7 +816,7 @@ static void map_image(module_t *m, const char *dir) {
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
-    memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); fiber_pac_apply(m); pac_patch_text(m);
+    memcpy(m->base, raw, sz); free(raw); install_key_page(m); window_apply(m); fps_lock_apply(m); fiber_pac_apply(m); pac_patch_text(m);
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
