@@ -302,7 +302,7 @@ int vka_swap_rb(void);
 VkImageView vka_tex_id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout);   // texture ID id as a view of shape dim (DMSH_VK_DIM_*); VK_NULL_HANDLE = none fits
 void vka_tex_id_desc(int id, char *b, size_t n);   // texture ID id described for a [RED] line
 void vka_tex_id_peek(int id, char *b, size_t n);   // the same with its storage address and its image's (DM_VK_TEX_PEEK)
-void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw);   // vka_tex_prepare's phases, cumulative ns (the pace line)
+void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw, uint64_t *sweep);   // vka_tex_prepare's phases, cumulative ns (the pace line)
 void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n);   // the open pass's attachments and their levels (n 0: none), for vka_tex_id_view
 int vka_tex_id_in_pass(int id);   // texture ID id's image is an attachment of the open pass (vka_tex_feedback's set)
 int vka_tex_id_target(int id);                      // the NVN target texture ID id stands for (its view's), -1 = not registered

@@ -2356,8 +2356,8 @@ VkSampler vka_samp_default(void) {
 
 // vka_tex_prepare's phases (cumulative ns, the pace line reads them as deltas): the pruner, the CPU re-uploads, the GPU write log's poll, and the scan and re-uploads a GPU
 // write that is done calls for. The rest of the function -- the tracked images whose pages the CPU wrote -- is the pace line's remainder
-static uint64_t g_tp[4];
-void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw) { *prune = g_tp[0]; *redo = g_tp[1]; *poll = g_tp[2]; *gw = g_tp[3]; }
+static uint64_t g_tp[5];
+void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw, uint64_t *sweep) { *prune = g_tp[0]; *redo = g_tp[1]; *poll = g_tp[2]; *gw = g_tp[3]; *sweep = g_tp[4]; }
 void vka_tex_prepare(VkCommandBuffer cb) {
     uint64_t t0_ = now_ns();
     bindless_init();
@@ -2508,6 +2508,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x flags %#x target %d: its storage changed, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format, im->d.flags, im->d.target);
         }
     }
+    g_tp[4] += now_ns() - t0_;   // the sweep above: the bindless table's updates below are the pace line's "table"
     nvn_pool_use(0);   // (write_tex takes it again for each ID, after letting g_tmu go: never twice on one thread)
     if (!g_set) { g_ntd = g_nsd = 0; if (g_tdflag) memset(g_tdflag, 0, 1 << 20); if (g_sdflag) memset(g_sdflag, 0, 4096 * 4); pthread_mutex_unlock(&g_tmu); return; }
     enum { BATCH = 64 }; VkWriteDescriptorSet w[BATCH]; VkDescriptorImageInfo ii[BATCH]; int nw = 0;

@@ -201,24 +201,24 @@ static int pace_thr(int tid, vkpace_thr *o) {
     return ok;
 }
 static void pace_cost(uint64_t f, double nf, uint64_t draws, double rec_ms) {
-    static int rtid, etid; static vkpace_thr r0, e0; static uint64_t b0, p0, c0, tp0[4];
+    static int rtid, etid; static vkpace_thr r0, e0; static uint64_t b0, p0, c0, tp0[5];
     uint64_t bg, pr, cm; vka_exec_phases(&bg, &pr, &cm);
-    uint64_t tp1[4]; vka_tex_prep_phases(&tp1[0], &tp1[1], &tp1[2], &tp1[3]);
+    uint64_t tp1[5]; vka_tex_prep_phases(&tp1[0], &tp1[1], &tp1[2], &tp1[3], &tp1[4]);
     int rt = vka_rec_tid(), et = vka_enc_tid(); vkpace_thr r1 = {0}, e1 = {0};
     int rok = pace_thr(rt, &r1), eok = pace_thr(et, &e1);
     int rfirst = rt != rtid, efirst = et != etid;   // (a new thread: its counters from the next window)
     vkpace_thr rd = vkpace_thr_delta(&r0, &r1), ed = vkpace_thr_delta(&e0, &e1);
     char dp[1400], ep[400]; double dus = 0; vka_draw_pace(dp, sizeof dp, &dus); vka_enc_pace(ep, sizeof ep, nf);
     double dms = nf ? dus * (double)draws / nf / 1e3 : 0, pms = nf ? (pr - p0) / 1e6 / nf : 0, bms = nf ? (bg - b0) / 1e6 / nf - pms : 0, cms = nf ? (cm - c0) / 1e6 / nf : 0;
-    double tm[4] = {0, 0, 0, 0};   // texture prepare's own parts a frame: the pruner, the CPU re-uploads, the write log, the GPU-write scan
-    if (nf) for (int i = 0; i < 4; i++) { tm[i] = (double)(tp1[i] - tp0[i]) / 1e6 / nf; tp0[i] = tp1[i]; }
+    double tm[5] = {0, 0, 0, 0, 0};   // texture prepare's own parts a frame: the pruner, the CPU re-uploads, the write log, the GPU-write scan
+    if (nf) for (int i = 0; i < 5; i++) { tm[i] = (double)(tp1[i] - tp0[i]) / 1e6 / nf; tp0[i] = tp1[i]; }
     char rs[160], es[160];
     if (rok && !rfirst && nf) snprintf(rs, sizeof rs, "on a core %.1f ms, waited for a core %.1f ms, %.0f blocked / %.0f preempted switches", rd.run_ns / 1e6 / nf, rd.wait_ns / 1e6 / nf, rd.vol / nf, rd.invol / nf);
     else snprintf(rs, sizeof rs, "%s", rok ? "from the next line" : "not readable");
     if (eok && !efirst && nf) snprintf(es, sizeof es, "on a core %.1f ms, waited for a core %.1f ms, %.0f blocked / %.0f preempted switches", ed.run_ns / 1e6 / nf, ed.wait_ns / 1e6 / nf, ed.vol / nf, ed.invol / nf);
     else snprintf(es, sizeof es, "%s", eok ? "from the next line" : et ? "not readable" : "off");
-    if (nf) VLOG("pace cost up to frame %llu, a frame: recording %.1f ms = draws %.1f + texture prepare %.1f (prune %.1f, re-uploads %.1f, write log %.1f, GPU-write scan %.1f, rest %.1f) + submission start %.1f + commit %.1f + other records %.1f; replay thread %s; encoder %s; "
-                 "encoder calls ms (count): %s; %s", (unsigned long long)f, rec_ms, dms, pms, tm[0], tm[1], tm[2], tm[3], pms - tm[0] - tm[1] - tm[2] - tm[3], bms, cms,
+    if (nf) VLOG("pace cost up to frame %llu, a frame: recording %.1f ms = draws %.1f + texture prepare %.1f (prune %.1f, re-uploads %.1f, write log %.1f, GPU-write scan %.1f, images %.1f, table %.1f) + submission start %.1f + commit %.1f + other records %.1f; replay thread %s; encoder %s; "
+                 "encoder calls ms (count): %s; %s", (unsigned long long)f, rec_ms, dms, pms, tm[0], tm[1], tm[2], tm[3], tm[4], pms - tm[0] - tm[1] - tm[2] - tm[3] - tm[4], bms, cms,
                  rec_ms - dms - pms - bms - cms, rs, es, ep[0] ? ep : "none", dp[0] ? dp : "no draws timed");
     rtid = rt; etid = et; if (rok) r0 = r1; if (eok) e0 = e1; b0 = bg; p0 = pr; c0 = cm;
 }
