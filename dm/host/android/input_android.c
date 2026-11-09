@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   // strncasecmp (DM_PAD_IGNORE)
 #include <unistd.h>
 #include <android/sensor.h>
 #include <media/NdkMediaCodec.h>
@@ -57,7 +58,27 @@ static const nxin_map *pad_map(void) {   // under g_mu
     }
     return g_map_on ? &g_map : NULL;
 }
+// DM_PAD_IGNORE: devices whose name holds one of these (comma-separated, case-insensitive) never get a player. A phone can expose a *virtual* gamepad of its own
+// (Xiaomi's "uinput-goodix" touch node answers SOURCE_GAMEPAD on some models, so the launcher reports it) and it arrives before the pad in the hand: it took player 1
+// and the real controller became player 2, which a single-player game never reads. `DM_PAD_IGNORE=uinput` leaves player 1 to the pad
+static int g_ign[8]; static int g_nign;   // the device IDs refused by the name list (a key or axis event from them is refused too)
+static int ignored_dev(int device) { for (int i = 0; i < g_nign; i++) if (g_ign[i] == device) return 1; return 0; }
+static int name_ignored(const char *name) {
+    static char list[512]; static int got;
+    if (!got++) { const char *e = getenv("DM_PAD_IGNORE"); snprintf(list, sizeof list, "%s", e ? e : ""); if (list[0]) LOG("input: DM_PAD_IGNORE=%s: such devices get no player", list); }
+    if (!list[0] || !name) return 0;
+    for (char *p = list; *p; ) { char *c = strchr(p, ','); size_t n = c ? (size_t)(c - p) : strlen(p);
+        if (n && strncasecmp(p, name, n) == 0) return 1;
+        p = c ? c + 1 : p + n; }
+    return 0;
+}
 static int take(int device, const char *name, int labelled) {   // under g_mu
+    if (ignored_dev(device)) return -1;
+    if (name_ignored(name)) {
+        int n = g_nign; g_nign = n < 8 ? n + 1 : 8; g_ign[(n < 8 ? n : 7)] = device;
+        LOG("input: device %d (%s) is left out of the players (DM_PAD_IGNORE)", device, name ? name : "?");
+        return -1;
+    }
     int had = pad_slot_of(&g_slots, owner(device)) >= 0;
     int p = pad_slot_take(&g_slots, owner(device), name);
     if (p < 0) { if (!had) LOG("[RED] input: device %d (%s): every player is taken", device, name ? name : "?"); return -1; }

@@ -2428,7 +2428,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         #undef GW_TAKES
         g_ngw = k;
     }
-    g_tp[3] += now_ns() - t0_;
+    g_tp[3] += now_ns() - t0_; t0_ = now_ns();
     // Tracked images whose pages the CPU wrote since their last upload (a write to a protected page moves the dirty clock, so nothing is scanned while it stands still)
     // Sparse pools' textures also when a mapping request came since (the page table's generation moved)
     static uint64_t seen, vseen; uint64_t now = nvn_dirty_now(), vnow = nvn_sparse_gen();
