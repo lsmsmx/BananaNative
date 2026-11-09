@@ -712,7 +712,7 @@ static void fps_lock_apply(module_t *m) {
     if (fps < 1 || fps > 60) { LOG("[RED] DM_FPS_LOCK=%s: must be 1 to 60; the game's own pacing stays", e); return; }
     unsigned iv = (unsigned)((60 + fps / 2) / fps); if (iv < 1) iv = 1; if (iv > 8) iv = 8;
     static const struct { const char *build; uint64_t store[3]; } rows[] = {
-        { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc } },   // the interval store, its minimum, and its maximum
+        { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc } },   // add w9,w8,#1 (the interval), movz w8,#1 (its minimum), movz w8,#2 (its maximum)
     };
     int r = -1;
     for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) if (!strcmp(rows[i].build, m->build_id)) r = (int)i;
@@ -721,7 +721,8 @@ static void fps_lock_apply(module_t *m) {
         uint64_t off = rows[r].store[i];
         if (off + 4 > m->text_end) { LOG("[RED] frame lock: main+%#llx is outside main's text; the game's own pacing stays", (unsigned long long)off); return; }
         uint32_t w = *(const uint32_t *)(m->base + off);
-        if ((w & 0xFFE0001Fu) != 0x52800000u) { LOG("[RED] frame lock: main+%#llx is %08x, not movz; the game's own pacing stays", (unsigned long long)off, w); return; }
+        // movz w<n>,#imm (the two clamp stores), or the add w9, w8, #1 one of them starts as: both are replaced by movz w<their destination>,#iv
+        if ((w & 0xFFE0001Fu) != 0x52800000u && w != 0x11000509u) { LOG("[RED] frame lock: main+%#llx is %08x, not movz or add w9,w8,#1; the game's own pacing stays", (unsigned long long)off, w); return; }
     }
     for (int i = 0; i < 3; i++) { uint32_t *p = (uint32_t *)(m->base + rows[r].store[i]); *p = 0x52800000u | (iv << 5) | (*p & 0x1Fu); }   // movz w<n>, #iv
     LOG("frame lock: interval %u, %u fps (DM_FPS_LOCK=%s), in main build %s", iv, 60 / iv, e, m->build_id);
