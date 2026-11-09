@@ -926,11 +926,13 @@ static uint8_t *unmapped_content(const tex_t *t) {
                                                               (unsigned long long)u, (unsigned long long)((t->L.size + 4095) >> 12), (const void *)t->mem);
     return c;
 }
-// DM_GUEST_FILE: the guest's pages are a file's, and the kernel evicts them under pressure -- the phone's logs show 5,000-8,000 major faults inside one frame. An upload
-// reads a whole texture at once, so each missing page is a random 4 KB read faulted one at a time; asking for the range first lets the kernel read it ahead in one go
+// DM_GUEST_FILE: the guest's pages are a file's, and the kernel evicts them under pressure -- the phone's logs show thousands of major faults inside one frame, and a
+// texture upload reads a whole range at once, so each missing page is a random 4 KB read faulted one at a time; asking for the range first lets the kernel read it ahead in
+// one go. The threshold was 1 MiB, which skipped every texture a game streams in small pieces (the phone's freeze: draw-idx 302 us a draw against 13 us normally, with 1547
+// major faults in the frame -- the draws were resolving new textures whose storage had been evicted); 64 KiB is the smallest read-ahead worth a syscall
 int dm_guest_file_backed(void);
 static void guest_prefetch(const void *p, uint64_t n) {
-    if (!p || n < (1u << 20) || !dm_guest_file_backed()) return;
+    if (!p || n < (64u << 10) || !dm_guest_file_backed()) return;
     madvise((void *)((uintptr_t)p & ~(uintptr_t)0xFFF), (size_t)n + 0x1000, MADV_WILLNEED);
 }
 static uint64_t ft_hash(uintptr_t lo, uintptr_t hi) {
