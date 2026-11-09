@@ -2062,7 +2062,10 @@ typedef struct { int id; uint8_t dim; uint32_t ver, gen; vka_img *im; VkImageVie
 // slot -- a direct-mapped entry was evicted by the next ID of its band, and the memo missed for the whole game's work rather than for its own (Mario Kart World: 6210 live
 // images). Empty ways are filled first, then the set's oldest is replaced in turn
 enum { VM_SETS = 2048, VM_WAYS = 4 };
-static vmemo g_vm[VM_SETS * VM_WAYS]; static uint8_t g_vm_next[VM_SETS]; static struct { int id; uint32_t ver; VkSampler s; } g_sm[512];
+enum { SM_SETS = 512, SM_WAYS = 4 };   // the sampler memo: the same four-way treatment, for the same reason ("id & 511" piles every ID 512 apart on one entry)
+static vmemo g_vm[VM_SETS * VM_WAYS]; static uint8_t g_vm_next[VM_SETS];
+static struct { int id; uint32_t ver; VkSampler s; } g_sm[SM_SETS * SM_WAYS]; static uint8_t g_sm_next[SM_SETS];
+static _Atomic uint64_t g_sm_hit, g_sm_try;
 static inline vmemo *vm_set(int id, uint8_t dim) { return &g_vm[(size_t)(((unsigned)id * 7u + dim) & (VM_SETS - 1)) * VM_WAYS]; }
 // The memo's answers and, when it had none, why (vka_tex_memo_stats, the pace line): no way holds the ID at all / the ID's registration version moved (it was registered
 // again, its texture mapping dropped, or its image remade for storage use) / the image is the open pass's own attachment (a view of it differs). Counted on the recording thread
@@ -2117,11 +2120,19 @@ int vka_tex_id_pending_rec(int id, uint8_t dim) {   // 0 at once when the memo h
 VkSampler vka_samp_id_rec(int id) {
     if (id <= 0 || id >= 4096 * 4 || !g_sver || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return vka_samp_id(id);
     uint32_t ver = atomic_load_explicit(&g_sver[id], memory_order_acquire);
-    typeof(g_sm[0]) *m = &g_sm[id & 511];
-    if (m->id == id && m->ver == ver && m->s) return m->s;
+    atomic_fetch_add_explicit(&g_sm_try, 1, memory_order_relaxed);
+    typeof(g_sm[0]) *s = &g_sm[(size_t)(id & 511) * SM_WAYS];   // four ways, as the view memo: "id & 511" piles every sampler ID 512 apart on one entry
+    for (int w = 0; w < SM_WAYS; w++) if (s[w].id == id && s[w].ver == ver && s[w].s) { atomic_fetch_add_explicit(&g_sm_hit, 1, memory_order_relaxed); return s[w].s; }
     VkSampler sp = vka_samp_id(id);
-    m->id = id; m->ver = ver; m->s = sp;
+    {   int w = -1;
+        for (int i = 0; i < SM_WAYS && w < 0; i++) if (!s[i].s || s[i].id == id) w = i;
+        if (w < 0) w = g_sm_next[id & 511]++ & (SM_WAYS - 1);
+        s[w] = (typeof(s[0])){id, ver, sp}; }
     return sp;
+}
+uint64_t vka_samp_memo_stats(uint64_t *hit, uint64_t *try_n) {
+    *hit = atomic_load_explicit(&g_sm_hit, memory_order_relaxed); *try_n = atomic_load_explicit(&g_sm_try, memory_order_relaxed);
+    return *try_n;
 }
 // The inputs vka_tex_id_view_rec and vka_samp_id_rec resolve from, as generations: the view memo's global (a texture map entry added or tombstoned) and per-ID, the sampler's
 // per-ID, and the open pass's attachments. vka_draw.c keeps a draw's resolved descriptors while all of these and its walk hold (sets_memo); each is read under the same rule

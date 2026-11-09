@@ -1693,6 +1693,7 @@ void vka_draw_prof(char *b, size_t n, double draws) {
 void vka_draw_pace(char *b, size_t n, double *draw_us) {
     static dprof last; static uint64_t vk0, vb0, vk1, vb1, dh0, dm0, ds0, sh0, st0;
     static uint64_t mh0, mo0, mv0, mi0, mg0;   // the view memo's counters at the last line
+    static uint64_t msh0, mst0;                // the sampler memo's
     dprof d; dprof_take(&last, &d);
     uint64_t vk = g_vin_kept - vk0, vb = g_vin_built - vb0, bk = g_vb_kept - vk1, bb = g_vb_bound - vb1, dh = g_dm_hit - dh0, dm = g_dm_miss - dm0, ds = g_dm_stamp - ds0;
     uint64_t sh = g_sm_hit - sh0, st = g_sm_try - st0;
@@ -1714,6 +1715,11 @@ void vka_draw_pace(char *b, size_t n, double *draw_us) {
         if (o < n && tot) o += (size_t)snprintf(b + o, n - o, "%sview memo answered %.0f %% of %llu lookups: another ID in the slot %.0f, the ID's version moved (registered again, its texture dropped or its image remade) %.0f, a pass's own target %.0f, other %.0f",
                                                o ? "; " : "", 100.0 * (double)dh2 / (double)tot, (unsigned long long)tot, 100.0 * (double)dot / (double)tot, 100.0 * (double)dv / (double)tot,
                                                100.0 * (double)di / (double)tot, 100.0 * (double)dg / (double)tot);
+    }
+    {   // the sampler memo (vka_tex.c vka_samp_memo_stats)
+        uint64_t h, t; vka_samp_memo_stats(&h, &t);
+        uint64_t dh3 = h - msh0, dt3 = t - mst0; msh0 = h; mst0 = t;
+        if (o < n && dt3) o += (size_t)snprintf(b + o, n - o, "%ssampler memo answered %.0f %% of %llu lookups", o ? "; " : "", 100.0 * (double)dh3 / (double)dt3, (unsigned long long)dt3);
     }
     if (o < n) o += (size_t)snprintf(b + o, n - o, "%sset 0 writes kept %.0f %% of the draws that could (DM_VK_SETS_MEMO)",
                                       o ? "; " : "", st ? 100.0 * (double)sh / (double)st : 0.0);

@@ -311,6 +311,7 @@ int vka_tex_id_class(int id);                       // the numeric class of text
 int vka_tex_id_class_rec(int id);                   // the same, memoized for the recording thread (by the ID's registration version)
 VkSampler vka_samp_id_rec(int id);
 void vka_tex_memo_stats(uint64_t *hit, uint64_t *other, uint64_t *ver, uint64_t *infb, uint64_t *gen);   // the view memo's answers and its misses by reason (the pace line)
+uint64_t vka_samp_memo_stats(uint64_t *hit, uint64_t *try_n);   // the sampler memo's lookups and its answers (the same line)
 uint64_t vka_tex_gen(void);                        // the view memo's global generation (map_del / map_del_im)
 uint32_t vka_tex_ver(int id);                      // texture ID id's registration version, as the view memo keys it
 uint32_t vka_samp_ver(int id);                      // sampler ID id's version, as the sampler memo keys it
