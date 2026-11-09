@@ -1112,7 +1112,11 @@ static void exec(const uint8_t *p, int depth) {
         case OP_END: return;
         case OP_BEGIN: break;
         case OP_JUMP: memcpy(&p, a, 8); continue;
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth < 16) { g_xret[g_nxret++] = p + h.size; exec((const uint8_t *)(uintptr_t)t, depth + 1); g_nxret--; } else VRED_ONCE("command lists nested deeper than 16"); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8);
+                      // the recursion runs inside this iteration, so its time is taken here as the call's own before descending: otherwise every kind nested under a call is
+                      // counted twice (once by itself, once as part of the call), which makes the top-three meaningless and the total read far above the walk's real time
+                      if (rk0) { g_rk_t[OP_CALL] += rk_cnt() - rk0; g_rk_n[OP_CALL]++; rk0 = 0; }
+                      if (depth < 16) { g_xret[g_nxret++] = p + h.size; exec((const uint8_t *)(uintptr_t)t, depth + 1); g_nxret--; } else VRED_ONCE("command lists nested deeper than 16"); break; }
         case OP_SIGNAL_EVENT: { uint64_t val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); post((pop){1, m, v, 0, val}); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
             uint32_t q = 0;
