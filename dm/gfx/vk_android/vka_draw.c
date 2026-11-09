@@ -22,6 +22,9 @@ static int g_prof_all, g_prof_every;   // DM_VK_PROF: every draw timed; the pace
 // DM_VK_PROF_IMG (diagnostic, default 0): the image descriptors' own split in the pace line (how much of them is the ID's view lookup and how much everything after it).
 // It costs two counter reads per image descriptor -- six or so a draw -- which was a tenth of a draw's recording time, so it is off unless asked for
 static int g_prof_img;
+// The two per-descriptor diagnostics are off unless asked for: class_note walks a 4096-entry table for every image descriptor of every draw to log at most 64 lines in a
+// run, and tex_peek re-read the switch's list each time. DM_VK_CLASS_NOTE=1 brings the first back (it explains "reads as unbound" lines); DM_VK_TEX_PEEK its own
+static int g_class_note, g_tex_peek_any;
 static int g_vin_skip = 1;             // DM_VK_VIN_SKIP (vin_build_kept)
 static int g_inst_on;   // DM_VK_INSTANCE (the instanced runs below)
 uint64_t vka_n_rp;   // render passes the draws opened (vka_exec.c replay statistics)
@@ -131,7 +134,7 @@ void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
-    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_prof_img = VKA_ENV("DM_VK_PROF_IMG", 0); g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
+    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_prof_img = VKA_ENV("DM_VK_PROF_IMG", 0); g_class_note = VKA_ENV("DM_VK_CLASS_NOTE", 0); g_tex_peek_any = VKA_ENV("DM_VK_TEX_PEEK_ANY", 0) || getenv("DM_VK_TEX_PEEK") != NULL; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
     g_vin_skip = VKA_ENV("DM_VK_VIN_SKIP", 1);
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
     g_cur_dp[g_slot] = 0;
@@ -1123,8 +1126,8 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                 tw_ = g_prof && g_prof_img && tid ? cntvct() : 0;
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
                 if (tw_) { tv_ = cntvct() - tw_; g_ps[6] += tv_; }
-                if (tid && v) class_note(sh, st, &r[i], tid, storage);
-                if (tid) tex_peek(sh->key, st, &r[i], v, storage);
+                if (g_class_note && tid && v) class_note(sh, st, &r[i], tid, storage);
+                if (g_tex_peek_any && tid) tex_peek(sh->key, st, &r[i], v, storage);
                 // A 2D texture in a 3D or cube slot: what the game leaves bound where a shader's branch does not sample (DKB's materials keep a 1x1 2D texture in their volume slot 12).
                 // It reads as unbound, zeros, as nvn_mtl.m's zero 3D / zero cube fallback does; noted once. Other mismatches are reported
                 int dd = r[i].dim & DMSH_VK_DIM_MASK, tt = tid && !v ? vka_tex_id_target_rec(tid) : -1;

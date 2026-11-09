@@ -208,7 +208,7 @@ static void pace_cost(uint64_t f, double nf, uint64_t draws, double rec_ms) {
     int rok = pace_thr(rt, &r1), eok = pace_thr(et, &e1);
     int rfirst = rt != rtid, efirst = et != etid;   // (a new thread: its counters from the next window)
     vkpace_thr rd = vkpace_thr_delta(&r0, &r1), ed = vkpace_thr_delta(&e0, &e1);
-    char dp[700], ep[400]; double dus = 0; vka_draw_pace(dp, sizeof dp, &dus); vka_enc_pace(ep, sizeof ep, nf);
+    char dp[1400], ep[400]; double dus = 0; vka_draw_pace(dp, sizeof dp, &dus); vka_enc_pace(ep, sizeof ep, nf);
     double dms = nf ? dus * (double)draws / nf / 1e3 : 0, pms = nf ? (pr - p0) / 1e6 / nf : 0, bms = nf ? (bg - b0) / 1e6 / nf - pms : 0, cms = nf ? (cm - c0) / 1e6 / nf : 0;
     double tm[4] = {0, 0, 0, 0};   // texture prepare's own parts a frame: the pruner, the CPU re-uploads, the write log, the GPU-write scan
     if (nf) for (int i = 0; i < 4; i++) { tm[i] = (double)(tp1[i] - tp0[i]) / 1e6 / nf; tp0[i] = tp1[i]; }
