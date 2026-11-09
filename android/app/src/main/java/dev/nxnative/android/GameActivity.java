@@ -442,7 +442,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                     .append(" in Settings › GPU driver, or in this game's Game settings.");
             else m.append(custom ? ".\n\nThe game may stop or draw wrongly. A custom GPU driver (Settings › GPU driver) may help." : ".\n\nThe game may stop or draw wrongly.");
             readinessDialog("Not ready for this game", m.toString(), details(fails, warns, gpu), report, placed ? "Start anyway (black screen)" : "Try anyway", true);
-        } else if (!warns.isEmpty() && !Prefs.of(this).getString(Prefs.gameKey("readiness_seen", id), "").equals(warnKey(f, warns))) {
+        } else if (!warns.isEmpty() && !seenWarned(id, warns)) {
             StringBuilder m = new StringBuilder("Runs with less: ");
             for (Readiness.Check c : warns) m.append(c.title).append(", ");
             m.setLength(m.length() - 2);
@@ -459,15 +459,25 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         return m.append(gpu).toString();
     }
 
-    /** What the notice was about (the warnings, the GPU and driver): "Don't show again" holds until one of them changes */
-    private static String warnKey(Map<String, String> f, List<Readiness.Check> warns) {
-        StringBuilder s = new StringBuilder(Readiness.gpu(f));
+    /**
+     * "Don't show this again" holds for the warnings it was about, by title: "|title|title|" in readiness_seen. It used to be a hash of the GPU string and the titles, and
+     * that string carries the driver's name and version, which changes with a driver update (or a probe answering differently) -- so the notice came back at every start
+     * for a phone whose warnings had not changed at all. A warning that was not there when the box was checked still shows the notice; one that came back after being
+     * dismissed does not
+     */
+    private boolean seenWarned(String id, List<Readiness.Check> warns) {
+        String seen = Prefs.of(this).getString(Prefs.gameKey("readiness_seen", id), "");
+        for (Readiness.Check c : warns) if (!seen.contains("|" + c.title + "|")) return false;
+        return true;
+    }
+    private static String warnSpec(List<Readiness.Check> warns) {
+        StringBuilder s = new StringBuilder();
         for (Readiness.Check c : warns) s.append('|').append(c.title);
-        return Integer.toHexString(s.toString().hashCode());
+        return s.append('|').toString();
     }
 
     /**
-     * The start-up notice. Required items missing: Try anyway, Back, Details. Only degraded items: Continue (one tap), with "Don't show this again" (until the GPU,
+     * The start-up notice. Required items missing: Try anyway, Back, Details. Only degraded items: Continue (one tap), with "Don't show this again" (until a warning it did not cover,
      * the driver or the warnings change), Back and Details; Settings › Readiness check shows the details again at any time.
      */
     private void readinessDialog(String title, String msg, String details, String report, String go, boolean required) {
@@ -492,7 +502,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         }
         b.setPositiveButton(go, (d, w) -> {
             if (again != null && again.isChecked())
-                Prefs.of(this).edit().putString(Prefs.gameKey("readiness_seen", id), warnKey(rFacts, Readiness.of(rChecks, Readiness.Status.WARNING))).apply();
+                Prefs.of(this).edit().putString(Prefs.gameKey("readiness_seen", id), warnSpec(Readiness.of(rChecks, Readiness.Status.WARNING))).apply();
             triedAnyway = required;
             start();
         });
