@@ -64,6 +64,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `sdk` | VammManager node area and alignment, SDK 4.4.0 (9de92bad) | address space | blocked: one game ships it | judgement | 1 | [sdk_patches.py](../../dm/tools/sdk_patches.py) | an older implementation no rule covers (its large regions aligned to 32 MB, not the rules' 2 MB); a rule once a second game ships it |
 | `build` → `engine` | Criterion's 60 fps mode, frame ticks and game step at fixed addresses | frame rate | blocked: one game on that engine here | judgement | 1 | [Need For Speed™ Hot Pursuit Remastered](../../dm/games/010029B0118E8000/README.md) | the studio's engine, which its other games ship |
 | `build` → `engine` | Frostbite's frame regulator at a fixed pointer | frame rate | blocked: one Frostbite game here | judgement | 1 | [EA SPORTS FC 27](../../dm/games/0100C49025D3E000/README.md) | engine code other Frostbite games ship (the simulation's own rate is already set by name) |
+| `build` → `engine` | Mario Kart World's present-interval bound, three immediates in its frame-pacing function (DM_FPS_LOCK) | frame rate | blocked: one game with this frame-pacing function here | judgement | 1 | [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) | sead code other Nintendo EPD games ship: the function's shape (interval = elapsed / frame + 1, clamped) could find the three stores instead of fixed offsets |
 | `build` → `engine` | Next Level Games' frame limiter target at a fixed address | frame rate | blocked: one game on that engine here | judgement | 1 | [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md) | the studio's engine, which its other games ship |
 | `build` → `engine` | RE Engine's frame limit at a fixed pointer | frame rate | blocked: one RE Engine game here | judgement | 1 | [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md) | engine code other RE Engine games ship |
 | `build` → `engine` | sead's dynamic interval controller floor behind a fixed global (the app object's framework) | frame rate | blocked: one game with this controller here | judgement | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | sead's game framework code that other Nintendo EPD games ship, so the controller could be found by its code (the clamp to [+0, +4] and 60 / interval) instead of a fixed address |
@@ -93,6 +94,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Luigi's Mansion 3](#luigis-mansion-3) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Mario + Rabbids Kingdom Battle](#mario--rabbids-kingdom-battle) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 | [Mario + Rabbids® Sparks of Hope](#mario--rabbids-sparks-of-hope) | 7 | 0 | 0 | 0 | 0 | `build` → `game` ×2 |
+| [Mario Kart World](#mario-kart-world) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Monster Hunter Rise](#monster-hunter-rise) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [Need For Speed™ Hot Pursuit Remastered](#need-for-speed-hot-pursuit-remastered) | 1 | 0 | 0 | 0 | 5 | `build` → `game`, `build` → `engine` |
 | [NieR:Automata The End of YoRHa Edition (010056B015FE8000)](#nierautomata-the-end-of-yorha-edition-010056b015fe8000) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
@@ -390,6 +392,15 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x16430c`: Snowdrop allocator: override the large range-size field to 2 GB (str x1,[x19,#0xa8]); AllocateAddressRegion wrapper never reads x2
   - cut `+0x164338`: Snowdrop large allocator: maximum 64 KB page count 65536 -> 32768, matching its 2 GB range (mov w5,#0x8000)
   - cut `+0x94354`: Unused 272-byte slot pool: 4,194,304 -> 65,536 slots, 1.06 GB -> 17 MB of address space (mov w1,#0x10000)
+
+### Mario Kart World
+
+[Mario Kart World](../../dm/games/0400C3F00006E000/README.md), `0400C3F00006E000`.
+
+- **`build` → `engine`**, frame rate, blocked: one game with this frame-pacing function here, judgement: Mario Kart World's present-interval bound, three immediates in its frame-pacing function (DM_FPS_LOCK). Sead code other Nintendo EPD games ship: the function's shape (interval = elapsed / frame + 1, clamped) could find the three stores instead of fixed offsets
+
+- **1.8.0 `main`** `d00e4f39…`
+  - host [loader.c:702](../../dm/host/loader.c#L702): present-interval bound written into a frame-rate controller whose limits are immediates
 
 ### Monster Hunter Rise
 

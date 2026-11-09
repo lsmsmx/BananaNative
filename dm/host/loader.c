@@ -697,6 +697,10 @@ static void window_apply(module_t *m) {
         (unsigned long long)fn[0], (unsigned long long)fn[1], rows[r].w, rows[r].h, was[0], was[1]);
 }
 
+// The rows of DM_FPS_LOCK (loader.c fps_lock_apply): the main build, and the three instructions of its frame-pacing function -- the interval store, its minimum, its maximum
+static const struct { const char *build; uint64_t store[3]; } k_fps_lock[] = {
+    { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc } },   // add w9,w8,#1 (the interval), movz w8,#1 (its minimum), movz w8,#2 (its maximum)
+};
 // DM_FPS_LOCK=<fps> (Android and the Mac; the game's own pacing unless set): a frame-rate controller compiled with its present-interval bounds as *immediates* has no
 // field for hle_fpslock.c to write, so the bound itself is rewritten here, while main's text is still writable (before the mprotect below), the same window DM_WINDOW_SIZE
 // uses. Mario Kart World 1.8.0 (main build d00e4f399e411d0613aa8d26b1c02fef): the frame-pacing function at main+0x69cbb0 computes `interval = elapsed / frame + 1` and
@@ -711,21 +715,18 @@ static void fps_lock_apply(module_t *m) {
     int fps = atoi(e);
     if (fps < 1 || fps > 60) { LOG("[RED] DM_FPS_LOCK=%s: must be 1 to 60; the game's own pacing stays", e); return; }
     unsigned iv = (unsigned)((60 + fps / 2) / fps); if (iv < 1) iv = 1; if (iv > 8) iv = 8;
-    static const struct { const char *build; uint64_t store[3]; } rows[] = {
-        { "d00e4f399e411d0613aa8d26b1c02fef", { 0x69cce0, 0x69ccec, 0x69cddc } },   // add w9,w8,#1 (the interval), movz w8,#1 (its minimum), movz w8,#2 (its maximum)
-    };
     int r = -1;
-    for (size_t i = 0; i < sizeof rows / sizeof *rows; i++) if (!strcmp(rows[i].build, m->build_id)) r = (int)i;
+    for (size_t i = 0; i < sizeof k_fps_lock / sizeof *k_fps_lock; i++) if (!strcmp(k_fps_lock[i].build, m->build_id)) r = (int)i;
     if (r < 0) { LOG("[RED] DM_FPS_LOCK=%s: no row for main build %s; the game's own pacing stays", e, m->build_id); return; }
     for (int i = 0; i < 3; i++) {
-        uint64_t off = rows[r].store[i];
+        uint64_t off = k_fps_lock[r].store[i];
         if (off + 4 > m->text_end) { LOG("[RED] frame lock: main+%#llx is outside main's text; the game's own pacing stays", (unsigned long long)off); return; }
         uint32_t w = *(const uint32_t *)(m->base + off);
         // movz w<Rd>,#imm (the two clamp stores; the mask keeps the opcode and hw only -- the immediate and Rd are the point of the write), or the add w9, w8, #1 the
         // interval's own store starts as: either is replaced by movz w<its destination>,#iv
         if ((w & 0xFFE00000u) != 0x52800000u && w != 0x11000509u) { LOG("[RED] frame lock: main+%#llx is %08x, not movz or add w9,w8,#1; the game's own pacing stays", (unsigned long long)off, w); return; }
     }
-    for (int i = 0; i < 3; i++) { uint32_t *p = (uint32_t *)(m->base + rows[r].store[i]); *p = 0x52800000u | (iv << 5) | (*p & 0x1Fu); }   // movz w<n>, #iv
+    for (int i = 0; i < 3; i++) { uint32_t *p = (uint32_t *)(m->base + k_fps_lock[r].store[i]); *p = 0x52800000u | (iv << 5) | (*p & 0x1Fu); }   // movz w<n>, #iv
     LOG("frame lock: interval %u, %u fps (DM_FPS_LOCK=%s), in main build %s", iv, 60 / iv, e, m->build_id);
 }
 
