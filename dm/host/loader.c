@@ -721,8 +721,9 @@ static void fps_lock_apply(module_t *m) {
         uint64_t off = rows[r].store[i];
         if (off + 4 > m->text_end) { LOG("[RED] frame lock: main+%#llx is outside main's text; the game's own pacing stays", (unsigned long long)off); return; }
         uint32_t w = *(const uint32_t *)(m->base + off);
-        // movz w<n>,#imm (the two clamp stores), or the add w9, w8, #1 one of them starts as: both are replaced by movz w<their destination>,#iv
-        if ((w & 0xFFE0001Fu) != 0x52800000u && w != 0x11000509u) { LOG("[RED] frame lock: main+%#llx is %08x, not movz or add w9,w8,#1; the game's own pacing stays", (unsigned long long)off, w); return; }
+        // movz w<Rd>,#imm (the two clamp stores; the mask keeps the opcode and hw only -- the immediate and Rd are the point of the write), or the add w9, w8, #1 the
+        // interval's own store starts as: either is replaced by movz w<its destination>,#iv
+        if ((w & 0xFFE00000u) != 0x52800000u && w != 0x11000509u) { LOG("[RED] frame lock: main+%#llx is %08x, not movz or add w9,w8,#1; the game's own pacing stays", (unsigned long long)off, w); return; }
     }
     for (int i = 0; i < 3; i++) { uint32_t *p = (uint32_t *)(m->base + rows[r].store[i]); *p = 0x52800000u | (iv << 5) | (*p & 0x1Fu); }   // movz w<n>, #iv
     LOG("frame lock: interval %u, %u fps (DM_FPS_LOCK=%s), in main build %s", iv, 60 / iv, e, m->build_id);
