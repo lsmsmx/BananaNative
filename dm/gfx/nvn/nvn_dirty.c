@@ -34,7 +34,7 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; uint8_t *ever; size_t cap; _Atomic int live; _Atomic uint64_t gmax; } range_t;   // gmax: the newest page generation in the range, so a query can answer "nothing written since" without walking its pages
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; uint8_t *ever; size_t cap; _Atomic int live; _Atomic uint64_t gmax; _Atomic uintptr_t last; } range_t;   // gmax: the newest page generation in the range, so a query can say "nothing written since" without walking; last: that page's index, so it can say "something was" without walking too
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -92,7 +92,8 @@ static void block_bounds(const range_t *r, uintptr_t *p, uintptr_t *q) {
 static void stamp_page(range_t *r, uintptr_t p) {
     { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[p], g);
       uint64_t cur = atomic_load(&r->gmax);   // (a max, not a store: two writers may reach the two stores out of order)
-      while (g > cur && !atomic_compare_exchange_weak(&r->gmax, &cur, g)) {} }
+      while (g > cur && !atomic_compare_exchange_weak(&r->gmax, &cur, g)) {}
+      atomic_store_explicit(&r->last, p, memory_order_relaxed); }   // the newest write's page, as the query's hint (a stale read only costs the walk, never an answer)
     // Publish completion after the generation: a checker may have cached "clean" using the incremented clock before the generation store. Both fault and host-write paths
     // must invalidate that cached clock, as the page stays writable until the next upload protects it again.
     atomic_fetch_add(&g_now, 1);
@@ -191,7 +192,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset(ever, 0, np);
     }
-    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->ever = ever; atomic_store(&r->gmax, 0);
+    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->ever = ever; atomic_store(&r->gmax, 0); atomic_store(&r->last, ~(uintptr_t)0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
