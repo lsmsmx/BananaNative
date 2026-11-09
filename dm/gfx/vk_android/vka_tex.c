@@ -2445,10 +2445,17 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             if (vg != im->vgen) { vid_new = 1; break; }
         }
     }
+    // The tail below visits only the images it can act on: a plain image with no tracking, or a GPU-owned one, has nothing in it (its first checks skip it) and the rest is
+    // a dirty-page compare each. Built every submission -- a pass of flag loads, ~6000 of them -- instead of a generation counter, because the flags themselves move
+    // (track is set at a texture's first upload, is_video at the late video detection) and a stale list would skip a texture that just started changing
+    static vka_img **sw; static int swcap;
+    if (swcap < g_nlive) { swcap = g_nlive + 256; sw = realloc(sw, (size_t)swcap * sizeof *sw); if (!sw) { swcap = 0; } }
+    int nsw = 0;
+    for (int i = 0; i < g_nlive && sw; i++) { vka_img *im = g_live[i]; if (im && im->mem && (im->is_video || im->vbind || im->vtrack || im->track)) sw[nsw++] = im; }
     if (now != seen || vnow != vseen || vid_new) {
         seen = now; vseen = vnow;
-        for (int i = 0; i < g_nlive; i++) {
-            vka_img *im = g_live[i];
+        for (int i = 0; i < nsw; i++) {
+            vka_img *im = sw[i];
             if (img_pool_dead(im)) continue;
             if (!im->is_video && im->mem && im->vchk != pgen) {
                 uint32_t vs = 0;
@@ -2487,11 +2494,16 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             }
             if (!im->track || im->gpu_owned || !im->mem) continue;
             uint64_t size = im->L.size;
-            size_t lo, hi;
-            if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
+            if (!nvn_dirty_since_span(im->span, im->mem, size, im->stamp)) continue;   // one atomic compare: nothing in it written since its upload
             tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
-            int rows = VKA_ENV("DM_VK_ROWS", 1);
-            if (rows && upload_rows_tracked(im, &t, cb, lo, hi)) continue;
+            // The bounds -- a page-by-page scan of the image's whole range, 87,000 atomic loads for a 341 MB target written every frame -- are only read by the row-wise
+            // upload, which refuses everything but a linear 2D single-level texture; so they are found only when that could take it (DM_VK_ROWS, live, default 1)
+            size_t lo = 0, hi = size; int rows = VKA_ENV("DM_VK_ROWS", 1);
+            const vka_fmt *f_ = &im->f;
+            if (rows && (im->is_video || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) && im->levels <= 1 && im->layers <= 1 && im->depth <= 1 && f_->kind < 3) {
+                if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
+                if (upload_rows_tracked(im, &t, cb, lo, hi)) continue;
+            }
             upload_tracked(im, &t, cb);
             if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x flags %#x target %d: its storage changed, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format, im->d.flags, im->d.target);
         }
