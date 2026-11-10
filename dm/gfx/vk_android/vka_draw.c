@@ -1397,8 +1397,17 @@ typedef struct {
     uint64_t lay, texgen, memgen, fbgen, alpha, spush, pools, base, sk[VKA_NSTAGE], stemo[VKA_NSTAGE][2];
     int rast_discard;
 } sets_key;
-static struct { sets_key k; int ok, any, n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint64_t rv[VKA_NSTAGE][512]; vka_res r[VKA_NSTAGE][512]; } g_smemo;
-static void sets_memo_drop(void) { g_smemo.ok = 0; }
+// Four entries, not one: a scene reaches back over a few patterns (material A, B, A ...), which a one-entry
+// memo misses almost always (20 % of the draws that could keep their writes on the phone).
+typedef struct { sets_key k; int ok, any, n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint64_t rv[VKA_NSTAGE][512]; vka_res r[VKA_NSTAGE][512]; } sets_memo;
+enum { SNMEMO = 4 };
+static sets_memo g_sm[SNMEMO]; static unsigned g_smn;
+static int sets_memo_ways(void) {   // DM_VK_SETS_MEMO_WAYS: 1 is the earlier one-entry memo, for the A/B
+    static int v = -1;
+    if (v < 0) { v = VKA_ENV("DM_VK_SETS_MEMO_WAYS", SNMEMO); if (v < 1) v = 1; if (v > SNMEMO) v = SNMEMO; }
+    return v;
+}
+static void sets_memo_drop(void) { for (int i = 0; i < SNMEMO; i++) g_sm[i].ok = 0; }
 // The key of this draw's writes: the layout, the shaders, the generations the views and samplers resolve from, and the state the driver segments are filled from
 static void sets_key_of(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, sets_key *k) {
     memset(k, 0, sizeof *k);   // (memcmp'd: its padding too)
@@ -1435,38 +1444,38 @@ static inline int res_same(const vka_res *a, const vka_res *b) {
 }
 // 1 when the last kept draw's walk and view and sampler versions are this draw's
 static uint64_t g_sm_hit, g_sm_try;   // draws whose writes were kept, of the draws that could be (vka_draw_pace's line)
-static int sets_memo_same(const sets_key *k) {
-    if (memcmp(k, &g_smemo.k, sizeof *k)) return 0;
+static int sets_memo_same(const sets_key *k, const sets_memo *m) {
+    if (!m->ok || memcmp(k, &m->k, sizeof *k)) return 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
         int n = g_wk.n[st];
-        if (n != g_smemo.n[st] || g_wk.pool[st] != g_smemo.pool[st]) return 0;
+        if (n != m->n[st] || g_wk.pool[st] != m->pool[st]) return 0;
         if (n <= 0) continue;
-        for (int i = 0; i < n; i++) if (sets_rv(&g_wk.r[st][i]) != g_smemo.rv[st][i] || !res_same(&g_wk.r[st][i], &g_smemo.r[st][i])) return 0;
+        for (int i = 0; i < n; i++) if (sets_rv(&g_wk.r[st][i]) != m->rv[st][i] || !res_same(&g_wk.r[st][i], &m->r[st][i])) return 0;
     }
     return 1;
 }
-// The writes the build below makes, kept for the next draw (the key is the one the hit test read: what the build does must not change it)
+// The writes the build below makes, kept for the next draws (the key is the one the hit test read: what the build does must not change it)
 static void sets_memo_store(const sets_key *k, int any_pool) {
-    g_smemo.k = *k; g_smemo.any = any_pool;
+    sets_memo *m = &g_sm[g_smn++ % (unsigned)sets_memo_ways()];
+    m->k = *k; m->any = any_pool;
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        int n = g_smemo.n[st] = g_wk.n[st]; g_smemo.pool[st] = g_wk.pool[st];
-        for (int i = 0; i < n; i++) g_smemo.rv[st][i] = sets_rv(&g_wk.r[st][i]);
-        if (n > 0) memcpy(g_smemo.r[st], g_wk.r[st], (size_t)n * sizeof(vka_res));
+        int n = m->n[st] = g_wk.n[st]; m->pool[st] = g_wk.pool[st];
+        for (int i = 0; i < n; i++) m->rv[st][i] = sets_rv(&g_wk.r[st][i]);
+        if (n > 0) memcpy(m->r[st], g_wk.r[st], (size_t)n * sizeof(vka_res));
     }
-    g_smemo.ok = 1;
+    m->ok = 1;
 }
 static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, VkPipelineBindPoint bp, c0_at *c0) {
     int keep = VKA_ENV("DM_VK_SETS_MEMO", 1) && sets_keepable(sh, bp);
     sets_key k; if (keep) sets_key_of(d, sh, lay, &k);   // (before the build: what it resolves must not change it)
-    if (keep && g_smemo.ok) {
+    if (keep) {
         g_sm_try++;
-        if (sets_memo_same(&k)) {   // g_w as the last draw left it: the same writes
+        for (int i = 0, w = sets_memo_ways(); i < w; i++) if (sets_memo_same(&k, &g_sm[i])) {   // g_w as that draw left it: the same writes
             g_sm_hit++;
-            if (g_sets_dry) { g_dry_pool = g_smemo.any; return 1; }
-            return sets_push(lay, bp, g_smemo.any);
+            if (g_sets_dry) { g_dry_pool = g_sm[i].any; return 1; }
+            return sets_push(lay, bp, g_sm[i].any);
         }
     }
-    g_smemo.ok = 0;   // (anything below that fails leaves it dropped)
     g_w.n = 0;
     int any_pool = 0;
     uint64_t t1_ = g_prof ? cntvct() : 0;
