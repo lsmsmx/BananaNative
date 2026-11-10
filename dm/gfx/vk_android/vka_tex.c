@@ -931,9 +931,20 @@ static uint8_t *unmapped_content(const tex_t *t) {
 // one go. The threshold was 1 MiB, which skipped every texture a game streams in small pieces (the phone's freeze: draw-idx 302 us a draw against 13 us normally, with 1547
 // major faults in the frame -- the draws were resolving new textures whose storage had been evicted); 64 KiB is the smallest read-ahead worth a syscall
 int dm_guest_file_backed(void);
+// MADV_WILLNEED on the whole range first: the kernel starts the read-ahead and returns, so the caller's own copy faults pages that are already on their way. A second pass
+// with MADV_POPULATE_READ waits until every page is in memory -- synchronous, but it turns "40 faults at 4 KB, each a storage round trip" into one request the kernel can
+// merge, which is what a 341 MB target or a sequence of small textures being resolved in one draw needs. DM_GUEST_PREFAULT=0 keeps the asynchronous form only;
+// MADV_POPULATE_READ is Linux 5.14 (the phone is on 4.9, where madvise returns EINVAL and the call is simply not made again)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
 static void guest_prefetch(const void *p, uint64_t n) {
-    if (!p || n < (64u << 10) || !dm_guest_file_backed()) return;
-    madvise((void *)((uintptr_t)p & ~(uintptr_t)0xFFF), (size_t)n + 0x1000, MADV_WILLNEED);
+    if (!p || n < (16u << 10) || !dm_guest_file_backed()) return;
+    void *a = (void *)((uintptr_t)p & ~(uintptr_t)0xFFF); size_t len = (size_t)n + 0x1000;
+    madvise(a, len, MADV_WILLNEED);
+    static int pop = -1;
+    if (pop < 0) { const char *e = getenv("DM_GUEST_PREFAULT"); pop = !(e && *e == '0'); }
+    if (pop && madvise(a, len, MADV_POPULATE_READ) && pop) { pop = 0; VLOG("guest pre-fault: MADV_POPULATE_READ is not supported here (errno %d): the read-ahead only", errno); }
 }
 static uint64_t ft_hash(uintptr_t lo, uintptr_t hi) {
     const uint8_t *p = (const uint8_t *)lo; size_t n = hi - lo, i = 0; uint64_t h = 0x9e3779b97f4a7c15ull ^ n, w;
