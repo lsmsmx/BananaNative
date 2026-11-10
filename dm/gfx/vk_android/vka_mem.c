@@ -506,6 +506,14 @@ static void pend_done(uintptr_t lo, uintptr_t hi) {
     for (int i = 0; i < g_npend; i++) if (g_pend[i].lo == lo && g_pend[i].hi == hi) { g_pend[i] = g_pend[--g_npend]; break; }
     pthread_cond_broadcast(&g_pendcv); pthread_mutex_unlock(&g_pendmu);
 }
+// This thread waits until no give-back is pending over [lo, hi): the guest is about to take the range back,
+// and the pending give-back copies from and remaps it. Called without g_pl (a placement waiting in cover
+// holds it, and pend_wait drops it while waiting: neither must wait for the other).
+static void pend_wait_range(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_pendmu);
+    while (pend_overlaps(lo, hi)) pthread_cond_wait(&g_pendcv, &g_pendmu);
+    pthread_mutex_unlock(&g_pendmu);
+}
 static void detach(int i, segvec *v) {   // caller holds g_pl, and g_rw for writing
     pthread_mutex_lock(&g_pendmu);
     if (g_npend == g_pendcap) { g_pendcap = g_pendcap ? 2 * g_pendcap : 16; g_pend = realloc(g_pend, (size_t)g_pendcap * sizeof *g_pend); }
@@ -578,6 +586,49 @@ static void unplace(const seg_t *sp) {
 }
 static void unplace_all(segvec *v) { for (int i = 0; i < v->n; i++) { unplace(&v->s[i]); pend_done(v->s[i].lo, v->s[i].hi); } free(v->s); *v = (segvec){0}; }
 
+// Give-backs that wait for a submission the replay has not handed to the GPU yet. A pool finalized while
+// the replay is still recording the submission that named it waits for that fence, which the GPU cannot
+// reach before the recording ends: done on the guest's thread, that is the guest's stall (a level's end on
+// the phone: 1.48 s of give-back in a 1.44 s frame, GPU idle, 'vk-replay' recording). They run on a thread
+// of their own instead. The ranges stay in the pending table until unplace_all's pend_done: a placement
+// over one waits in cover (pend_wait), and vka_mem_release waits before the guest reuses the range.
+typedef struct give_job { segvec v; struct give_job *next; } give_job;
+static give_job *g_gq_h, *g_gq_t;
+static pthread_mutex_t g_gqmu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gqcv = PTHREAD_COND_INITIALIZER;
+static int g_give_up;   // the thread started (1), could not (-1), not asked yet (0)
+static void *give_main(void *a) {
+    (void)a;
+    for (;;) {
+        pthread_mutex_lock(&g_gqmu);
+        while (!g_gq_h) pthread_cond_wait(&g_gqcv, &g_gqmu);
+        give_job *j = g_gq_h; g_gq_h = j->next; if (!g_gq_h) g_gq_t = NULL;
+        pthread_mutex_unlock(&g_gqmu);
+        uint64_t t0 = mono_ns();
+        unplace_all(&j->v);
+        atomic_fetch_add(&g_give_ns, mono_ns() - t0);
+        free(j);
+    }
+    return NULL;
+}
+static void give_start_once(void) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, give_main, NULL)) { g_give_up = -1; VRED("give-back: the thread did not start: a give-back waits on the calling thread"); return; }
+    pthread_detach(th); g_give_up = 1;
+}
+static void give_defer(segvec v) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, give_start_once);
+    give_job *j = g_give_up > 0 ? malloc(sizeof *j) : NULL;
+    if (!j) { unplace_all(&v); return; }   // (the thread or memory: as before, on this thread)
+    j->v = v; j->next = NULL;
+    pthread_mutex_lock(&g_gqmu);
+    if (g_gq_t) g_gq_t->next = j; else g_gq_h = j;
+    g_gq_t = j;
+    pthread_cond_signal(&g_gqcv);
+    pthread_mutex_unlock(&g_gqmu);
+}
+
 // The segments one pool holds references on (by start)
 typedef struct { uintptr_t *lo; int n, cap; } seglist;
 static void sl_add(seglist *l, uintptr_t lo) { if (l->n == l->cap) { l->cap = l->cap ? l->cap * 2 : 2; l->lo = realloc(l->lo, (size_t)l->cap * sizeof *l->lo); } l->lo[l->n++] = lo; }
@@ -642,6 +693,7 @@ void *vka_mem_mapped(size_t n) {
 static void lazy_release_note(uintptr_t lo, uintptr_t hi);
 int vka_mem_release(uintptr_t lo, uintptr_t hi) {
     if (!vka_ok() || hi <= lo) return 0;
+    pend_wait_range(lo, hi);   // a give-back still pending over the range first: the guest is about to reuse it
     segvec v = {0};
     pthread_mutex_lock(&g_pl); pthread_rwlock_wrlock(&g_rw);
     int k = sg_find(lo); if (k < 0 || g_sg[k].hi <= lo) k++;
@@ -916,6 +968,17 @@ void mtl_pool_del(const void *mem) {
     if (!e.segs.n) { free(e.segs.lo); return; }
     segvec v = {0}; uint64_t t0 = mono_ns();
     pthread_mutex_lock(&g_pl); pthread_rwlock_wrlock(&g_rw); uncover(&e.segs, &v); pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
+    // The last fence reserved is one the replay may still be recording (its submission has been made by the
+    // game but not handed to the GPU): waiting for it here is waiting out the recording on the guest's
+    // thread. Give it back on the give-back thread instead; the range stays pending, so a placement over it
+    // waits (cover) and vka_mem_release waits before the guest takes the range back.
+    if (v.n && vka_worker_on() && vka_fence_last() > vka_fence_queued()) {
+        static _Atomic int nlog;
+        if (atomic_fetch_add(&nlog, 1) < 4) VLOG("give-back: %d segments deferred (fence %llu reserved, %llu queued)", v.n,
+                                                (unsigned long long)vka_fence_last(), (unsigned long long)vka_fence_queued());
+        give_defer(v);
+        return;
+    }
     unplace_all(&v);
     atomic_fetch_add(&g_give_ns, mono_ns() - t0);
 }
