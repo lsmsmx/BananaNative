@@ -38,5 +38,24 @@ class NoFolderRename(unittest.TestCase):
         self.assertNotIn('Files.move(', s)
 
 
+class OutputsThatWent(unittest.TestCase):
+    """BananaNative issue #3: job.json beside the dump outlives the app's pack folder (gone with an uninstall), so a step recorded done is checked against its
+    outputs before the pack step uses them, and runs again when they went (OutputsJvmTest checks Outputs.redo and the checks themselves)"""
+    def test_wired(self):
+        s = PACK_SERVICE.read_text(encoding='utf-8')
+        work = s[s.index('private void work()'):s.index('private void finished()')]
+        self.assertLess(work.index('dropMissing(j, "before it goes on")'), work.index('while ((i = j.next()) >= 0)'), 'checked before the steps run')
+        self.assertIn('j.codeModules(Outputs.codeModules(j.pack()))', work, 'the rewrite records the modules it wrote')
+        pack = s[s.index('case "pack": {'):s.index('default:\n                return "unknown step "')]
+        self.assertLess(pack.index('dropMissing(j, "before the pack step")'), pack.index('"--keep-code"'), 'the pack step goes back instead of stopping')
+        self.assertIn('return "interrupted"', pack)
+        job = (SRC.parent / 'Job.java').read_text(encoding='utf-8')
+        self.assertIn('USES = {null, {PACK}, null, {PACK}, null}', job)
+        self.assertIn('Outputs.codeComplete(pack(), codeModules())', job)
+        self.assertIn('Outputs.libraryComplete(shaderCache(), BuildConfig.NX_DMSH_VK_CHAIN)', job)
+        fake = (SRC.parent / 'FakeEngine.java').read_text(encoding='utf-8')
+        self.assertIn('".android.key"', fake, 'the simulated rewrite writes the key the check looks for')
+
+
 if __name__ == '__main__':
     unittest.main()

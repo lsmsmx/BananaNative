@@ -17,6 +17,7 @@ import java.util.List;
  * minutes &lt;n&gt;                                           → "minutes &lt;lo&gt; &lt;hi&gt; &lt;text&gt;"; job &lt;n&gt; → "job &lt;a whole Prepare's text&gt;"
  * restamp &lt;pack&gt; &lt;title ID&gt; &lt;current&gt; &lt;abi&gt; &lt;stamps&gt;  → "restamp &lt;the older version taken over&gt;" or "restamp none"
  * selection &lt;profile dir&gt;                               → "selection &lt;keys, comma-separated&gt;" or "selection none" (no shader_seen.tsv)
+ * absent &lt;profile dir&gt; &lt;split's shader_map.tsv&gt;         → "absent &lt;keys, comma-separated&gt;" or "absent none" (ShaderLibs.absentOptional)
  * </pre>
  */
 public final class ShaderLibsJvmTest {
@@ -70,6 +71,16 @@ public final class ShaderLibsJvmTest {
                     throw new RuntimeException(e);
                 }
                 System.out.println("selection " + (k == null ? "none" : String.join(",", k)));
+                break;
+            }
+            case "absent": {
+                List<String> k;
+                try {
+                    k = ShaderLibs.absentOptional(new File(a[1]), new File(a[2]));
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(e);
+                }
+                System.out.println("absent " + (k == null ? "none" : String.join(",", k)));
                 break;
             }
             default:

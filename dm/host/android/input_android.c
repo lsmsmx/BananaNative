@@ -103,6 +103,19 @@ void nxhost_input_device_removed(int device) {
     }
     pthread_mutex_unlock(&g_mu);
 }
+int nxhost_input_device_first(int device, const char *name) {
+    pthread_mutex_lock(&g_mu);
+    int p = take(device, name, 0), from = p, moved = -1;   // take: connected (labels as its added call gave them, or none)
+    if (p > 0) {
+        int lab = g_labelled[0]; g_labelled[0] = g_labelled[p]; g_labelled[p] = lab;
+        p = pad_slot_first(&g_slots, owner(device), name, &moved);
+        for (int q = 0; q < DM_PLAYERS; q++) if (q == 0 || q == from) { memset(&g_pad[q], 0, sizeof g_pad[q]); g_pad[q].map = pad_map(); publish_pad(q); }
+        dm_pad_players(pad_slot_mask(&g_slots));
+        if (moved > 0) LOG("input: device %d (%s) is player 1; player 1's device moves to player %d", device, name && *name ? name : "unnamed", moved + 1);
+        else LOG("input: device %d (%s) is player 1", device, name && *name ? name : "unnamed");
+    }
+    pthread_mutex_unlock(&g_mu); return p;
+}
 int nxhost_input_device_player(int device) { pthread_mutex_lock(&g_mu); int p = pad_slot_of(&g_slots, owner(device)); pthread_mutex_unlock(&g_mu); return p; }
 bool nxhost_input_key(int device, int keycode, bool down) {
     pthread_mutex_lock(&g_mu);

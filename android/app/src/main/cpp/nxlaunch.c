@@ -58,6 +58,7 @@ void nxhost_env_changed(void);
 #pragma weak nxhost_fps_cap_set
 #pragma weak nxhost_fps_cap_status
 #pragma weak nxhost_input_device_player
+#pragma weak nxhost_input_device_first
 #pragma weak nxhost_rumble_callback
 #pragma weak nxhost_rumble_route
 #pragma weak nxhost_fps_limit_set
@@ -409,6 +410,10 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_selftest(JNIEnv *env, jc
 
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_devicePlayer(JNIEnv *env, jclass cls, jint device) {
     (void)env; (void)cls; return nxhost_input_device_player ? nxhost_input_device_player(device) : -1;
+}
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_deviceFirst(JNIEnv *env, jclass cls, jint device, jstring name) {   // PadOrder: this device is player 1
+    (void)cls; if (!nxhost_input_device_first) return -1;
+    char *n = name ? jstr(env, name) : NULL; int p = nxhost_input_device_first(device, n); free(n); return p;
 }
 
 // ---- Rumble: the host calls rumble() on its rumble thread for each change of a player's vibration; it goes to listener.onRumble(player, intensity, sharpness) (Rumble.java),

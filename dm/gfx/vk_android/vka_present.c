@@ -801,6 +801,13 @@ static int present_one(const pq_item *it) {
     VkPresentTimeGOOGLE pt = {(uint32_t)it->ticket, want};
     VkPresentTimesInfoGOOGLE ptv = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1, .pTimes = &pt};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = V.display_timing ? &ptv : NULL, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_sdone[idx], .swapchainCount = 1, .pSwapchains = &g_swap, .pImageIndices = &idx};
+    // The frame done on the GPU before the queue lock is taken: a submission that waits for a timeline value still pending can block inside vkQueueSubmit until it is
+    // signalled (Turnip on KGSL emulates timeline semaphores: 25-35 ms a frame with the lock held, so every replay submission behind it waited; Ocarina of Time's note).
+    // The copy cannot start before the frame ends anyway; only a value already handed to the queue is waited for here (a later one is handled under the lock below)
+    // Test switch DM_VK_PRESENT_PREWAIT=0: no wait here (as before), for A/B runs
+    if (it->fence && !vka_hung() && VKA_ENV("DM_VK_PRESENT_PREWAIT", 1) && it->fence <= __atomic_load_n(&V.tl_queued, __ATOMIC_ACQUIRE)) {
+        VkResult vka_tl_wait(VkSemaphore s, uint64_t v, uint64_t timeout_ns); vka_tl_wait(V.tl, it->fence, vka_hang_ns());   // a timeout: the submission below waits as before, and the hang handling sees it
+    }
     pthread_mutex_lock(&V.qmu);
     // Never a wait for a value no earlier submission signals: the queue runs its batches in order, so the copy would wait for a submission queued behind it, and neither ever
     // runs (mtl_present takes vka_fence_queued for that; this holds it under the queue lock)
@@ -811,8 +818,11 @@ static int present_one(const pq_item *it) {
     { static int mode = -1, at; if (mode < 0) { const char *e = getenv("DM_VK_TEST_HANG"); mode = 0; if (e && sscanf(e, "%d,%d", &mode, &at) < 1) mode = 0; if (at <= 0) at = 600; }
       if (mode && it->ticket == (uint64_t)at && it->fence) { wv[1] = mode == 1 ? vka_fence_last() + 1 : V.tl_queued + 1000000000ull;
           VRED("DM_VK_TEST_HANG=%d: present ticket %llu waits for fence %llu (%llu handed to the queue)", mode, (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); } }
+    void vka_qhold_add(int k, uint64_t ns); uint64_t th0 = now_ns();
     r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, g_fr[k].fence);
+    uint64_t th1 = now_ns();
     VkResult pr = r ? r : vk.vkQueuePresentKHR(V.q, &pi);
+    vka_qhold_add(0, th1 - th0); vka_qhold_add(1, now_ns() - th1);
     pthread_mutex_unlock(&V.qmu);
     g_fr[k].held = im;
     if (!r) vka_ctl_shot_done(g_fr[k].fence);

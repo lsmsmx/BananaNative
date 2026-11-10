@@ -50,6 +50,25 @@ final class PrepareText {
         return new Failure(what + " Tap Retry. If it stops again, Details has the log.", detail, FIX_RETRY);
     }
 
+    /**
+     * A step's log read for the reason of a stop: the last [RED] line, or a Python traceback's last line ("KeyError: 'x'") when it comes later. The packer's runner
+     * (android/ondevice/dm_pack.c) writes an uncaught exception as a [RED] line of its own; the traceback is read too, so a tool run without it (or whose [RED] line
+     * could not be written) still gives its card a reason. Lines as PackService's Tail hands them over: trimmed, one at a time
+     */
+    static final class StopReason {
+        private static final Pattern EXCEPTION = Pattern.compile("^(?:[A-Za-z_][A-Za-z0-9_]*\\.)*[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception|Exit|Interrupt)(?::\\s.*)?$");
+        private boolean inTrace;
+        volatile String reason;   // read by the step once its Tail thread is done
+
+        /** line: one trimmed log line; true when it is a [RED] line */
+        boolean line(String line) {
+            if (line.startsWith("[RED] ")) { reason = line; inTrace = false; return true; }
+            if (line.startsWith("Traceback (most recent call last):")) inTrace = true;
+            else if (inTrace && EXCEPTION.matcher(line).matches()) { reason = line; inTrace = false; }   // frames and code lines before it never match: "File …", "raise …"
+            return false;
+        }
+    }
+
     /** The job itself failed (an exception in the service): plain words, the exception in Details */
     static Failure crashed(String step, String exception) {
         return new Failure(step + " stopped because of an error in the app. Tap Retry. If it stops again, Details has the error.", exception, FIX_RETRY);

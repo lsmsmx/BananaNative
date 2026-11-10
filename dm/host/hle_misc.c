@@ -10,9 +10,11 @@
 //   or <index>.img (a RomFS image) or <index>.nup (a .nup holding that add-on, or a link to one: hle_fs.c aoc_dir).
 //     Engage: F001 → 1 (E0), F002 → 2 (H0); the content itself is in the 2.0.0 update's RomFS and each DLC package holds one empty marker file; the game calls MountAddOnContent for each index ListAddOnContent returns (hle_fs.c).
 //   No DM_AOC_DIR: none (on a Switch 2 Mario 1.2.1 uses it to tell whether the upgrade pack is owned, and the user has no Mario add-on content files).
+//   Each must open (hle_fs.c dm_aoc_usable): one that cannot be read is left out with a [RED] line, and the game runs without it.
 //   DM_AOC_OWNED=0: always none (test switch, for runs without the DLC).
 // Room for every index the scan accepts (1..2000): Super Smash Bros. Ultimate has 99 DLC, and a cap below the folder count dropped whichever readdir returned last (fighters among them).
 static int g_aoc[2000], g_naoc = -1;
+int dm_aoc_usable(int index);   // hle_fs.c: the index's DM_AOC_DIR entry is there and opens (a [RED] line when it does not)
 static int aoc_int_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
 static void aoc_load(void) {
     if (g_naoc >= 0) return;
@@ -29,6 +31,10 @@ static void aoc_load(void) {
         qsort(g_aoc, g_naoc, sizeof *g_aoc, aoc_int_cmp);
         int unique = 0; for (int i = 0; i < g_naoc; i++) if (!i || g_aoc[i] != g_aoc[i - 1]) g_aoc[unique++] = g_aoc[i];
         g_naoc = unique;   // a legacy directory and its replacement image (or .nup link) report the same DLC once
+        // Only add-on content that can be read is owned: one that cannot (a .nup without that add-on, a cut-off image, a link to nothing) is a [RED] line from
+        // dm_aoc_usable and the game runs as without it, which on hardware it would; reported as owned, the game mounts it and the run stopped there (Forgejo #30)
+        int usable = 0; for (int i = 0; i < g_naoc; i++) if (dm_aoc_usable(g_aoc[i])) g_aoc[usable++] = g_aoc[i];
+        g_naoc = usable;
     }
     static char list[2000 * 5 + 1]; list[0] = 0; for (int i = 0; i < g_naoc; i++) snprintf(list + strlen(list), sizeof list - strlen(list), "%s%d", i ? "," : "", g_aoc[i]);
     LOG("aoc: reporting %d add-on contents {%s} (%s)", g_naoc, list, why);

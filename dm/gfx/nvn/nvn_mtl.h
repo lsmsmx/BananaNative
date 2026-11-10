@@ -18,6 +18,8 @@ void mtl_pool_del(const void *mem);
 // The GPU is given an address in [addr, addr+len) (a buffer, a pool's or a texture's address, a linear texture): the Vulkan replay places the pools there that it has not placed
 // yet, or the parts of a large pool that [addr, addr+len) touches (vka_mem.c; why names the ask in its log lines); Metal wraps every pool at mtl_pool_add, so this is a no-op there
 void mtl_pool_need(const void *addr, uint64_t len, const char *why);
+int nvn_shader_pools_deferred(void);                 // hle_nvn.c "Shader-code pools": 1 = SHADER_CODE pools are not placed for their address (DM_VK_PLACE_SHADER_POOLS=0)
+int nvn_shader_code_readable(uint64_t a, uint64_t n);   // hle_nvn.c: [a, a+n) lies in one live shader-code pool of its table (read on the CPU as guest memory)
 // memory pool Finalize: evict the textures built on this pool (pool object address) from the storage-sharing table
 void mtl_alias_drop_pool(const void *pool);
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 1 on success; buf is a (__bridge) id<MTLBuffer>
@@ -44,6 +46,8 @@ uint64_t mtl_sub_commit(void);
 
 uint64_t mtl_last_fence(void);                       // Fence value of the most recent submit (0 = never submitted)
 uint64_t mtl_acquire_fence(uint64_t presented);       // The fence a window acquire sync waits for (presented: the last fence reserved when that image was last presented); weak default in hle_nvn.c: mtl_last_fence()
+void mtl_queue_wait_fence(uint64_t serial, uint64_t fence);   // QueueWaitSync on a fenced sync: that queue's later work runs after the fence's submission (weak no-op in hle_nvn.c; vka_worker.c on Android)
+void mtl_event_cpu_signal(void);                     // EventSignal wrote an event word on the CPU: a queue waiting for it may go on (weak no-op in hle_nvn.c; vka_worker.c on Android)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU has completed up to fence, 0 on timeout
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns);   // the same for a sync WindowAcquireTexture handed out (its own line in the wait ledger, DM_NVN_WAITS)
 void mtl_finish(void);                               // Wait for all submitted commands to complete

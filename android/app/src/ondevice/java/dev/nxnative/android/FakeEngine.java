@@ -82,6 +82,7 @@ final class FakeEngine implements PackEngine {
             work(4000);
             if (fail) { log.println("[RED] simulated failure (NX_FAKE_FAIL)"); return 1; }
             write(new File(out, modules[i] + ".patched.bin"), "");
+            write(new File(out, modules[i] + ".android.key"), "simulated\n");   // last, as pack_android.py writes it (the pack step checks both: Outputs.codeComplete)
             log.println("rewrote " + modules[i] + " (simulated)");
         }
         log.println("progress " + modules.length + " " + modules.length + " rewrite");
@@ -171,6 +172,8 @@ final class FakeEngine implements PackEngine {
         for (String m : new String[] {"main", "sdk"}) {   // a shaders-only rebuild skipped the rewrite: placeholders, as the rewrite step writes
             File f = new File(out, m + ".patched.bin");
             if (!f.isFile()) write(f, "");
+            File k = new File(out, m + ".android.key");
+            if (!k.isFile()) write(k, "simulated\n");
         }
         write(new File(out, "pack.tsv"), "format\t1\ntarget\tandroid\ntitle_id\t" + game() + "\nname\t" + (Profile.of(game()) != null ? Profile.of(game()).name : game()) + " (simulated)\nversion\t"
                 + System.getenv("NX_PACK_VERSION") + "\nmodules\tmain sdk\nromfs\t" + ("0".equals(System.getenv("NX_PACK_VERSION")) ? "base" : "updates/" + System.getenv("NX_PACK_VERSION")) + "/romfs\nshaders\t" + rel + "\nsimulated\t1\n");

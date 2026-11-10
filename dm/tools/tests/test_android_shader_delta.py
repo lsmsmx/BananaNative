@@ -427,6 +427,25 @@ class Launcher(unittest.TestCase):
         (d / 'shader_seen.tsv').write_text('# a comment 00000000000000cc\nkey\tstage\n00000000000000bb\tvertex\n00000000000000aa\tpixel\n00000000000000dd\tpixel\n00000000000000bb\tvertex\n')
         self.assertEqual(self.java('selection', d), '00000000000000aa,00000000000000bb', 'only keys of the map, sorted, once')
 
+    def test_absent_optional(self):
+        """A split that lacks only keys of the profile's shader_optional.tsv is the profile's (PackService splitMatchesProfile), and the shaders step leaves those out;
+        a missing key that is not optional, a key the profile lacks, or no shader_optional.tsv is not"""
+        d = self.tmp / 'opt'; d.mkdir(exist_ok=True)
+        head = '# kind: evidence\npackage\tindex\tstage\tdm_ctl_sha16\tsource\n'
+        rows = lambda *ks: head + ''.join(f'cs_0.bin\t{i}\tcompute\t{k}\tsrc\n' for i, k in enumerate(ks))
+        (d / 'shader_map.tsv').write_text(rows('00000000000000aa', '00000000000000bb', '00000000000000cc'))
+        split = self.tmp / 'split_map.tsv'
+        split.write_text(rows('00000000000000aa', '00000000000000bb'))
+        self.assertEqual(self.java('absent', d, split), 'none', 'no shader_optional.tsv')
+        (d / 'shader_optional.tsv').write_text('# keys\n00000000000000cc\t1.8.0 as version 0 only\n')
+        self.assertEqual(self.java('absent', d, split), '00000000000000cc')
+        split.write_text(rows('00000000000000aa'))
+        self.assertEqual(self.java('absent', d, split), 'none', 'bb is not optional')
+        split.write_text(rows('00000000000000aa', '00000000000000bb', '00000000000000dd'))
+        self.assertEqual(self.java('absent', d, split), 'none', 'a key the profile does not have')
+        split.write_text(rows('00000000000000aa', '00000000000000bb', '00000000000000cc'))
+        self.assertEqual(self.java('absent', d, split), 'none', 'nothing lacking: the byte comparison decides')
+
     def test_selection_of_profiles(self):
         """Every profile with a selected set: the Java selection is what the Mac's selected build passes (shader_seen.tsv keys in shader_map.tsv)"""
         for seen in sorted((REPO / 'dm/games').glob('*/shader_seen.tsv')):

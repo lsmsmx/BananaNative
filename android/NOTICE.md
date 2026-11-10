@@ -19,6 +19,12 @@ games' own shaders translated, not part of this code. The other translator files
 therefore a GPL-3.0-or-later work whatever `nxLsfg` says, and the Mac and iPhone builds stay MIT only as apps: the committed translator `dm/gfx/tools/dmsh_xlate_bin` they run to
 build shader libraries is the same GPL combined work.
 
+File-backed memory pools (the launcher's per-game **RAM saver (uses storage)**, `DM_MEM_FILEBACK`) come from [Anka Native](https://github.com/EddizEge/AnkaNative)
+v0.2.2 by EddizEge (MIT, "Copyright (c) 2026 EddizEge" with the MIT permission notice in [LICENSE](../LICENSE)): `dm/gfx/vk_android/vka_fileback.h` and its test
+`dm/host/tests/t_android_fileback.c` as they were there, the "File-backed pools" part of `dm/gfx/vk_android/vka_mem.c` with its hook in `dm/gfx/nvn/hle_nvn.c`, and the
+"Shader-code pools" part of `dm/gfx/nvn/hle_nvn.c` (`DM_VK_PLACE_SHADER_POOLS`, `DM_VK_SHPOOL_LOG`, `nvn_shader_code_readable`) with its hooks in the same file, fitted to
+this host (here the default for every game on Android). Thanks to them.
+
 Some fixes follow other projects' findings without copying their code: [kartnative](https://github.com/pahorema/kartnative) by pahorema (MIT) for
 GPU-written sparse textures (`dm/gfx/vk_android/vka_tex.c`) and the per-primitive header of mesh programs (`dm/gfx/tools/shader_split.py`), and
 [switch2mac](https://github.com/azmasm/switch2mac) by azmasm (MIT outside `nx2_lower`) for the SPIR-V mesh entry points marked in the translator.. The translator's handling of
@@ -26,6 +32,10 @@ atomics in `AstOptimizer.cs`, of else-ifs for SPIR-V and of TMML's negative LOD,
 [nx2android](https://github.com/shirai91/nx2android) by Tung Pham (MIT, as nxnative: "Copyright (c) 2026 seedds" and the MIT permission notice in
 [LICENSE](../LICENSE)), with the TMML finding from yuzu #10234 (no yuzu code); the changes are listed in
 [dm/third_party/ryujinx/README.md](../dm/third_party/ryujinx/README.md). Thanks to them.
+
+The launcher's gate on adb control commands (`AdbControl.java`, Settings › ADB control in `MainActivity.java` and `Prefs.java`) is ported from
+[Anka Native](https://github.com/EddizEge/AnkaNative) 0.2.2 by EddizEge (MIT: "Copyright (c) 2026 seedds", "Copyright (c) 2026 EddizEge" and the MIT permission notice
+in [LICENSE](../LICENSE)). Thanks to them.
 
 The on-device packer's Python home (`assets/pack/python.zip`) carries, besides the [CPython](https://www.python.org/) Android build (PSF License),
 [Capstone](https://www.capstone-engine.org/) 5.0.7 (BSD-3-Clause) and [python-lz4](https://github.com/python-lz4/python-lz4) 4.4.5 (BSD-3-Clause, with LZ4's BSD-2-Clause

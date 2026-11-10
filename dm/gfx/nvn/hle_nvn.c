@@ -187,6 +187,8 @@ __attribute__((weak)) int dm_sdk_major(void) { return 0; }   // loader.c; graphi
 __attribute__((weak)) int dm_sdk_ounce(void) { return 0; }
 __attribute__((weak)) int dm_sdk_nvn2_item(unsigned item, int *out) { (void)item; (void)out; return 0; }
 __attribute__((weak)) int dm_glslc_gpu_code(int *major, int *minor) { *major = *minor = 0; return 0; }   // hle_glslc.c: the game's own GLSLC's GPU code version
+__attribute__((weak)) void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) { (void)mem; (void)size; (void)kind; }   // vka_mem.c (DM_MEM_FILEBACK); none on Metal
+__attribute__((weak)) int dm_gfx_fileback_line(char *b, size_t n) { (void)b; (void)n; return 0; }   // vka_mem.c: the file-backed pools' totals (0: none moved)
 static void nvn_api(int api[2]) {
 #ifdef DM_GAME_NVN_API_MAJOR
     api[0] = DM_GAME_NVN_API_MAJOR; api[1] = DM_GAME_NVN_API_MINOR; LOG("[nvn] device API %d.%d (game profile device_api)", api[0], api[1]);
@@ -385,20 +387,180 @@ uint64_t nvn_pool_live(const void *pool, unsigned *flags, int *sparse) {
     if (g) { const pool_t *o = (const pool_t *)pool; if (flags) *flags = (unsigned)o->flags; if (sparse) *sparse = o->vp != NULL; }
     pthread_mutex_unlock(&g_pl_mu); return g;
 }
+// ---------- Shader-code pools (DM_VK_PLACE_SHADER_POOLS, DM_VK_SHPOOL_LOG) ----------
+// From Anka Native (EddizEge's MIT fork, v0.2.2; android/NOTICE.md), with its default changed: off (0) on Android for every game, not a profile key.
+// A pool with NVN_MEMORY_POOL_FLAGS_SHADER_CODE holds the game's shader programs. On the Vulkan replay the GPU never reads them: nvnProgramSetShaders hands the host the
+// code's address, the host hashes the code on the CPU from guest memory (keys_hash) and draws with its own SPIR-V library. Yet such pools became placed Vulkan memory
+// (vka_mem.c mtl_pool_need) as soon as the game took their address (nvnMemoryPoolGetBufferAddress, to compute program addresses) or made a buffer object over them: Ocarina
+// of Time (Anka Native's fb8) holds 205 of them, 345 MiB, all placed, the largest 244 MiB, unswappable driver memory the GPU never reads; placed, they also undo the
+// file-backed pools' shader kind (vka_mem.c "File-backed pools": the placement punches the pool out of the file at once).
+// DM_VK_PLACE_SHADER_POOLS=0 (read once; the default on Android, every game; 1 = placed for their address as before, the default on the Metal host, whose mtl_pool_need
+// does nothing) places such a pool only for a use that hands the GPU data in it:
+//   - a command that gives the GPU an address inside it, recorded (shp_bind, at record time, on the game's thread, as every other placement): vertex, index, uniform,
+//     storage and transform-feedback buffers, indirect and multi-draw arguments and counts, buffer copies and clears (both ends), buffer <-> texture copies, uniform
+//     updates, counter reports, conditional render. That is every NVN command that carries an address (the list of NVNbufferAddress parameters in nvn.h); the replay
+//     resolves only addresses that came in commands (vka_addr), so a range no command named is never looked up. The part placed is the command's range (a pool placed by
+//     parts: its granules; a smaller pool: whole), the rest of the pool's end when the command's size is not known here (index buffers of indirect draws, copies to or
+//     from textures, transform-feedback state)
+//   - a texture over it (nvnTextureInitialize; the replay reads texture storage on the CPU, but a linear texture's write-back and a texture's address are GPU uses),
+//     and a mapping of it into a virtual pool: placed at once, as before, whatever their use
+//   - not: its address (GetBufferAddress) and buffer objects over it (BufferInitialize, GetAddress), the two ways a game names program addresses. A buffer object's data
+//     reaches the GPU only through a command naming its address, which places it then.
+// What is not covered: a shader that dereferences a raw pointer (raw global memory, vka_draw.c gmem_map) into a shader-code pool that no command named. Such a pointer
+// comes from the game's own data, not from NVN; the replay's pointer table holds placed memory only, so the load would read the sink (a wrong picture, no fault). Run with
+// DM_VK_SHPOOL_LOG=1 first: it lists every use of each shader-code pool (count and bytes by kind) with the pools placed as before, so a game that keeps data there shows
+// it with DM_VK_PLACE_SHADER_POOLS=1. A pointer of that kind into a pool no NVN call names was already the sink's for every other pool the replay places lazily
+// (DM_VK_PLACE_LAZY); a shader-code pool differs only in that its address taken no longer places it.
+// DM_VK_SHPOOL_LOG=1 (read once): one line per pool and kind of use, the first time (uncapped: each pool once per kind), and a summary at presents 60 and 300 and every
+// 1800 after. The table: of the live shader-code pools (at most SHP_MAX: past it a pool is placed as before and said once), read at record time without a
+// lock (a sequence count; writers are Initialize and Finalize). With DM_VK_PLACE_SHADER_POOLS=1 and no log: no table, one relaxed load per recorded draw or bind
+enum { SHP_MAX = 1024 };
+enum { SHK_ADDR, SHK_BUFOBJ, SHK_TEX, SHK_MAP, SHK_VBUF, SHK_IBUF, SHK_UBO, SHK_SSBO, SHK_IND, SHK_COPY, SHK_UPDATE, SHK_CLEAR, SHK_REPORT, SHK_XFB, SHK_COND, SHK_N };
+static const char *const g_shk_name[SHK_N] = {"the pool's address", "a buffer object", "a texture", "a virtual pool mapping", "a vertex buffer", "an index buffer", "a uniform buffer",
+                                              "a storage buffer", "indirect arguments", "a copy", "a uniform update", "a buffer clear", "a report", "transform feedback", "conditional render"};
+typedef struct { const pool_t *p; uint64_t gen, size, nuse, buse; uint32_t flags, kinds, data; } shp_info;   // kinds: the kinds of use seen (bits); data: a data use placed it (gate 0)
+static _Atomic uint64_t g_shp_lo[SHP_MAX], g_shp_hi[SHP_MAX];   // sorted by lo
+static shp_info g_shp[SHP_MAX];                                  // (under g_shp_mu)
+static _Atomic int g_shp_n; static _Atomic uint32_t g_shp_seq; static pthread_mutex_t g_shp_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_shk_n[SHK_N], g_shk_b[SHK_N]; static int g_shp_over;   // (under g_shp_mu)
+static int g_shp_place = -1, g_shp_log;   // DM_VK_PLACE_SHADER_POOLS, DM_VK_SHPOOL_LOG
+static int shp_on(void) {
+    if (g_shp_place < 0) {
+#ifdef __ANDROID__
+        enum { SHP_PLACE_DEFAULT = 0 };   // (the Vulkan replay: the GPU never reads shader code)
+#else
+        enum { SHP_PLACE_DEFAULT = 1 };   // (Metal: every pool is a buffer from mtl_pool_add on; nothing to save)
+#endif
+        const char *e = getenv("DM_VK_PLACE_SHADER_POOLS"); g_shp_place = e && *e ? atoi(e) != 0 : SHP_PLACE_DEFAULT;
+        e = getenv("DM_VK_SHPOOL_LOG"); g_shp_log = e && atoi(e) > 0;
+        if (!g_shp_place || g_shp_log)
+            LOG("[nvn] shader-code pools: %s%s", g_shp_place ? "placed as before (DM_VK_PLACE_SHADER_POOLS=1)" : "placed only for a command or texture that hands the GPU data in them, not for program addresses (DM_VK_PLACE_SHADER_POOLS=0)",
+                g_shp_log ? "; every use logged once per pool and kind (DM_VK_SHPOOL_LOG=1)" : "");
+    }
+    return !g_shp_place || g_shp_log;
+}
+static int shp_defer(void) { return shp_on() && !g_shp_place; }
+int nvn_shader_pools_deferred(void) { return shp_defer(); }   // vka_mem.c fb_kinds: shader-code pools stay unplaced for their address (the file-backed shader kind pays off)
+static int shp_lower(uint64_t a, int n) { int L = 0, H = n; while (L < H) { int m = (L + H) / 2; if (atomic_load_explicit(&g_shp_lo[m], memory_order_relaxed) < a) L = m + 1; else H = m; } return L; }   // first lo >= a
+static void shp_wbegin(void) { atomic_store_explicit(&g_shp_seq, atomic_load_explicit(&g_shp_seq, memory_order_relaxed) + 1, memory_order_relaxed); atomic_thread_fence(memory_order_release); }
+static void shp_wend(void) { atomic_store_explicit(&g_shp_seq, atomic_load_explicit(&g_shp_seq, memory_order_relaxed) + 1, memory_order_release); }
+static void shp_remove(int i) {   // caller holds g_shp_mu, inside shp_wbegin / shp_wend
+    int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed);
+    for (int k = i; k + 1 < n; k++) { atomic_store_explicit(&g_shp_lo[k], atomic_load_explicit(&g_shp_lo[k + 1], memory_order_relaxed), memory_order_relaxed);
+        atomic_store_explicit(&g_shp_hi[k], atomic_load_explicit(&g_shp_hi[k + 1], memory_order_relaxed), memory_order_relaxed); g_shp[k] = g_shp[k + 1]; }
+    atomic_store_explicit(&g_shp_n, n - 1, memory_order_relaxed);
+}
+static void shp_add(const pool_t *o, uint64_t gen) {   // nvnMemoryPoolInitialize: a pool with storage and SHADER_CODE
+    pthread_mutex_lock(&g_shp_mu); shp_wbegin();
+    int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed);
+    for (int i = 0; i < n; i++) if (g_shp[i].p == o) { shp_remove(i); n--; break; }   // initialized again without a Finalize
+    if (n == SHP_MAX) { shp_wend(); int first = !g_shp_over++; pthread_mutex_unlock(&g_shp_mu);
+        if (first) LOG("[RED] [nvn] shader-code pools: more than %d live: pool %p+%#llx and later ones are placed as before (not in the table)", SHP_MAX, (const void *)o->mem, (unsigned long long)o->size);
+        return; }
+    uint64_t lo = (uint64_t)(uintptr_t)o->mem; int i = shp_lower(lo, n);
+    // (shp_find needs pools that do not overlap: one over a pool in the table stays out of it and is placed as before)
+    if ((i > 0 && atomic_load_explicit(&g_shp_hi[i - 1], memory_order_relaxed) > lo) || (i < n && atomic_load_explicit(&g_shp_lo[i], memory_order_relaxed) < lo + o->size)) {
+        shp_wend(); static int told; int first = !told++; pthread_mutex_unlock(&g_shp_mu);
+        if (first) LOG("[nvn] shader-code pools: pool %p+%#llx overlaps one in the table: it and later such pools are placed as before (not in the table)", (const void *)o->mem, (unsigned long long)o->size);
+        return; }
+    for (int k = n; k > i; k--) { atomic_store_explicit(&g_shp_lo[k], atomic_load_explicit(&g_shp_lo[k - 1], memory_order_relaxed), memory_order_relaxed);
+        atomic_store_explicit(&g_shp_hi[k], atomic_load_explicit(&g_shp_hi[k - 1], memory_order_relaxed), memory_order_relaxed); g_shp[k] = g_shp[k - 1]; }
+    atomic_store_explicit(&g_shp_lo[i], lo, memory_order_relaxed); atomic_store_explicit(&g_shp_hi[i], lo + o->size, memory_order_relaxed);
+    g_shp[i] = (shp_info){o, gen, o->size, 0, 0, (uint32_t)o->flags, 0, 0};
+    atomic_store_explicit(&g_shp_n, n + 1, memory_order_relaxed);
+    shp_wend(); pthread_mutex_unlock(&g_shp_mu);
+}
+static void shp_del(const pool_t *o) {   // nvnMemoryPoolFinalize
+    if (!atomic_load_explicit(&g_shp_n, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_shp_mu);
+    int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed);
+    for (int i = 0; i < n; i++) if (g_shp[i].p == o) { shp_wbegin(); shp_remove(i); shp_wend(); break; }
+    pthread_mutex_unlock(&g_shp_mu);
+}
+// The shader-code pool over [a, a+n) (n 0: one byte), its range in *lo, *hi: 1 = one. Without a lock: the sequence count says whether a writer changed the table meanwhile
+static int shp_find(uint64_t a, uint64_t n, uint64_t *lo, uint64_t *hi) {
+    uint64_t e = a + (n ? n : 1); if (e < a) e = UINT64_MAX;
+    for (;;) {
+        uint32_t s = atomic_load_explicit(&g_shp_seq, memory_order_acquire);
+        if (s & 1) { sched_yield(); continue; }
+        int c = atomic_load_explicit(&g_shp_n, memory_order_relaxed), i = shp_lower(e, c) - 1, hit = 0; uint64_t l = 0, h = 0;   // the last pool starting before e (pools do not overlap)
+        if (i >= 0) { l = atomic_load_explicit(&g_shp_lo[i], memory_order_relaxed); h = atomic_load_explicit(&g_shp_hi[i], memory_order_relaxed); hit = h > a; }
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_shp_seq, memory_order_relaxed) == s) { if (hit) { *lo = l; *hi = h; } return hit; }
+    }
+}
+// Whether [a, a+n) lies in one live shader-code pool (the host reads program code there on the CPU: keys_hash, vka_shader.c shdump)
+int nvn_shader_code_readable(uint64_t a, uint64_t n) {
+    uint64_t lo, hi;
+    return n && atomic_load_explicit(&g_shp_n, memory_order_relaxed) && shp_find(a, n, &lo, &hi) && a >= lo && a + n <= hi && !dm_guest_unmapped((uintptr_t)a, n);
+}
+// A use of kind k at [a, a+n) (n 0: size not known here, to the pool's end): counted, logged the first time for its pool and kind. Returns 0: not in a shader-code pool of
+// the table (placed as before), 1: a program-address use (the pool's address, a buffer object: not placed for it under DM_VK_PLACE_SHADER_POOLS=0), 2: a data use (the
+// range from *plo, *pn bytes, placed for it under DM_VK_PLACE_SHADER_POOLS=0; as before under 1)
+static int shp_use(int k, uint64_t a, uint64_t n, uint64_t *plo, uint64_t *pn) {
+    if (!a || !atomic_load_explicit(&g_shp_n, memory_order_relaxed)) return 0;
+    uint64_t lo, hi; if (!shp_find(a, n, &lo, &hi)) return 0;
+    if (a < lo) { n = n ? n - (lo - a) : 0; a = lo; }   // (a range from before the pool: its part in the pool)
+    uint64_t len = n && a + n <= hi ? n : hi - a;
+    int data = k != SHK_ADDR && k != SHK_BUFOBJ, first = 0; shp_info inf = {0};
+    pthread_mutex_lock(&g_shp_mu);
+    int c = atomic_load_explicit(&g_shp_n, memory_order_relaxed), i = shp_lower(lo, c);
+    if (i < c && atomic_load_explicit(&g_shp_lo[i], memory_order_relaxed) == lo) {
+        shp_info *s = &g_shp[i]; s->nuse++; s->buse += len; first = !(s->kinds >> k & 1); s->kinds |= 1u << k; if (data && !g_shp_place) s->data = 1; inf = *s; }
+    g_shk_n[k]++; g_shk_b[k] += len;
+    pthread_mutex_unlock(&g_shp_mu);
+    if (first && g_shp_log) LOG("[nvn] shader-code pool %#llx+%.1f MiB (flags %#x, Initialize %llu): first %s at %#llx+%#llx: %s", (unsigned long long)lo, inf.size / 1048576.0, inf.flags,
+                                (unsigned long long)inf.gen, g_shk_name[k], (unsigned long long)a, (unsigned long long)len,
+                                g_shp_place ? (k == SHK_ADDR || k == SHK_BUFOBJ ? "placed (as before: the GPU is given the range)" : "a data use (placed as before)")
+                                            : data ? "a data use: that range placed (DM_VK_PLACE_SHADER_POOLS=0)" : "not placed for it (program addresses; DM_VK_PLACE_SHADER_POOLS=0)");
+    if (plo) { *plo = a; *pn = len; }
+    return data ? 2 : 1;
+}
+static int shp_skip(int k, uint64_t a, uint64_t n) { return shp_use(k, a, n, NULL, NULL) == 1 && !g_shp_place; }   // a program-address use not placed for (gate 0)
+// A command recorded with an address (the record functions below): with the table on, a data use in a shader-code pool; placed there under DM_VK_PLACE_SHADER_POOLS=0
+static void shp_bind_slow(int k, uint64_t a, uint64_t n) {
+    uint64_t pa, pn;
+    if (shp_use(k, a, n, &pa, &pn) == 2 && !g_shp_place) mtl_pool_need((const void *)(uintptr_t)pa, pn, "a command naming an address in a shader-code pool");
+}
+static inline void shp_bind(int k, uint64_t a, uint64_t n) { if (a && __builtin_expect(atomic_load_explicit(&g_shp_n, memory_order_relaxed) != 0, 0)) shp_bind_slow(k, a, n); }
+static void shp_report(uint64_t presents) {
+    if (!(presents == 60 || presents == 300 || (presents && presents % 1800 == 0))) return;
+    { char fb[420]; if (dm_gfx_fileback_line(fb, sizeof fb)) LOG("[nvn] file-backed pools at present %llu: %s", (unsigned long long)presents, fb); }   // (DM_MEM_FILEBACK; the per-pool lines stop at 8, then every 64th)
+    if (!g_shp_log) return;
+    char b[1400]; size_t o = 0; double M = 1048576.0;
+    pthread_mutex_lock(&g_shp_mu);
+    int n = atomic_load_explicit(&g_shp_n, memory_order_relaxed), naddr = 0, nobj = 0, ngpu = 0; uint64_t all = 0, gpu = 0;
+    for (int i = 0; i < n; i++) { const shp_info *s = &g_shp[i]; uint32_t dk = s->kinds & ~(1u << SHK_ADDR | 1u << SHK_BUFOBJ);
+        all += s->size; naddr += !!(s->kinds >> SHK_ADDR & 1); nobj += !!(s->kinds >> SHK_BUFOBJ & 1);
+        if (dk) { ngpu++; gpu += s->size; } }
+    for (int k = 0; k < SHK_N && o < sizeof b; k++) if (g_shk_n[k]) o += (size_t)snprintf(b + o, sizeof b - o, "%s%s %llu (%.1f MiB)", o ? ", " : "", g_shk_name[k], (unsigned long long)g_shk_n[k], g_shk_b[k] / M);
+    int over = g_shp_over;
+    pthread_mutex_unlock(&g_shp_mu);
+    LOG("[nvn] shader-code pools at present %llu: %d live, %.0f MiB%s; address taken in %d, buffer objects in %d; pools with a GPU data use: %d (%.0f MiB)%s; uses (all pools, since the start): %s",
+        (unsigned long long)presents, n, all / M, over ? " (more not in the table: placed as before)" : "", naddr, nobj, ngpu, gpu / M,
+        g_shp_place ? "" : ": their ranges placed (DM_VK_PLACE_SHADER_POOLS=0; the rest stays guest memory)", o ? b : "none");
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     pthread_mutex_lock(&g_pl_mu);   // (a pool initialized again without a Finalize: readers see its new fields only with its new serial)
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
-    pl_put(o, ++g_plgen); pthread_mutex_unlock(&g_pl_mu);
+    pl_put(o, ++g_plgen); uint64_t gen = g_plgen; pthread_mutex_unlock(&g_pl_mu);
+    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && (o->flags & NVN_MEMORY_POOL_FLAGS_SHADER_CODE) && shp_on()) shp_add(o, gen);   // (Shader-code pools)
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range until its first mapping decides (see MapVirtual)
-    else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pc_add(o); }
+    else if (o->mem) {
+        mtl_pool_add(o->mem, o->size);
+        // File-backed pools (vka_mem.c, DM_MEM_FILEBACK; shader code by default on Android): kind 1 shader code, 2 a pool that may hold texture storage (not physical, virtual or compressible)
+        int fbk = (o->flags & NVN_MEMORY_POOL_FLAGS_SHADER_CODE) ? 1 : !(o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE)) ? 2 : 0;
+        if (fbk) dm_gfx_pool_fileback(o->mem, o->size, fbk);
+        nvn_dirty_add_range(o->mem, o->size); pc_add(o);
+    }
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     if (getenv("DM_NVN_VLOG")) { LOG("[nvn] MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags); void dm_backtrace(uint64_t fp); dm_backtrace((uint64_t)__builtin_frame_address(0)); }
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
 static void fl_add(const uint8_t *a, uint64_t n); static void fl_drop(const uint8_t *a, uint64_t n);   // flushed ranges, see nvn_flushed
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pthread_rwlock_wrlock(&g_pl_use); pl_del((const pool_t *)p); pthread_rwlock_unlock(&g_pl_use); pc_del((const pool_t *)p); if (((pool_t *)p)->flags & 0x200 && ((pool_t *)p)->vp) vpool_release((pool_t *)p);
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pthread_rwlock_wrlock(&g_pl_use); pl_del((const pool_t *)p); pthread_rwlock_unlock(&g_pl_use); pc_del((const pool_t *)p); shp_del((const pool_t *)p); if (((pool_t *)p)->flags & 0x200 && ((pool_t *)p)->vp) vpool_release((pool_t *)p);
     if (((pool_t *)p)->mem && !(((pool_t *)p)->flags & 0x200)) {   // A virtual pool's storage is borrowed from a physical pool; do not unregister it
  nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); fl_drop(((pool_t *)p)->mem, ((pool_t *)p)->size); } mtl_alias_drop_pool(p); ((pool_t *)p)->magic = 0; }
 static void ft_flush(const uint8_t *a, uint64_t n);
@@ -408,7 +570,11 @@ NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, 
     if (!(o->flags & 0x200)) fl_add(o->mem + off, n);
     ft_flush(o->mem + off, n);
 }
-NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { pc_use((const pool_t *)p, 'a', 0, 0); if (((const pool_t *)p)->mem) mtl_pool_need(((const pool_t *)p)->mem, ((const pool_t *)p)->size, "the pool's address"); return (NVNbufferAddress)((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) {
+    const pool_t *o = (const pool_t *)p; pc_use(o, 'a', 0, 0);
+    if (o->mem && !shp_skip(SHK_ADDR, (uint64_t)(uintptr_t)o->mem, o->size)) mtl_pool_need(o->mem, o->size, "the pool's address");   // (a shader-code pool under DM_VK_PLACE_SHADER_POOLS=0: not)
+    return (NVNbufferAddress)o->mem;
+}
 
 // ---------- Descriptor pools ----------
 // One ID space per pool. In NVN a texture or sampler ID indexes the pool the command buffer has bound (SetTexturePool / SetSamplerPool), and two pools may use the same IDs. The replay keeps
@@ -666,6 +832,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     }
     o->serial = nvn_new_serial(); mtl_tex_init(o);
     if (o->mem) pc_use(o->pool, 't', o->off, o->L.size);
+    if (o->mem && shp_use(SHK_TEX, (uint64_t)(uintptr_t)o->mem, o->L.size, NULL, NULL) == 2 && !g_shp_place) mtl_pool_need(o->mem, o->L.size, "a texture in a shader-code pool");   // (Shader-code pools: a texture is a data use)
     if (o->mem && o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) mtl_pool_need(o->mem, o->L.size, "a linear texture");   // its GPU content is copied back into the storage (vka_tex_writeback)
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
         static int ti = -1; static uint32_t tw, th;
@@ -831,7 +998,7 @@ static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     if (!sd->control) return 0;
     nvn_ctl_lens(sd->control, &nctl, &ncode);
     int code = sd->data && ncode && ncode < (1u << 24);
-    if (mapped && !(code && mtl_addr(sd->data, ncode, &mb, &mo))) return 0;
+    if (mapped && !(code && (mtl_addr(sd->data, ncode, &mb, &mo) || nvn_shader_code_readable(sd->data, ncode)))) return 0;   // (a shader-code pool not placed: guest memory, read here as placed memory is)
     uint8_t md[32]; plat_sha256_t hc; plat_sha256_init(&hc);
     // Profile key shader_key_skip: bytes of the control section hashed as zeros (shader_split.py key_ctl). Batman: Arkham Knight's engine shares one control section among shaders whose
     // sections differ only in GLSLC's compile information (+0x778..+0x791, +0x7d0..+0x7e7): it hands a program the section of an earlier shader with the same rest, so the bytes there name another shader
@@ -892,7 +1059,16 @@ NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
 // A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
+// The Android replay (vka_worker.c) orders the queue's later work after the fence's submission; a sync not fenced yet passes at once, as a snapshot of nothing to wait for (the
+// SDK's semantics: DRAGON BALL Sparking! ZERO waits on its own queue before that queue's first fence of the sync, upstream 9b69d27d)
+__attribute__((weak)) void mtl_queue_wait_fence(uint64_t serial, uint64_t fence) { (void)serial; (void)fence; }
+__attribute__((weak)) void mtl_event_cpu_signal(void) {}
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
+    const sync_t *o = (const sync_t *)s; static int once;
+    if (!o->fenced) { if (!once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet: the wait passes"); return 1; }
+    pthread_mutex_lock(&g_sub_mu); mtl_queue_wait_fence(((const queue_t *)q)->serial, o->fence); pthread_mutex_unlock(&g_sub_mu);
+    return 1;
+}
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
@@ -918,7 +1094,7 @@ NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
 NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
 static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
-NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
+NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); mtl_event_cpu_signal(); }
 
 // ---------- Queue ----------
 #define QB(b) ((queue_builder_t *)(b))
@@ -1119,16 +1295,17 @@ NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
 }
 NVN(nvnCommandBufferReportCounter, void, NVNcommandBuffer *c, NVNcounterType t, NVNbufferAddress a) {
+    shp_bind(SHK_REPORT, a, 16);
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
 }
 NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddress src, NVNbufferAddress dst, size_t n, int flags) {
-    (void)flags;
+    (void)flags; shp_bind(SHK_COPY, src, n); shp_bind(SHK_COPY, dst, n);
     uint8_t *p = cmd_alloc(CB(c), 32); put_hdr(p, OP_COPY_B2B, 32); uint64_t nn = n;
     memcpy(p + 8, &src, 8); memcpy(p + 16, &dst, 8); memcpy(p + 24, &nn, 8);
 }
 // uniform update: the data is copied into command memory at record time (NVN semantics: the caller may modify the original data after recording) and written into the buffer at submit
 NVN(nvnCommandBufferUpdateUniformBuffer, void, NVNcommandBuffer *c, NVNbufferAddress buf, size_t bufsz, ptrdiff_t off, size_t n, const void *data) {
-    (void)bufsz;
+    (void)bufsz; shp_bind(SHK_UPDATE, buf + off, n);
     uint32_t sz = (uint32_t)(24 + n);
     uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, OP_UPDATE_UB, (sz + 7) & ~7u);
     uint64_t dst = buf + off, nn = n; memcpy(p + 8, &dst, 8); memcpy(p + 16, &nn, 8); memcpy(p + 24, data, n);
@@ -1146,8 +1323,10 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
 // while there are usually only 1–2 in practice), and the empty tail took 40–50% of the command bytes per frame; the advanced stats page of the level 88 sorceress recorded 12.5 MB per frame, using up the game's own command memory pool (about 105 segments x 128 KB per frame)
 #define RECN(c, OP, T, ARR, N) ((T *)rec((c), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
 // Draws carry the indirect / multi-draw fields (ind onwards) only when they use them: a plain indexed draw record is 0x28 bytes instead of 0x40 (nvn_obj.h draw_rec)
-static void rec_draw(NVNcommandBuffer *c, p_draw d) { size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
-static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) { size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n); }
+static void rec_draw(NVNcommandBuffer *c, p_draw d) { shp_bind(SHK_IND, d.ind, 16); shp_bind(SHK_IND, d.mdi_cnt, 4); size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw, ind); memcpy(rec(c, OP_DRAW, n), &d, n); }
+static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) {
+    shp_bind(SHK_IBUF, d.ibuf, d.ind || d.count <= 0 ? 0 : (uint64_t)d.count << (d.itype == 0 ? 0 : d.itype == 1 ? 1 : 2)); shp_bind(SHK_IND, d.ind, 20); shp_bind(SHK_IND, d.mdi_cnt, 4);
+    size_t n = d.ind || d.mdi_cnt ? sizeof d : offsetof(p_draw_idx, ind); memcpy(rec(c, OP_DRAW_IDX, n), &d, n); }
 #if defined(__ANDROID__)
 // NVN2 mesh draw: count task workgroups (or mesh workgroups when the program has no task shader) from first, with the bound program's task and mesh shaders. A draw like the
 // others (it opens and joins render passes the same way); the Vulkan replay draws it with vkCmdDrawMeshTasksEXT (vka_draw.c). The signature is the game's calls' (switch2mac
@@ -1225,12 +1404,14 @@ NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, con
 }
 NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *rg) {
     if (n < 0 || first + n > 16) { LOG("[RED] BindVertexBuffers first=%d n=%d", first, n); return; }
+    for (int i = 0; i < n; i++) shp_bind(SHK_VBUF, rg[i].address, rg[i].size);
     if (n == 1 && (unsigned)first < 16 && rg[0].size <= UINT32_MAX) {
         *REC(c, OP_BIND_VBUF1, p_bind_vbuf1) = (p_bind_vbuf1){(uint32_t)first, (uint32_t)rg[0].size, rg[0].address}; return;
     }
     p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+    shp_bind(SHK_UBO, a, n);
     if ((unsigned)st < 6 && (unsigned)i < 16 && n <= UINT32_MAX) {
         *REC(c, OP_BIND_UBO_SMALL, p_bind_ubo_small) = (p_bind_ubo_small){(uint16_t)st, (uint16_t)i, (uint32_t)n, a}; return;
     }
@@ -1243,11 +1424,11 @@ static void ssbo_slot_check(int st, int i) {   // the replay keeps 16 storage bu
     if (i >= 16) { static int n; if (n++ < 8) LOG("[RED] storage buffer bound at slot %d of stage %d: the host keeps 16 a stage, the bind is dropped", i, st); }
 }
 NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
-    ssbo_slot_check(st, i);
+    ssbo_slot_check(st, i); shp_bind(SHK_SSBO, a, n);
     *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
-    for (int i = 0; i < n; i++) { ssbo_slot_check(st, first + i); *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size}; }
+    for (int i = 0; i < n; i++) { ssbo_slot_check(st, first + i); shp_bind(SHK_SSBO, rg[i].address, rg[i].size); *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size}; }
 }
 static p_bind_handles *bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) {
     if (n < 0 || n > 32) { LOG("[RED] bind handle count %d", n); return NULL; }
@@ -1300,6 +1481,7 @@ NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, in
 }
 // Indirect: the three group counts at ind are read by the GPU when the dispatch runs (nvn_mtl.m dispatch)
 NVN(nvnCommandBufferDispatchComputeIndirect, void, NVNcommandBuffer *c, NVNbufferAddress ind) {
+    shp_bind(SHK_IND, ind, 12);
     *REC(c, OP_DISPATCH, p_dispatch) = (p_dispatch){0, 0, 0, (uint64_t)__builtin_return_address(0), ind};
 }
 NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
@@ -1308,10 +1490,12 @@ NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerP
 
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
+    shp_bind(SHK_COPY, src, 0);
     p_copy_b2t *o = REC_SNAP(c, OP_COPY_B2T, p_copy_b2t, 1); o->src = src; o->tex = tex_snap(o, SNAP_OFF(p_copy_b2t), 0, t, (uint64_t)__builtin_return_address(0)); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
 }
 NVN(nvnCommandBufferCopyTextureToBuffer, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r,
     NVNbufferAddress dst, int flags) {
+    shp_bind(SHK_COPY, dst, 0);
     p_copy_b2t *o = REC_SNAP(c, OP_COPY_T2B, p_copy_b2t, 1); o->src = dst; o->tex = tex_snap(o, SNAP_OFF(p_copy_b2t), 0, t, (uint64_t)__builtin_return_address(0)); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
 }
 // Clear a texture region with the given value (float / unsigned integer versions; mask = channel write mask)
@@ -1480,7 +1664,6 @@ static void nvn_nop(void) {}
 static const char *const g_nops[] = {
     "nvnCommandBufferSetPatchSize",
     "nvnCommandBufferSetDepthBounds",
-    "nvnCommandBufferWaitSync",
     "nvnCommandBufferSetShaderScratchMemory",
     "nvnCommandBufferPushDebugGroupDynamic",
     "nvnCommandBufferPopDebugGroup",
@@ -1490,7 +1673,6 @@ static const char *const g_nops[] = {
     "nvnCommandBufferPushDebugGroupStatic",
     "nvnCommandBufferPopDebugGroupId",
     "nvnCommandBufferInsertDebugMarkerStatic",
-    "nvnCommandBufferWaitEvent",
     "nvnCommandBufferSetComputeWorkloadPriority",
     "nvnCommandBufferSetGraphicsWorkloadPriority",
     "nvnCommandBufferBindShadingRateImage",
@@ -2122,6 +2304,7 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     if (o->presents == 1 || o->presents == 60 || o->presents == 300) pc_log(o->presents);
+    shp_report(o->presents);   // (DM_MEM_FILEBACK; the per-pool lines stop at 8, then every 64th)
     dm_fps_lock_tick(); dm_ue_cvar_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
     int c = fps_step_cap();
@@ -2320,13 +2503,13 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
     // compressing encoder (when the pause menu opens, and near a save commit): the buffer's one use is a texture-to-buffer copy of the picture's own extent, which lies inside the pool. Not an error by itself: one line.
     if ((uint64_t)bb->off + bb->size > bb->pool->size) ONCE_LOG("BufferInitialize: a buffer reaches past the end of its pool (offset %#llx size %#llx pool %#llx); only an access that leaves the pool is an error, and it is reported where it happens", (unsigned long long)bb->off, (unsigned long long)bb->size, (unsigned long long)bb->pool->size);
     *(buf_t *)buf = (buf_t){.magic = MAGIC('B', 'U', 'F', 0), .pool = bb->pool, .off = bb->off, .size = bb->size};
-    pc_use(bb->pool, 'b', bb->off, bb->size); mtl_pool_need(bb->pool->mem + bb->off, bb->size, "a buffer");   // the GPU reaches a buffer by its address
+    pc_use(bb->pool, 'b', bb->off, bb->size); if (!shp_skip(SHK_BUFOBJ, (uint64_t)(uintptr_t)(bb->pool->mem + bb->off), bb->size)) mtl_pool_need(bb->pool->mem + bb->off, bb->size, "a buffer");   // the GPU reaches a buffer by its address (Shader-code pools: by a command naming it)
     OLOG("BufferInitialize %p pool=%p off=%#llx size=%#llx", (void *)buf, (const void *)bb->pool, (unsigned long long)bb->off, (unsigned long long)bb->size);
     return 1;
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { mtl_pool_need(BF(buf)->pool->mem + BF(buf)->off, BF(buf)->size, "a buffer's address"); return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }   // (again here: a virtual pool's storage may have moved since the buffer was made)
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { if (!shp_skip(SHK_BUFOBJ, (uint64_t)(uintptr_t)(BF(buf)->pool->mem + BF(buf)->off), BF(buf)->size)) mtl_pool_need(BF(buf)->pool->mem + BF(buf)->off, BF(buf)->size, "a buffer's address"); return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }   // (again here: a virtual pool's storage may have moved since the buffer was made)
 // A buffer or pool the CPU has no access to (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) maps to NULL, as in NVN, though the host's storage is CPU memory: EA SPORTS FC 27's Frostbite
 // renderer takes a buffer's GPU address as GetAddress + (its data pointer − Map), with a null data pointer for such a buffer (OpcodeCopySubresource), so a real pointer made the
 // copy's destination address 0 (FATAL buffer copy address is in no memory pool)
@@ -2481,6 +2664,7 @@ NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappi
     for (int i = 0; v && i < n && ok; i++) ok = vpool_map(v, &r[i]);
     pthread_mutex_unlock(&g_vp_mu);
     for (int i = 0; i < n; i++) if (r[i].phys) pc_use((const pool_t *)r[i].phys, 'm', r[i].poff, r[i].size);   // (requested: counted whether or not they succeed)
+    for (int i = 0; i < n; i++) if (r[i].phys && ((const pool_t *)r[i].phys)->mem) shp_bind(SHK_MAP, (uint64_t)(uintptr_t)((const pool_t *)r[i].phys)->mem + r[i].poff, r[i].size);   // (Shader-code pools: a data use)
     if (v) return (NVNboolean)ok;
     for (int i = 0; i < n; i++) {
         const pool_t *ph = (const pool_t *)r[i].phys;
@@ -2631,15 +2815,16 @@ NVN_NOPROTO(nvnSetExternalDebuggerEnabledNVX, void, NVNboolean enable) { (void)e
 // Transform feedback (vertex outputs captured into buffers): Pokémon Legends: Z-A skins its characters this way. A vertex-only program writes skinned positions and packed normals / tangents
 // under rasterizer discard, and the character draws read those buffers as vertex streams. Recorded here and run at replay by the shader's main0_tf entry point, a vertex function that stores the
 // captured outputs into the bound buffers (dmsh_build.py vs_tf, the layout from the program's control section; nvn_mtl.m tf_* for the replay)
-NVN(nvnCommandBufferBindTransformFeedbackBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) { *REC(c, OP_TF_BIND, p_tf_bind) = (p_tf_bind){i, 0, a, n}; }
+NVN(nvnCommandBufferBindTransformFeedbackBuffer, void, NVNcommandBuffer *c, int i, NVNbufferAddress a, size_t n) { shp_bind(SHK_XFB, a, n); *REC(c, OP_TF_BIND, p_tf_bind) = (p_tf_bind){i, 0, a, n}; }
 NVN(nvnCommandBufferBindTransformFeedbackBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *r) {
-    for (int i = 0; i < n; i++) *REC(c, OP_TF_BIND, p_tf_bind) = (p_tf_bind){first + i, 0, r[i].address, r[i].size};
+    for (int i = 0; i < n; i++) { shp_bind(SHK_XFB, r[i].address, r[i].size); *REC(c, OP_TF_BIND, p_tf_bind) = (p_tf_bind){first + i, 0, r[i].address, r[i].size}; }
 }
-NVN(nvnCommandBufferBeginTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){0, 0, a}; }
-NVN(nvnCommandBufferEndTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){1, 0, a}; }
-NVN(nvnCommandBufferPauseTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){2, 0, a}; }
-NVN(nvnCommandBufferResumeTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){3, 0, a}; }
+NVN(nvnCommandBufferBeginTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { shp_bind(SHK_XFB, a, 0); *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){0, 0, a}; }
+NVN(nvnCommandBufferEndTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { shp_bind(SHK_XFB, a, 0); *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){1, 0, a}; }
+NVN(nvnCommandBufferPauseTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { shp_bind(SHK_XFB, a, 0); *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){2, 0, a}; }
+NVN(nvnCommandBufferResumeTransformFeedback, void, NVNcommandBuffer *c, NVNbufferAddress a) { shp_bind(SHK_XFB, a, 0); *REC(c, OP_TF_STATE, p_tf_state) = (p_tf_state){3, 0, a}; }
 NVN(nvnCommandBufferDrawTransformFeedback, void, NVNcommandBuffer *c, NVNdrawPrimitive m, NVNbufferAddress a) {
+    shp_bind(SHK_XFB, a, 0);
     *REC(c, OP_DRAW, p_draw) = (p_draw){.prim=m,.instances=1,.ind=a+16};
 }
 
@@ -2902,14 +3087,22 @@ NVN(nvnCommandBufferSetDepthRanges, void, NVNcommandBuffer *c, int first, int n,
     if (first + n > 1) ONCE_LOG("SetDepthRanges first=%d n=%d: the host uses only index 0", first, n);
 }
 
+// GPU waits: the commands after one run once the event holds the value (EQUAL, or GEQUAL_WRAP: (uint32_t)(event - value) < 0x80000000) or the sync is reached. Recorded; the
+// Android replay parks the waiting queue's work until the producer on another queue has been replayed (vk_android/vka_qsched.h); the Metal replay passes them at once.
+// Before 2026-11-09 both were empty implementations: Ocarina of Time's ambient-cache pass (queue 5) waits for its SH lighting producer (queue 1), which it submits later
+NVN(nvnCommandBufferWaitEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventWaitMode m, uint32_t v) {
+    *REC(c, OP_WAIT_EVENT, p_wait_event) = (p_wait_event){((const ev_t *)e)->val, (uint32_t)m, v};
+}
+NVN(nvnCommandBufferWaitSync, void, NVNcommandBuffer *c, const NVNsync *s) { *REC(c, OP_WAIT_SYNC, p_wait_sync) = (p_wait_sync){(const sync_t *)s}; }
 // GPU value write: ReportValue = write a 32-bit value to the address when this point is reached (the replay layer's event write, applied on completion)
 NVN(nvnCommandBufferReportValue, void, NVNcommandBuffer *c, uint32_t v, NVNbufferAddress a) {
+    shp_bind(SHK_REPORT, a, 4);
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_SIGNAL_EVENT, 24);
     volatile uint32_t *val = (volatile uint32_t *)(uintptr_t)a; uint32_t mm = NVN_EVENT_SIGNAL_MODE_WRITE;
     memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
 }
 // Clear a buffer to a 32-bit value: one OP_CLEAR_BUF record, filled in order within the submission at replay (fillBuffer when all bytes match, otherwise copied from a pattern buffer)
-NVN(nvnCommandBufferClearBuffer, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n, uint32_t v) { *REC(c, OP_CLEAR_BUF, p_clear_buf) = (p_clear_buf){a, n, v, 0}; }
+NVN(nvnCommandBufferClearBuffer, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n, uint32_t v) { shp_bind(SHK_CLEAR, a, n); *REC(c, OP_CLEAR_BUF, p_clear_buf) = (p_clear_buf){a, n, v, 0}; }
 
 // State the replay layer does not have yet: logged once (conditional rendering is treated as "always draw")
 // Render enable (profile render_cond, see OP_RENDER_COND in nvn_mtl.m): recorded and evaluated at replay; without the key everything draws, as before
@@ -2918,6 +3111,7 @@ NVN(nvnCommandBufferSetRenderEnable, void, NVNcommandBuffer *c, uint32_t en) {
     else if (!(en & 0xff)) ONCE_LOG("[RED] SetRenderEnable(false): the host draws anyway for now");
 }
 NVN(nvnCommandBufferSetRenderEnableConditional, void, NVNcommandBuffer *c, NVNconditionalRenderMode m, NVNbufferAddress a) {
+    shp_bind(SHK_COND, a, 0);
     if (DM_GAME_RENDER_COND) *REC(c, OP_RENDER_COND, p_render_cond) = (p_render_cond){(int)m & 1, 0, a};
     else ONCE_LOG("[RED] SetRenderEnableConditional: the host draws anyway for now");
 }

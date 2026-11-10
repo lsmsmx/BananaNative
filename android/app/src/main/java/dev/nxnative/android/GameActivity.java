@@ -63,7 +63,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private static Boolean overlayEnv;   // DM_OVERLAY in env.txt: overrides the setting for this run (static: a screen created again keeps it)
     private TouchControls controls;
     private SidePanel panel;
-    private final HashSet<Integer> pads = new HashSet<>();   // the gamepads connected: the on-screen controls hide while there is one
+    private final HashSet<Integer> pads = new HashSet<>();   // the gamepads with a player: the on-screen controls hide while there is one
+    private PadOrder order;   // which gamepad gets a player, and which is player 1 (hostSetup)
     private File log;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile Rumble rumble;   // the game's vibration on the controller's or the phone's vibrator
@@ -366,6 +367,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (Prefs.instancedDraws(this, id)) env.add("DM_VK_INSTANCE=1");   // Game settings › Instanced draws
         if (Prefs.classicPasses(this, id)) env.add("DM_VK_CLASSIC_RP=1");   // Game settings › Classic render passes
         env.add("DM_VK_PSO_ASYNC=" + (Prefs.psoAsync(this, id) ? 2 : 0));   // Game settings › Background pipelines (an env.txt line of the player's comes later and wins)
+        if (Prefs.ramSaver(this, id)) { env.add("DM_MEM_FILEBACK=1"); env.add("DM_MEM_FILEBACK_KINDS=shader,texture"); }   // Game settings › RAM saver: texture pools in a file in TMPDIR, the cache folder (vka_mem.c "File-backed pools"); lines of env.txt or the game's own come later and win
         String padMap = Prefs.padMap(this, id);   // Button mapping (Game settings, Settings): wins over the label swap's A/B for the buttons it names
         if (!padMap.isEmpty()) env.add("DM_PAD_MAP=" + padMap);
         if (Prefs.stretch(this, id)) env.add("DM_VK_STRETCH=1");   // Game settings › Display › Stretch to screen (or the in-game panel's Picture rows)
@@ -668,6 +670,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (rumble != null) { rumble.mute(!on); Native.note("rumble: " + (on ? "on" : "off") + " (the in-game panel)"); }
     }
 
+    /** The in-game panel's Player 1 choice: the gamepads connected, the one on player 1 (null: none) */
+    java.util.List<PadOrder.Pad> gamepads() { return order != null ? order.known() : java.util.Collections.emptyList(); }
+    PadOrder.Pad playerOne() { return order != null ? order.first() : null; }
+    /** Player 1: this device from now on and at later starts (a descriptor; "" = automatic, PadOrder) */
+    void choosePlayerOne(String key) {
+        Prefs.padFirst(this, key);
+        if (order == null) return;
+        order.choose(key);
+        PadOrder.Pad one = order.first();
+        Native.note("input: player 1 " + (key.isEmpty() ? "automatic" : "chosen") + " (the in-game panel): " + (one != null ? one.name : "no gamepad"));
+    }
+
     /** The in-game panel's Button mapping shortcut: this game as Game settings sees it */
     Game game() {
         android.content.Intent i = getIntent();
@@ -787,10 +801,13 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     /**
      * DM_AOC_DIR/<index> → each DLC's RomFS folder in the game folder, or DM_AOC_DIR/<index>.nup → the .nup (hle_fs.c aoc_dir; Pack.aocLinks), as symbolic links in
      * app storage. A .nup used where it is (nupFd ≥ 0): the link's target is fd:<n>/<name>, which the host reads with readlink (nothing is at that path).
-     * A link that cannot be made is a [RED] line in the run's log (aocProblems): the game runs without that DLC
+     * A link that cannot be made, or a pack.tsv aoc row whose DLC the game's folder or .nup has not got (Pack.aocLinks skipped), is a [RED] line in the run's
+     * log (aocProblems): the game runs without that DLC
      */
     private File aocLinks(File dir, File game, Pack pack, int nupFd) {
-        Map<String, String> links = pack.aocLinks(game);
+        List<String> skipped = new ArrayList<>();
+        Map<String, String> links = pack.aocLinks(game, skipped);
+        for (String p : skipped) aocProblems.add("[RED] [nxlaunch] DLC: " + p);
         for (String p : Pack.makeAocLinks(dir, links, t -> nupFd >= 0 ? PickedPath.forHost(t, game, nupFd) : t, (target, path) -> {
             try { Os.symlink(target, path); } catch (ErrnoException e) { throw new IOException(android.system.OsConstants.errnoName(e.errno) + " (" + e.getMessage() + ")"); }
         })) aocProblems.add("[RED] [nxlaunch] DLC: " + p);
@@ -857,7 +874,18 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private void hostSetup() {
         inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
         inputManager.registerInputDeviceListener(this, ui);
-        for (int id : inputManager.getInputDeviceIds()) onInputDeviceAdded(id);
+        order = new PadOrder(new PadOrder.Host() {
+            @Override public int add(PadOrder.Pad p) { int pl = Native.deviceAdded(p.id, p.name, false); if (pl >= 0) padConnected(p.id); return pl; }
+            @Override public int first(PadOrder.Pad p) {
+                int pl = Native.deviceFirst(p.id, p.name);
+                if (pl == 0 && rumble != null) for (int id : pads) rumble.route(id);   // two players traded devices: each gets its device's vibrator
+                return pl;
+            }
+            @Override public int player(int id) { return Native.devicePlayer(id); }
+        }, Prefs.padFirst(this));
+        java.util.List<PadOrder.Pad> now = new java.util.ArrayList<>();
+        for (int id : inputManager.getInputDeviceIds()) { InputDevice d = InputDevice.getDevice(id); if (gamepadLike(d)) now.add(pad(d)); }
+        order.start(now);   // best first: an external controller is player 1 before a phone's own gamepad-like device (PadOrder)
         Native.motionRotation(getDisplay().getRotation());
         if (resumedNow && !paused) Native.motionStart();   // the screen was resumed before the game started (onResume then did nothing): the sensors start here
         audio = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -963,17 +991,31 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                 || (source & InputDevice.SOURCE_DPAD) == InputDevice.SOURCE_DPAD;
     }
 
+    /** Gamepads and joysticks only: a keyboard with arrow keys (SOURCE_DPAD) gets a player from its first pad key, if it ever sends one (PadOrder.active) */
+    private static boolean gamepadLike(InputDevice d) {
+        return d != null && !d.isVirtual() && (d.supportsSource(InputDevice.SOURCE_GAMEPAD) || d.supportsSource(InputDevice.SOURCE_JOYSTICK));
+    }
+    /** What PadOrder ranks a device by: external, gamepad buttons with a stick, a vendor ID; never its name */
+    private static PadOrder.Pad pad(InputDevice d) {
+        boolean[] keys = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B);
+        boolean full = keys[0] && keys[1] && d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null
+                && d.getMotionRange(MotionEvent.AXIS_Y, InputDevice.SOURCE_JOYSTICK) != null;
+        return new PadOrder.Pad(d.getId(), d.getDescriptor(), d.getName(), d.isExternal(), full, d.getVendorId());
+    }
+    /** A pad key that gives a device without a player one (the keys the host takes: gamepad buttons and the D-pad) */
+    private static boolean padKey(int code) {
+        return KeyEvent.isGamepadButton(code) || code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN || code == KeyEvent.KEYCODE_DPAD_LEFT
+                || code == KeyEvent.KEYCODE_DPAD_RIGHT || code == KeyEvent.KEYCODE_DPAD_CENTER;
+    }
+
     @Override public void onInputDeviceAdded(int id) {
         InputDevice d = InputDevice.getDevice(id);
-        // Gamepads and joysticks only: a keyboard with arrow keys (SOURCE_DPAD) gets a player from its first pad key, if it ever sends one
-        if (d != null && !d.isVirtual() && (d.supportsSource(InputDevice.SOURCE_GAMEPAD) || d.supportsSource(InputDevice.SOURCE_JOYSTICK))) {
-            Native.deviceAdded(id, d.getName(), false);
-            padConnected(id);
-        }
+        if (order != null && gamepadLike(d)) order.connected(pad(d));
         deviceAxes.remove(id);
     }
     @Override public void onInputDeviceRemoved(int id) {
         Native.deviceRemoved(id); deviceAxes.remove(id);
+        if (order != null) order.removed(id);
         if (pads.remove(id)) controls.setGamepad(!pads.isEmpty());
     }
     private void padConnected(int id) {
@@ -993,8 +1035,10 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             return true;
         }
         // Back from the phone and keyboard keys stay with the launcher: the host takes only pad buttons
+        // A device without a player gets one from its first pad key (PadOrder.active: a phone's own gamepad-like device that never sends one takes none)
         if (input && gamepad(e.getSource()) && e.getDevice() != null && !e.getDevice().isVirtual()
                 && (e.getAction() == KeyEvent.ACTION_DOWN || e.getAction() == KeyEvent.ACTION_UP)
+                && (order.plays(e.getDeviceId()) || e.getAction() == KeyEvent.ACTION_DOWN && padKey(e.getKeyCode()) && order.active(pad(e.getDevice())))
                 && Native.key(e.getDeviceId(), e.getKeyCode(), e.getAction() == KeyEvent.ACTION_DOWN)) { padConnected(e.getDeviceId()); return true; }
         return super.dispatchKeyEvent(e);
     }
@@ -1021,6 +1065,9 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             return super.onGenericMotionEvent(e);
         int[] have = axesOf(e.getDevice(), e.getSource());
         for (int i = 0; i < have.length; i++) axisValues[i] = e.getAxisValue(have[i]);
+        // A device without a player gets one when a stick or trigger is pushed past half (PadOrder.wakes), not from a resting stick's noise
+        if (!order.plays(e.getDeviceId()) && !(gamepadLike(e.getDevice()) && PadOrder.wakes(axisValues, have.length) && order.active(pad(e.getDevice()))))
+            return super.onGenericMotionEvent(e);
         return Native.axes(e.getDeviceId(), have, axisValues) || super.onGenericMotionEvent(e);   // the host reads have.length values
     }
 

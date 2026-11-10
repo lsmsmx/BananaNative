@@ -12,6 +12,9 @@
 NXHOST_API int nxhost_input_device_added(int device, const char *name, int labelled);   // the player (0..7), -1 with every player taken
 NXHOST_API void nxhost_input_device_removed(int device);
 NXHOST_API int nxhost_input_device_player(int device);   // -1 when the device has no player
+// The device becomes player 1 (connected first if it was not; name as for added): player 1's holder moves to the device's old player (pad_slot_first). Both players' buttons
+// and sticks are let go. 0, or -1 with every player taken
+NXHOST_API int nxhost_input_device_first(int device, const char *name);
 // KeyEvent from dispatchKeyEvent: keycode and down (ACTION_DOWN; repeats may be passed). True when it is a pad button: the launcher returns true and does not pass it on
 NXHOST_API bool nxhost_input_key(int device, int keycode, bool down);
 // MotionEvent from dispatchGenericMotionEvent (SOURCE_JOYSTICK / SOURCE_GAMEPAD): one axis (MotionEvent.AXIS_*), or every axis of one event at once (published once)

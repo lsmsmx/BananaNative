@@ -30,7 +30,7 @@ final class Profile {
     boolean hasResolution() { return resolution.equals("window") || resolution.startsWith("scale:"); }
 
     /**
-     * The host's environment lines for a Game resolution choice (Prefs.WINDOWS: "original", "2560x1440", "1920x1080", "1280x720", "960x540"): DM_WINDOW_SIZE=&lt;choice&gt; for a game with
+     * The host's environment lines for a Game resolution choice (Prefs.WINDOWS: "original", "2560x1440", "1920x1080", "1280x720", "960x540", "848x480"): DM_WINDOW_SIZE=&lt;choice&gt; for a game with
      * window_fn rows (its window size) or res_levels rows (a cap on its dynamic resolution); DM_GRAPHICS_SCALE and DM_OPMODE from the choice's graphics_scale row for a game that sizes its scenes by the graphics scale (none for a choice
      * without a row: the game's own); none for a game with neither.
      */

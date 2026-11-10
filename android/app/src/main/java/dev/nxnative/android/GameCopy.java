@@ -34,6 +34,9 @@ final class GameCopy {
     static final int PICK_TREE = 50;
     private static volatile boolean running;
 
+    /** Whether a copy is being written (Settings › Storage waits for it) */
+    static boolean running() { return running; }
+
     static void pickTree(MainActivity a) {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         a.startActivityForResult(i, PICK_TREE);

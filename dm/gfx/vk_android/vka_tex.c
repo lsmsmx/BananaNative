@@ -21,6 +21,7 @@
 #include "vka_gml.h"
 #include "vka_texlimit.h"
 #include "game_profile.h"
+#include "vka_texown.h"
 
 __attribute__((weak)) int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) { (void)mem; (void)size; (void)stride; return 0; }
 __attribute__((weak)) uint64_t dm_codec_video_gen(const void *mem) { (void)mem; return 0; }
@@ -1576,8 +1577,21 @@ static void vka_tex_prune_locked(void) {
     static prune_ent *c; static int ccap; int nc = 0;
     if (ccap < g_nlive) { ccap = g_nlive + 256; c = realloc(c, (size_t)ccap * sizeof *c); }
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
+    // A texture a shader reads only through the pool (a bindless handle from a record in a storage buffer: Ocarina of Time's lightmaps) is never bound by a draw,
+    // so its last_frame does not move: evicting it rewrote its slot (redirty_ids), write_tex made it again at the next submission, and the cache evicted and
+    // remade thousands of images a second (Turnip under 1 fps, a crash in Qualcomm's driver). An image a live pool slot names is in use: it stays, and a working
+    // set over the limit is kept (logged below). DM_VK_EAGER_TEX=0 makes no image for a slot, so nothing to keep
+    int pool_keep = VKA_ENV("DM_VK_EAGER_TEX", 1), npool = 0;
+    if (pool_keep)
+        for (int id = 1; id < g_ntreg; id++) {
+            const treg_ent *te = &g_treg[id];
+            if (!te->t.serial || (te->t.pool && te->pgen && nvn_pool_live(te->t.pool, NULL, NULL) != te->pgen)) continue;   // (a finalized pool's slot has the null view: treg_dead)
+            smap_ent *se = map_get(te->t.serial);
+            if (se && se->im && se->im->pool_frame != cur_frame) { se->im->pool_frame = cur_frame; npool++; }
+        }
     for (int i = 0; i < g_nlive; i++) {
         vka_img *im = g_live[i];
+        if (pool_keep && im->pool_frame == cur_frame) continue;
         if (vktl_evictable2(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, im->last_fence && done_fence < im->last_fence,
                             (unsigned)VKA_ENV("DM_VK_IMG_KEEP_FRAMES", 2)))
             c[nc++] = (prune_ent){im, im->last_frame, im->gpu_owned != 0};
@@ -1601,8 +1615,8 @@ static void vka_tex_prune_locked(void) {
         static uint64_t logged; static _Atomic int n;
         if (total_bytes >= logged + 256 * VKTL_MIB && atomic_fetch_add(&n, 1) < 8) {
             logged = total_bytes;
-            VLOG("image cache over its limit: %.0f MiB of images, limit %.0f MiB; the rest was used in the last %d frames or is held, so it stays (evicting it would upload it again)",
-                 total_bytes / 1048576.0, limit_bytes / 1048576.0, VKTL_KEEP_FRAMES);
+            VLOG("image cache over its limit: %.0f MiB of images, limit %.0f MiB; the rest was used in the last %d frames, is held or is named by a texture pool slot (%d images), so it stays (evicting it would upload it again)",
+                 total_bytes / 1048576.0, limit_bytes / 1048576.0, VKTL_KEEP_FRAMES, npool);
         }
     }
 }
@@ -1643,13 +1657,18 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
     }
     vka_fmt f; vka_img *im = NULL; int throttle = 0;
     if (vka_fmt_of(t->d.format, &f)) {
-        for (int i = 0; i < g_nlive && !im; i++) if (t->mem && same_shape(g_live[i], t, &f, 1) && !(g_live[i]->base && sparse_gpu(t, &f))) {
+        // An image whose pool was finalized (img_pool_dead) holds that pool's content. One the GPU drew is taken over by a new texture of the same storage and shape (the GPU
+        // draws it again, and a large depth buffer is not made twice), but not one whose content came from the storage: the new pool's storage is the new texture's content,
+        // and its pages were never protected for that image, so its tracking would not see the CPU's writes there and it kept the old pool's texels (tiles of the scene
+        // before; docs/reference/nvn-objects.md "An image of a finalized pool taken over with its old content")
+        for (int i = 0; i < g_nlive && !im; i++) if (t->mem && same_shape(g_live[i], t, &f, 1) && !(g_live[i]->base && sparse_gpu(t, &f)) && (!img_pool_dead(g_live[i]) || g_live[i]->gpu_owned)) {
             im = g_live[i]; im->refs++;
-            if (im->pdead) {
+            int revived = im->pdead;
+            if (revived) {
                 im->pdead = 0; im->track = (im->mode == ST_TRACK);
                 im->serial = t->serial;
             }
-            if (t->pool && im->pool != t->pool) { uint64_t fin = nvn_pool_fin(), g = nvn_pool_live(t->pool, NULL, NULL); if (g) { im->pool = t->pool; im->pfin = fin; im->pgen = g; } } }
+            if (t->pool && (im->pool != t->pool || revived)) { uint64_t fin = nvn_pool_fin(), g = nvn_pool_live(t->pool, NULL, NULL); if (g) { im->pool = t->pool; im->pfin = fin; im->pgen = g; } } }
         if (im) big_share(im, t);   // (another texture object of the same storage and shape: DM_VK_BIGIMG_MB diagnostic)
         uint32_t vmin = 0, base = sparse_sampled(t, &f) ? sparse_base(t->pool, t->mem, &t->d, &t->L, &vmin) : 0;
         int mode = 0;
@@ -1899,9 +1918,20 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("texture serial %llu %ux%u format %#x: %llu bytes uploaded from guest memory", (unsigned long long)t->serial, im->w, im->h, d->format, (unsigned long long)bytes);
 }
 
-void mtl_tex_init(const tex_t *t) { (void)t; }
+// The object each serial was initialized in (vka_texown.h): a Finalize of a copy of a texture object whose original lives on ends nothing
+static nvn_hmap g_tex_own;   // serial -> the texture object nvnTextureInitialize ran on (g_tmu)
+static int tex_obj_holds(uintptr_t obj, uint64_t serial) {   // read through the guest's mappings: the game may have freed and unmapped the object
+    tex_t seen; dm_guest_read_mapped(&seen, obj, sizeof seen);
+    return seen.magic == MAGIC('T', 'E', 'X', 0) && seen.serial == serial;
+}
+void mtl_tex_init(const tex_t *t) { if (!t || !t->serial) return; pthread_mutex_lock(&g_tmu); vto_own(&g_tex_own, t->serial, t); pthread_mutex_unlock(&g_tmu); }
 void mtl_tex_release(tex_t *t) {
     pthread_mutex_lock(&g_tmu);
+    if (!vto_release(&g_tex_own, t->serial, t, tex_obj_holds)) {
+        static _Atomic uint64_t n; uint64_t k = atomic_fetch_add(&n, 1) + 1;
+        if (k <= 4 || !(k & (k - 1))) VLOG("texture serial %llu: Finalize of a copy of its texture object, the original still holds it: its image stays (%llu so far)", (unsigned long long)t->serial, (unsigned long long)k);
+        pthread_mutex_unlock(&g_tmu); return;
+    }
     smap_ent *e = map_get(t->serial); vka_img *im = e ? e->im : NULL;
     if (e) map_del(t->serial);
     cpuw_take(t->serial, 0);
@@ -2297,7 +2327,10 @@ static int treg_dead(int id, const treg_ent *e) {
 static void write_tex(int id, VkCommandBuffer cb, VkWriteDescriptorSet *w, VkDescriptorImageInfo *ii) {   // caller holds g_tmu; it is let go while the image is made
     treg_ent ent = g_treg[id], *e = &ent;
     if (e->img && VKA_ENV("DM_VK_IMG_UPGRADE", 1)) e->t.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;   // an image registration is image intent (nvn_mtl.m image_prepare), with or without the texture's IMAGE flag
-    int eager = VKA_ENV("DM_VK_EAGER_TEX", 0);
+    // The slot's image is made here (and uploaded) when it is not made yet: a texture a shader reads only through the pool (a bindless handle from a record in a
+    // storage buffer, as agl / gsys lit materials read their lightmaps) has no other first use, and a slot written while its image is not made stays the null view
+    // (reads 0) until something rewrites it. DM_VK_EAGER_TEX=0: only an image already made is named (a319e773 .. this fix; Ocarina of Time's lightmaps read 0 then: black walls)
+    int eager = VKA_ENV("DM_VK_EAGER_TEX", 1);
     vka_img *im = NULL;
     if (eager) {
         pthread_mutex_unlock(&g_tmu);

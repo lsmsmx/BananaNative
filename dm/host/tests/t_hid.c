@@ -75,6 +75,17 @@ static void t_slots(void) {
     CHECK(pad_slot_take(&s, NULL, "x") == -1 && pad_slot_free(&s, NULL) == -1, "no owner, no slot");
     memset(&s, 0, sizeof s);   // DM_KBD_PLAYER=own: the keyboard holds player 1 for good
     CHECK(pad_slot_take(&s, &kbd, "keyboard") == 0 && pad_slot_take(&s, &a, "Xbox Wireless Controller") == 1, "with the keyboard on its own the first controller is player 2");
+
+    // pad_slot_first: a controller chosen as player 1 trades slots with player 1's holder (the Android launcher: a real controller before a system input device)
+    memset(&s, 0, sizeof s); int moved;
+    CHECK(pad_slot_take(&s, &a, "uinput-xiaomi") == 0 && pad_slot_take(&s, &b, "GameSir-X3 Pro") == 1, "a system device took player 1 first");
+    CHECK(pad_slot_first(&s, &b, "GameSir-X3 Pro", &moved) == 0 && moved == 1, "the controller becomes player 1, the other moves to its slot");
+    CHECK(pad_slot_of(&s, &b) == 0 && pad_slot_of(&s, &a) == 1 && !strcmp(s.last[0], "GameSir-X3 Pro") && !strcmp(s.last[1], "uinput-xiaomi"), "owners and names traded");
+    CHECK(pad_slot_first(&s, &b, "GameSir-X3 Pro", &moved) == 0 && moved == -1 && pad_slot_of(&s, &a) == 1, "player 1 already: nothing moves");
+    CHECK(pad_slot_first(&s, &c, "Pro Controller", &moved) == 0 && moved == 2 && pad_slot_of(&s, &b) == 2 && pad_slot_mask(&s) == 0x7, "a new controller made player 1: the old holder takes its new slot");
+    memset(&s, 0, sizeof s);
+    CHECK(pad_slot_first(&s, &a, "x", &moved) == 0 && moved == -1, "player 1 free: taken, nothing moves");
+    CHECK(pad_slot_first(&s, NULL, "x", &moved) == -1, "no owner, no slot");
 }
 
 static void t_npads(void) {

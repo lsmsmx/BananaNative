@@ -37,7 +37,7 @@ CAP_SIZE(p_clear_buf, 24); CAP_OFF(p_clear_buf, addr, 0); CAP_OFF(p_clear_buf, s
 CAP_SIZE(p_tf_bind, 24); CAP_OFF(p_tf_bind, addr, 8); CAP_OFF(p_tf_bind, size, 16);
 CAP_SIZE(p_tf_state, 16); CAP_OFF(p_tf_state, ctl, 8);
 CAP_SIZE(p_render_cond, 16); CAP_OFF(p_render_cond, mode, 0); CAP_OFF(p_render_cond, addr, 8);
-_Static_assert(OP_COUNT_ == 54, "nvn_capture.c: a record op was added or removed: give it a case in cap_rec_fields");
+_Static_assert(OP_COUNT_ == 56, "nvn_capture.c: a record op was added or removed: give it a case in cap_rec_fields");
 
 const char *cap_layout(void) {
     // sizes and pointer offsets as the walk knows them (the asserts above hold them to nvn_obj.h); bump this text with any change to the walk
@@ -75,6 +75,8 @@ int cap_rec_fields(uint32_t op, uint8_t *payload, uint32_t size, const cap_ops *
         case OP_COPY_B2B: { if (!HAS(16)) return 0; uint64_t n = u64_at(payload + 16); return ops->addr(ctx, F(0), n, 0) & ops->addr(ctx, F(8), n, 1); }
         case OP_UPDATE_UB: { if (!HAS(8)) return 0; return ops->addr(ctx, F(0), u64_at(payload + 8), 1); }   // dst, n, inline data
         case OP_FENCE_SYNC: return HAS(0) && ops->obj(ctx, CAP_K_SYNC, F(0), payload, (uint32_t)plen);
+        case OP_WAIT_EVENT: return HAS(0) && ops->addr(ctx, F(0), 4, 0);   // volatile uint32_t *val, mode, value
+        case OP_WAIT_SYNC: return HAS(0) && ops->obj(ctx, CAP_K_SYNC, F(0), payload, (uint32_t)plen);
         case OP_SET_RT: {
             int32_t n = HAS(0) ? i32_at(payload) : -1; if (n < 0 || n > 8 || !HAS(offsetof(p_set_rt, depth))) return 0;
             for (int i = 0; i < n; i++) ok &= ops->obj(ctx, CAP_K_TEX, F(offsetof(p_set_rt, color) + 8 * (size_t)i), payload, (uint32_t)plen);

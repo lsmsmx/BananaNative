@@ -1,5 +1,5 @@
 // The Android host's pure audio / picture helpers (android/av_android.h), on the Mac: the AAudio fallback resampler, AAC channel mapping, the SPS size MediaCodec is configured
-// with, and MediaCodec output layouts into NV12 / RGBA
+// with, MediaCodec output layouts into NV12 / RGBA, and what a stream keeps for a hardware decoder that fails inside it
 #include "android/av_android.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,8 +113,28 @@ static void t_rgba(void) {
     nx_nv12_to_rgba(fy, fuv, 2, 1, 2, o, 8, 1, 1);
     CHECK(o[0] == 255 && o[4] == 0, "full range: %d %d", o[0], o[4]);
 }
+static void t_mck(void) {
+    CHECK(!nx_mc_failed(0) && !nx_mc_failed(5) && !nx_mc_failed(-1) && !nx_mc_failed(-2) && !nx_mc_failed(-3), "indices and the three AMEDIACODEC_INFO_* codes are not failures");
+    CHECK(nx_mc_failed(-10000) && nx_mc_failed(-4), "AMEDIA_ERROR_UNKNOWN and other codes below -3 are failures");
+    nx_mck k; memset(&k, 0, sizeof k);
+    uint8_t a[3] = {1, 2, 3}, b[2] = {4, 5};
+    nx_mck_packet(&k, a, 3, 10, 1); nx_mck_packet(&k, b, 2, 20, 0); nx_mck_picture(&k);
+    CHECK(k.n == 2 && k.bytes == 5 && k.given == 1 && k.p[1].pts == 20 && k.p[1].d[1] == 5, "two packets since the key frame, one picture given: n %d bytes %zu given %llu", k.n, k.bytes, (unsigned long long)k.given);
+    nx_mck_packet(&k, b, 2, 30, 1);
+    CHECK(k.n == 1 && k.given == 0 && k.p[0].pts == 30, "a key frame starts over: n %d given %llu", k.n, (unsigned long long)k.given);
+    for (int i = 0; i < NX_MCK_PACKETS; i++) nx_mck_packet(&k, b, 2, i, 0);
+    CHECK(k.lost && k.n == 0 && k.bytes == 0, "past the cap the packets are given up: lost %d n %d", k.lost, k.n);
+    nx_mck_packet(&k, a, 3, 1, 0);
+    CHECK(k.lost && k.n == 0, "and stay given up until the next key frame");
+    nx_mck_packet(&k, a, 3, 2, 1);
+    CHECK(!k.lost && k.n == 1, "the next key frame keeps packets again");
+    nx_mck_packet(&k, NULL, 0, 3, 0);
+    CHECK(k.n == 2 && k.p[1].n == 0, "an empty packet is kept as one");
+    nx_mck_free(&k);
+    CHECK(!k.p && !k.n && !k.cap, "freed");
+}
 int main(void) {
-    t_resample(); t_chmap(); t_sps(); t_yuv(); t_rgba();
+    t_resample(); t_chmap(); t_sps(); t_yuv(); t_rgba(); t_mck();
     if (fails) { printf("t_android_av: %d failures\n", fails); return 1; }
     printf("t_android_av: ok\n");
     return 0;

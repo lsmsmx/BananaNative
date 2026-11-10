@@ -26,6 +26,10 @@ static jint j_device_added(JNIEnv *env, jclass c, jint dev, jstring name, jboole
 }
 static void j_device_removed(JNIEnv *env, jclass c, jint dev) { (void)env; (void)c; nxhost_input_device_removed(dev); }
 static jint j_device_player(JNIEnv *env, jclass c, jint dev) { (void)env; (void)c; return nxhost_input_device_player(dev); }
+static jint j_device_first(JNIEnv *env, jclass c, jint dev, jstring name) {
+    (void)c; const char *u = name ? (*env)->GetStringUTFChars(env, name, NULL) : NULL;
+    int p = nxhost_input_device_first(dev, u); if (u) (*env)->ReleaseStringUTFChars(env, name, u); return p;
+}
 static jboolean j_key(JNIEnv *env, jclass c, jint dev, jint key, jboolean down) { (void)env; (void)c; return nxhost_input_key(dev, key, down); }
 static jboolean j_axes(JNIEnv *env, jclass c, jint dev, jintArray axes, jfloatArray values) {
     (void)c; if (!axes || !values) return JNI_FALSE;
@@ -100,6 +104,7 @@ static const JNINativeMethod k_methods[] = {
     {"deviceAdded", "(ILjava/lang/String;Z)I", (void *)j_device_added},
     {"deviceRemoved", "(I)V", (void *)j_device_removed},
     {"devicePlayer", "(I)I", (void *)j_device_player},
+    {"deviceFirst", "(ILjava/lang/String;)I", (void *)j_device_first},
     {"key", "(IIZ)Z", (void *)j_key},
     {"axes", "(I[I[F)Z", (void *)j_axes},
     {"deadzone", "(F)V", (void *)j_deadzone},

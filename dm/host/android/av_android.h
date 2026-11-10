@@ -1,9 +1,10 @@
 // Pure audio and picture helpers of the Android host (no Android headers, no host state), so tests/t_android_av.c checks them on the Mac:
 // a linear resampler for an AAudio stream that would not open at 48 kHz, channel mapping for an AAC decoder whose output layout differs from the track's,
-// the SPS picture size for MediaCodec's format, and MediaCodec output buffer layouts copied into tight NV12 or RGBA.
+// the SPS picture size for MediaCodec's format, MediaCodec output buffer layouts copied into tight NV12 or RGBA, and what a stream keeps for a hardware decoder that fails inside it.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ---------- Resampler ----------
@@ -152,6 +153,34 @@ static inline int nx_yuv_to_nv12(const uint8_t *src, size_t n, const nx_yuv_layo
     }
     return 0;
 }
+// ---------- A hardware decoder that fails inside a stream ----------
+// AMediaCodec_dequeueOutputBuffer / dequeueInputBuffer: an index, or -1 (try again later), -2 (output format changed), -3 (output buffers changed); anything below is an error
+// (AMEDIA_ERROR_*, AMEDIACODEC_ERROR_*: a decoder in its error state, or one whose resources were reclaimed), after which it gives nothing more. Read as "no picture yet",
+// such an error left the movie player without a picture for every packet that followed
+static inline int nx_mc_failed(long r) { return r < -3; }
+// The packets of a stream since its last key frame (the last temporal unit with a sequence header), copied, so that when the hardware decoder fails the CPU decoder can start
+// again from that key frame: given counts the pictures the hardware decoder gave since it, which the CPU decoder's first pictures repeat (they are dropped). lost: more than the
+// cap came since the key frame (the CPU decoder then starts at the next one)
+#define NX_MCK_PACKETS 4096
+#define NX_MCK_BYTES (64u << 20)
+typedef struct { struct { uint8_t *d; size_t n; int64_t pts; } *p; int n, cap, lost; size_t bytes; uint64_t given; } nx_mck;
+static inline void nx_mck_drop(nx_mck *k) { for (int i = 0; i < k->n; i++) free(k->p[i].d); k->n = 0; k->bytes = 0; }
+static inline void nx_mck_clear(nx_mck *k) { nx_mck_drop(k); k->lost = 0; k->given = 0; }
+static inline void nx_mck_free(nx_mck *k) { nx_mck_clear(k); free(k->p); k->p = NULL; k->cap = 0; }
+static inline void nx_mck_packet(nx_mck *k, const uint8_t *d, size_t n, int64_t pts, int key) {
+    if (key) nx_mck_clear(k);
+    if (k->lost) return;
+    if (k->n >= NX_MCK_PACKETS || k->bytes + n > NX_MCK_BYTES) { k->lost = 1; nx_mck_drop(k); return; }
+    if (k->n == k->cap) {
+        int c = k->cap ? k->cap * 2 : 64; void *q = realloc(k->p, (size_t)c * sizeof *k->p);
+        if (!q) { k->lost = 1; nx_mck_drop(k); return; }
+        k->p = q; k->cap = c;
+    }
+    uint8_t *c = malloc(n ? n : 1); if (!c) { k->lost = 1; nx_mck_drop(k); return; }
+    if (n) memcpy(c, d, n);
+    k->p[k->n].d = c; k->p[k->n].n = n; k->p[k->n].pts = pts; k->n++; k->bytes += n;
+}
+static inline void nx_mck_picture(nx_mck *k) { k->given++; }
 #ifdef __ANDROID__   // the Vulkan replay's (vka_present.c), when it is linked in: 1 when the swapchain is BGRA
 __attribute__((weak)) int vka_swap_rb(void);
 #define NX_SWAP_RB() (&vka_swap_rb && vka_swap_rb())

@@ -74,6 +74,9 @@ final class Updater {
 
     private static boolean checkedThisStart;   // one check per app start (process)
     private static File pending;   // a verified download waiting for "install unknown apps" (resume)
+
+    /** The download waiting for its install, or null (Settings › Storage leaves it alone) */
+    static File pending() { return pending; }
     private static boolean receiverOn;
     private static WeakReference<Activity> front = new WeakReference<>(null);
 

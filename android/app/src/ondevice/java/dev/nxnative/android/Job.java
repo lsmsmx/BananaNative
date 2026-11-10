@@ -33,9 +33,14 @@ final class Job {
     static final String[] STEP_TEXT = {"Checking the dump", "Rewriting the game code", "Finding the shaders", "Translating shaders", "Finishing the pack"};
     /** Each step's share of the progress bar, roughly its time on the phone (ONDEVICE.md "Time and power"); the shaders' share is counted by shader */
     private static final int[] WEIGHT = {1, 5, 12, 78, 4};
-    static final int SHADERS = 3;
+    static final int REWRITE = 1, SHADERS = 3, PACK = 4;
     /** The steps whose outputs depend on the APK's shader chain: a job made by another APK starts them over */
     static final int FIRST_CHAIN_STEP = SHADERS;
+    /**
+     * Which steps use each step's checked outputs (Outputs.redo): the pack step takes the rewrite's code from the pack folder (--keep-code) and the shaders step's
+     * library (--shader-cache). The split's outputs are the shaders step's own check (PackService.step); identify writes nothing.
+     */
+    private static final int[][] USES = {null, {PACK}, null, {PACK}, null};
 
     final File file;
     private JSONObject o;
@@ -329,6 +334,52 @@ final class Job {
         JSONObject j = steps.optJSONObject(s);
         if (j == null) steps.put(s, j = new JSONObject().put("state", "pending").put("done", 0).put("total", 0).put("stage", ""));
         return j;
+    }
+
+    /** The modules the rewrite step wrote into the pack (recorded when it is done); a job from before the record, or one that took over a pack's code, has main */
+    synchronized java.util.List<String> codeModules() {
+        JSONArray a = o.optJSONArray("code_modules");
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (a != null) for (int i = 0; i < a.length(); i++) if (!a.optString(i).isEmpty()) out.add(a.optString(i));
+        if (out.isEmpty()) out.add("main");   // every game has one
+        return out;
+    }
+
+    /** Records the modules the rewrite step wrote (Outputs.codeModules of the pack after the step) */
+    synchronized void codeModules(java.util.List<String> modules) {
+        try {
+            o.put("code_modules", new JSONArray(modules));
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * Steps recorded done whose outputs went while a later step still needs them (Outputs.redo) are set pending again, with the steps made from them: the
+     * rewrite when the pack folder lost its code (job.json is on shared storage beside the dump; the app's packs/&lt;id&gt; goes when the app is uninstalled, BananaNative
+     * issue #3), the shaders step when its library is not in the folder the pack step copies from. Finished shader results (xlate/) stay: the shaders step rebuilds
+     * the library from them. → the steps set pending, empty when every output is there
+     */
+    synchronized java.util.List<String> dropMissing() {
+        int n = STEPS.length;
+        boolean[] done = new boolean[n], present = new boolean[n];
+        for (int i = 0; i < n; i++) { done[i] = "done".equals(stepState(STEPS[i])); present[i] = true; }
+        present[REWRITE] = Outputs.codeComplete(pack(), codeModules());
+        present[SHADERS] = Outputs.libraryComplete(shaderCache(), BuildConfig.NX_DMSH_VK_CHAIN);
+        boolean[] r = Outputs.redo(done, present, USES);
+        java.util.List<String> out = new java.util.ArrayList<>();
+        try {
+            for (int i = 0; i < n; i++) {
+                if (!r[i]) continue;
+                o.getJSONObject("steps").put(STEPS[i], new JSONObject().put("state", "pending").put("done", 0).put("total", 0).put("stage", ""));
+                // a library taken from the pack (Job.adopt, code only) that went with it: the shaders step builds its own in ondevice/lib
+                if (i == SHADERS) o.remove("shader_cache");
+                out.add(STEPS[i]);
+            }
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+        return out;
     }
 
     /** The first step not done, -1 when all are */

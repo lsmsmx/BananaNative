@@ -36,7 +36,10 @@
 #include <fcntl.h>
 #include "vka_mapbudget.h"
 #include "vka_fd_alias.h"
+#include "vka_fileback.h"
 
+static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
+static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
 typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; VkDeviceAddress bda; int refs, fd_alias; } seg_t;
 static seg_t *g_sg; static int g_nsg, g_sgcap;   // sorted by lo, disjoint
 // Bumped (under g_rw for writing) whenever a segment comes or goes: the replay's per-thread lookup cache (vka_addr, vka_addr_run) holds while it stands
@@ -429,12 +432,13 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     nvn_dirty_hold((const void *)lo, n);   // (see the note above prot_known; released after swap_end)
     prun pr[MAXRUN]; int npr = prot_runs(lo, hi, pr, MAXRUN), exact = prot_known(pr, &npr, lo, hi);
     p2 = mono_ns(); g_ph[1] += p2 - p1; p1 = p2;
-    void *p = NULL; int ok = 0;
+    void *p = NULL; int ok = 0, replaced = 0;
     swap_begin(lo, hi);
     prot_readonly(pr, npr);   // writers wait in the fault hook from here
     if ((s.fd_alias ? (p = exported.mapped, 0) : vk.vkMapMemory(V.dev, s.mem, 0, VK_WHOLE_SIZE, 0, &p)) == 0 && p) {
         copy_readable(p, lo, pr, npr);
         p3 = mono_ns(); g_ph[2] += p3 - p2; p2 = p3;
+        replaced = 1;   // (from here the range's pages are replaced: the placed map, or anonymous pages with the bytes after a failed one)
         if (s.fd_alias) {
             void *q = (void *)syscall(__NR_mmap, lo, (size_t)n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, exported.fd, 0);
             ok = q == (void *)lo; r = ok ? VK_SUCCESS : VK_ERROR_MEMORY_MAP_FAILED;
@@ -464,6 +468,7 @@ static int place(uintptr_t lo, uintptr_t hi, VkDeviceSize *grow) {
     swap_end();
     nvn_dirty_unhold();
     if (ok && pf) prefault_line();
+    if (replaced) fb_placed(lo, hi);   // (a file-backed piece under it: its pages were replaced with its bytes; its file range is punched)
     p5 = mono_ns();
     g_ph[3] += p3 - p2; g_ph[4] += p4 - p3; g_ph[5] += p5 - p4;
     if (!(++g_ph_n & 255)) VLOG("placed memory: %llu placements: allocation %.0f ms, protections read %.0f ms (%.0f lines of /proc/self/maps a read), copy %.0f ms, maps %.0f ms, prefault %.0f ms, protections back %.0f ms; %d memory maps of %d at the last count",
@@ -592,7 +597,7 @@ static void unplace_all(segvec *v) { for (int i = 0; i < v->n; i++) { unplace(&v
 // the phone: 1.48 s of give-back in a 1.44 s frame, GPU idle, 'vk-replay' recording). They run on a thread
 // of their own instead. The ranges stay in the pending table until unplace_all's pend_done: a placement
 // over one waits in cover (pend_wait), and vka_mem_release waits before the guest reuses the range.
-typedef struct give_job { segvec v; struct give_job *next; } give_job;
+typedef struct give_job { segvec v; uintptr_t fb_lo, fb_hi; int fb_back; struct give_job *next; } give_job;
 static give_job *g_gq_h, *g_gq_t;
 static pthread_mutex_t g_gqmu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_gqcv = PTHREAD_COND_INITIALIZER;
@@ -607,6 +612,7 @@ static void *give_main(void *a) {
         uint64_t t0 = mono_ns();
         unplace_all(&j->v);
         atomic_fetch_add(&g_give_ns, mono_ns() - t0);
+        if (j->fb_back) fb_gone(j->fb_lo, j->fb_hi, j->fb_back);   // (the RAM saver's file pieces, once the range is anonymous: as on the calling thread)
         free(j);
     }
     return NULL;
@@ -616,12 +622,12 @@ static void give_start_once(void) {
     if (pthread_create(&th, NULL, give_main, NULL)) { g_give_up = -1; VRED("give-back: the thread did not start: a give-back waits on the calling thread"); return; }
     pthread_detach(th); g_give_up = 1;
 }
-static void give_defer(segvec v) {
+static void give_defer(segvec v, uintptr_t fb_lo, uintptr_t fb_hi, int fb_back) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, give_start_once);
     give_job *j = g_give_up > 0 ? malloc(sizeof *j) : NULL;
-    if (!j) { unplace_all(&v); return; }   // (the thread or memory: as before, on this thread)
-    j->v = v; j->next = NULL;
+    if (!j) { unplace_all(&v); if (fb_back) fb_gone(fb_lo, fb_hi, fb_back); return; }   // (the thread or memory: as before, on this thread)
+    j->v = v; j->fb_lo = fb_lo; j->fb_hi = fb_hi; j->fb_back = fb_back; j->next = NULL;
     pthread_mutex_lock(&g_gqmu);
     if (g_gq_t) g_gq_t->next = j; else g_gq_h = j;
     g_gq_t = j;
@@ -704,6 +710,7 @@ int vka_mem_release(uintptr_t lo, uintptr_t hi) {
     pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
     unplace_all(&v);
     lazy_release_note(lo, hi);   // pools not placed yet (DM_VK_PLACE_LAZY) over the range: their storage leaves the guest too
+    fb_gone(lo, hi, 0);          // file-backed pieces there: dropped (the host maps fresh pages over the range next)
     return 0;
 }
 
@@ -965,7 +972,7 @@ void mtl_pool_del(const void *mem) {
     }
     pthread_mutex_unlock(&g_pmu);
     free(e.gmap);
-    if (!e.segs.n) { free(e.segs.lo); return; }
+    if (!e.segs.n) { free(e.segs.lo); fb_gone((uintptr_t)mem, (uintptr_t)mem + e.size, 1); return; }
     segvec v = {0}; uint64_t t0 = mono_ns();
     pthread_mutex_lock(&g_pl); pthread_rwlock_wrlock(&g_rw); uncover(&e.segs, &v); pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
     // The last fence reserved is one the replay may still be recording (its submission has been made by the
@@ -976,11 +983,12 @@ void mtl_pool_del(const void *mem) {
         static _Atomic int nlog;
         if (atomic_fetch_add(&nlog, 1) < 4) VLOG("give-back: %d segments deferred (fence %llu reserved, %llu queued)", v.n,
                                                 (unsigned long long)vka_fence_last(), (unsigned long long)vka_fence_queued());
-        give_defer(v);
+        give_defer(v, (uintptr_t)mem, (uintptr_t)mem + e.size, 1);
         return;
     }
     unplace_all(&v);
     atomic_fetch_add(&g_give_ns, mono_ns() - t0);
+    fb_gone((uintptr_t)mem, (uintptr_t)mem + e.size, 1);
 }
 // The live memory pools (the frame capture's regions, vka_capture.c): at most max of them, the count returned
 int vka_pools(uint64_t *lo, uint64_t *size, int max) {
@@ -1155,5 +1163,169 @@ int vka_mod_off(uint64_t addr, const char **name, uint64_t *off) {
     module_t *m = addr ? module_of((const void *)(uintptr_t)addr) : NULL;
     if (!m) return 0;
     *name = m->name; *off = addr - (uint64_t)(uintptr_t)m->base; return 1;
+}
+// ---------- File-backed pools (DM_MEM_FILEBACK; vka_fileback.h) ----------
+// From Anka Native (EddizEge's MIT fork, v0.2.2; NOTICE.md). DM_MEM_FILEBACK (read once; default 1 with the shader kind, every game; 0 turns it off; the launcher's
+// per-game "RAM saver (uses storage)" sets DM_MEM_FILEBACK_KINDS=shader,texture): a memory pool of the kinds DM_MEM_FILEBACK_KINDS names (default "shader";
+// "shader,texture" adds the large ones) becomes, at
+// nvnMemoryPoolInitialize (hle_nvn.c, after mtl_pool_add), a MAP_SHARED mapping of an unlinked sparse file in TMPDIR (the app's cache folder) instead of private anonymous
+// memory, by the swap the placements use: the range read-only (writers wait in the fault hook and the pre-write hook), the pages that hold data copied into the file's
+// mapping elsewhere, that mapping moved over the range with mremap, the protections put back. Why: a pool the GPU is not given is written once and read rarely on the CPU
+// (the host hashes shader code, vka_tex.c reads texture storage to make its images), and as anonymous memory under pressure it sits in zram, which keeps ~0.6-0.7 of each
+// byte in RAM; as clean file pages the kernel drops it and reads it back from flash when touched. Only pools the GPU has not been given: one placed later (mtl_pool_need)
+// has its pages replaced by the placed map as any pool's (the bytes copied first), and that part of the file is punched out (fb_placed). At nvnMemoryPoolFinalize
+// (mtl_pool_del) what is still the file's goes back to anonymous memory with its bytes (the file's data extents) and the file range is punched; a release of guest memory
+// under it (vka_mem_release) drops it (the host maps fresh pages there next). Kinds: shader = NVN_MEMORY_POOL_FLAGS_SHADER_CODE; texture = any other pool of
+// DM_MEM_FILEBACK_MB (64) MiB or more that is neither virtual, physical nor compressible (a game's large texture pools: each area load writes what it streams into them to
+// flash, so only when chosen). The shader kind needs a shader-code pool that stays unplaced: hle_nvn.c "Shader-code pools" (DM_VK_PLACE_SHADER_POOLS=0, the default)
+// places one only for a command that hands the GPU data in it, not for the program addresses the game takes; with DM_VK_PLACE_SHADER_POOLS=1 its address places it and
+// punches it out of the file at once, so the kind is off then (the copy and the flash writes would be for nothing). Shader code is written once per load and read on the
+// CPU only (keys_hash), so its flash writes are about the game's shader code a boot. A failure
+// leaves the range anonymous with its bytes ([RED] line), never half moved. Logged: each pool moved and given back (the first 8, then every 64th), the MiB moved and read
+// back, the file's blocks on disk, the process's write_bytes since the first move (all of its writes to storage, not only these), the failures
+static pthread_mutex_t g_fbmu = PTHREAD_MUTEX_INITIALIZER;   // the table and the file's size; lock order g_pl, then g_fbmu (never held across a swap)
+static vkfb_tab g_fb; static _Atomic int g_fb_n;            // pieces still mapped from the file (g_fb_n: their count, read without the lock)
+static int g_fb_fd = -2, g_fb_pm = -2, g_fb_err; static uint64_t g_fb_next;
+static struct { uint64_t pools, moved, back, cut, fails, back_fails, gone; int64_t wb0; } g_fbs;
+static int fb_kinds(void) {   // bit 1 shader, bit 2 texture; 0 off
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *e = getenv("DM_MEM_FILEBACK"), *k = getenv("DM_MEM_FILEBACK_KINDS");
+    int on = e && *e ? atoi(e) > 0 : 1; v = 0;   // (default on: the shader kind)
+    if (on) { const char *ks = k && *k ? k : "shader"; v = (strstr(ks, "shader") ? 1 : 0) | (strstr(ks, "texture") ? 2 : 0);
+              if ((v & 1) && !nvn_shader_pools_deferred()) { v &= ~1; VLOG("file-backed pools: shader kind off: DM_VK_PLACE_SHADER_POOLS=1 places shader-code pools for their address"); }
+              if (v) VLOG("file-backed pools (DM_MEM_FILEBACK): %s%s%s (DM_MEM_FILEBACK_KINDS=%s), an unlinked file in %s", v & 1 ? "shader-code pools" : "", v == 3 ? " and " : "",
+                   v & 2 ? "texture pools (large: flash writes at every area load)" : "", ks, getenv("TMPDIR") ? getenv("TMPDIR") : "(no TMPDIR: off)");
+              if (!v && !strstr(ks, "shader") && !strstr(ks, "texture")) VRED("DM_MEM_FILEBACK_KINDS=%s names no kind (shader, texture): file-backed pools stay off", ks); }
+    return v;
+}
+static int64_t proc_write_bytes(void) {   // /proc/self/io write_bytes, -1 unknown
+    FILE *f = fopen("/proc/self/io", "re"); if (!f) return -1;
+    char ln[128]; long long v = -1; while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "write_bytes: %lld", &v) == 1) break;
+    fclose(f); return v;
+}
+static void fb_line(char *b, size_t n) {   // (caller holds g_fbmu) the state for the log lines
+    int64_t d = g_fb_fd >= 0 ? vkfb_disk(g_fb_fd) : -1, wb = proc_write_bytes();
+    snprintf(b, n, "%d pieces, %.1f MiB file-backed; moved %.1f MiB in %llu pools, read back %.1f MiB, %.1f MiB cut by placements or releases; file blocks %.1f MiB (reserved at each move, written or not); process write_bytes %.1f MiB since the first; %llu failures",
+             g_fb.n, vkfb_tab_bytes(&g_fb) / 1048576.0, g_fbs.moved / 1048576.0, (unsigned long long)g_fbs.pools, g_fbs.back / 1048576.0, g_fbs.cut / 1048576.0, d >= 0 ? d / 1048576.0 : -1.0,
+             wb >= 0 && g_fbs.wb0 >= 0 ? (wb - g_fbs.wb0) / 1048576.0 : -1.0, (unsigned long long)(g_fbs.fails + g_fbs.back_fails));
+}
+int dm_gfx_fileback_line(char *b, size_t n) {   // hle_nvn.c shp_report: the totals line (0: no pool was moved and none failed)
+    pthread_mutex_lock(&g_fbmu);
+    int any = g_fbs.pools || g_fbs.fails; if (any) fb_line(b, n);
+    pthread_mutex_unlock(&g_fbmu);
+    return any;
+}
+// The readable runs of a range (vka_fileback.h's copies): 0 = a run is not mapped or the runs were not read (not moved then)
+static int fb_runs(uintptr_t lo, uintptr_t hi, prun *pr, int *npr, vkfb_run *rr, int *nrr) {
+    *npr = prot_runs(lo, hi, pr, MAXRUN); *nrr = 0;
+    if (!prot_known(pr, npr, lo, hi)) return 0;
+    for (int i = 0; i < *npr; i++) if (pr[i].prot & PROT_READ) rr[(*nrr)++] = (vkfb_run){pr[i].lo, pr[i].hi};
+    return 1;
+}
+void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_nvn.c nvnMemoryPoolInitialize, after mtl_pool_add; kind 1 shader code, 2 other
+    int k = fb_kinds(); if (!(k & kind) || !size) return;
+    if (kind == 2) { static int64_t mb = -1; if (mb < 0) { const char *e = getenv("DM_MEM_FILEBACK_MB"); mb = e && *e ? atoll(e) : 64; } if (size < (uint64_t)mb << 20) return; }
+    uintptr_t lo = (uintptr_t)mem, hi = lo + size; const char *what = kind == 1 ? "shader code" : "texture";
+    if ((lo | size) & (VKFB_PG - 1)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("file-backed pools: pool %#lx+%#llx is not page aligned: stays anonymous", (unsigned long)lo, (unsigned long long)size); return; }
+    uint64_t t0 = mono_ns();
+    pthread_mutex_lock(&g_pl);   // no placement over it meanwhile
+    int si = sg_find(hi - 1), placed = si >= 0 && g_sg[si].hi > lo;   // (the last segment starting below hi: segments are disjoint and sorted)
+    pthread_mutex_lock(&g_fbmu);
+    int over = 0; for (int i = 0; i < g_fb.n; i++) over |= g_fb.p[i].lo < hi && lo < g_fb.p[i].hi;
+    if (g_fb_fd == -2) {
+        const char *dir = getenv("TMPDIR"); g_fb_fd = dir && *dir ? vkfb_open(dir, &g_fb_err) : (g_fb_err = ENOENT, -1);
+        g_fb_pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC); g_fbs.wb0 = proc_write_bytes();
+        if (g_fb_fd < 0) VRED("file-backed pools: no unlinked file in TMPDIR %s (%s): pools stay anonymous memory", dir ? dir : "(unset)", strerror(g_fb_err));
+        else VLOG("file-backed pools: unlinked file in %s (descriptor %d)%s", dir, g_fb_fd, g_fb_pm < 0 ? "; /proc/self/pagemap not readable: every readable page of a pool is looked at (zero pages still skipped)" : "");
+    }
+    int64_t off = g_fb_fd < 0 || placed || over ? -1 : vkfb_alloc(g_fb_fd, &g_fb_next, size);
+    pthread_mutex_unlock(&g_fbmu);
+    if (off < 0) {
+        pthread_mutex_unlock(&g_pl);
+        if (g_fb_fd >= 0 && (placed || over)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("file-backed pools: pool %#lx+%#llx (%s) %s: stays as it is", (unsigned long)lo, (unsigned long long)size, what,
+                                                                                     placed ? "is placed memory already" : "overlaps a file-backed piece"); }
+        else if (g_fb_fd >= 0) { g_fbs.fails++; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("file-backed pools: pool %#lx+%#llx (%s): the file did not grow (%s): stays anonymous memory", (unsigned long)lo, (unsigned long long)size, what, strerror((int)-off)); }
+        return;
+    }
+    nvn_dirty_hold(mem, size);   // (as place: the tracker's protections must not change under the swap)
+    prun pr[MAXRUN]; vkfb_run rr[MAXRUN]; int npr, nrr, r = -EFAULT, lost = 0; uint64_t copied = 0;
+    int known = fb_runs(lo, hi, pr, &npr, rr, &nrr), exact = known;
+    if (known) {
+        swap_begin(lo, hi);
+        prot_readonly(pr, npr);   // writers wait in the fault hook from here
+        r = vkfb_to_file(g_fb_fd, (uint64_t)off, lo, size, rr, nrr, g_fb_pm, &copied, &lost);
+        if (lost) plat_mem_name_guest((void *)lo, size);   // (mapped again as anonymous memory from the copy)
+        if (!r || lost) prot_apply(pr, npr);   // the new mapping is read-write: the protections the range had
+        else for (int i = 0; i < npr; i++) sw_mprotect(pr[i].lo, pr[i].hi - pr[i].lo, pr[i].prot);   // not moved: the old pages, their protections back
+        swap_end_ok(exact && !lost);
+        swap_end();
+    }
+    nvn_dirty_unhold();
+    pthread_mutex_unlock(&g_pl);
+    char st[400];
+    pthread_mutex_lock(&g_fbmu);
+    if (!r && !vkfb_tab_add(&g_fb, lo, hi, (uint64_t)off)) r = -ENOMEM;   // (not in the table: it would never go back; a table that cannot grow is a failure, the pool is moved back below)
+    int nlog = 0; if (!r) { g_fbs.pools++; g_fbs.moved += copied; atomic_store(&g_fb_n, g_fb.n); nlog = g_fbs.pools <= 8 || !(g_fbs.pools & 63); } else g_fbs.fails++;
+    if (r && r != -ENOMEM) vkfb_punch(g_fb_fd, (uint64_t)off, size);
+    fb_line(st, sizeof st);
+    pthread_mutex_unlock(&g_fbmu);
+    if (r == -ENOMEM && known) {   // moved, but not recorded: back to anonymous memory now
+        pthread_mutex_lock(&g_pl); swap_begin(lo, hi); prot_readonly(pr, npr); uint64_t c2; int l2;
+        int r2 = vkfb_to_anon(g_fb_fd, (uint64_t)off, lo, size, rr, nrr, &c2, &l2); if (!r2 || l2) plat_mem_name_guest((void *)lo, size); prot_apply(pr, npr); swap_end_ok(0); swap_end(); pthread_mutex_unlock(&g_pl);
+        if (!r2 || l2) { pthread_mutex_lock(&g_fbmu); vkfb_punch(g_fb_fd, (uint64_t)off, size); pthread_mutex_unlock(&g_fbmu); }
+        VRED("file-backed pools: pool %#lx+%#llx (%s): no room in the table: %s", (unsigned long)lo, (unsigned long long)size, what, !r2 || l2 ? "moved back to anonymous memory" : "STAYS FILE-BACKED, not in the table");
+    } else if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8)
+        VRED("file-backed pools: pool %#lx+%#llx (%s) not moved: %s%s; it stays anonymous memory with its bytes. %s", (unsigned long)lo, (unsigned long long)size, what,
+             known ? strerror(-r) : "its protections were not read or a page of it is not mapped", lost ? " (the range was taken down by the failed mremap and mapped again from the copy)" : "", st); }
+    else if (nlog) VLOG("file-backed pools: pool %#lx+%.1f MiB (%s): %.1f MiB of data moved to the file (%.1f ms); %s", (unsigned long)lo, size / 1048576.0, what, copied / 1048576.0, (mono_ns() - t0) / 1e6, st);
+    if (!r) sync_file_range(g_fb_fd, off, (off64_t)size, SYNC_FILE_RANGE_WRITE);   // its dirty pages start to go to flash now (no wait), so they are clean, and droppable, sooner
+}
+// A placement replaced [lo, hi) (caller holds g_pl): file-backed pieces there are no longer mapped; their file ranges are punched (the bytes went into the placed memory)
+static void fb_placed(uintptr_t lo, uintptr_t hi) {
+    if (!atomic_load_explicit(&g_fb_n, memory_order_relaxed)) return;
+    pthread_mutex_lock(&g_fbmu);
+    vkfb_piece cut[16]; int k = vkfb_cut(&g_fb, lo, hi, cut, 16);
+    for (int i = 0; i < k && i < 16; i++) { vkfb_punch(g_fb_fd, cut[i].off, cut[i].hi - cut[i].lo); g_fbs.cut += cut[i].hi - cut[i].lo; }
+    int bad = k < 0 || k > 16; atomic_store(&g_fb_n, g_fb.n);
+    pthread_mutex_unlock(&g_fbmu);
+    if (bad) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("file-backed pools: placement %#lx-%#lx over %d pieces (or the table could not grow): some file ranges are not punched (disk space only)", (unsigned long)lo, (unsigned long)hi, k); }
+    else if (k) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("file-backed pools: placement %#lx-%#lx took %d file-backed piece%s (punched out of the file)", (unsigned long)lo, (unsigned long)hi, k, k == 1 ? "" : "s"); }
+}
+// [lo, hi) finalized (back: its pieces go back to anonymous memory, with their bytes) or released by the host (back 0: dropped, the host maps fresh pages there)
+static void fb_gone(uintptr_t lo, uintptr_t hi, int back) {
+    if (!atomic_load_explicit(&g_fb_n, memory_order_relaxed) || hi <= lo) return;
+    uint64_t t0 = mono_ns();
+    if (back) pthread_mutex_lock(&g_pl);   // (no placement over it meanwhile; a release runs with the range going away)
+    pthread_mutex_lock(&g_fbmu);
+    int cap = g_fb.n + 1; vkfb_piece *cut = malloc((size_t)cap * sizeof *cut);
+    int k = cut ? vkfb_cut(&g_fb, lo, hi, cut, cap) : 0;
+    if (k > cap) k = cap;
+    if (!back) for (int i = 0; i < k; i++) { vkfb_punch(g_fb_fd, cut[i].off, cut[i].hi - cut[i].lo); g_fbs.cut += cut[i].hi - cut[i].lo; }
+    atomic_store(&g_fb_n, g_fb.n);
+    pthread_mutex_unlock(&g_fbmu);
+    uint64_t rb = 0; int failed = 0, lostn = 0;
+    for (int i = 0; back && i < k; i++) {
+        uintptr_t a = cut[i].lo, e = cut[i].hi; prun pr[MAXRUN]; vkfb_run rr[MAXRUN]; int npr, nrr, l = 0, r = -EFAULT; uint64_t c = 0;
+        int known = fb_runs(a, e, pr, &npr, rr, &nrr);
+        if (known) {
+            swap_begin(a, e); prot_readonly(pr, npr);
+            r = vkfb_to_anon(g_fb_fd, cut[i].off, a, e - a, rr, nrr, &c, &l);
+            if (!r || l) plat_mem_name_guest((void *)a, e - a);   // (named as the guest block again, as sw_mmap_fixed does: it merges with its neighbours)
+            if (!r || l) prot_apply(pr, npr); else for (int j = 0; j < npr; j++) sw_mprotect(pr[j].lo, pr[j].hi - pr[j].lo, pr[j].prot);
+            swap_end_ok(!r && !l); swap_end();
+        }
+        pthread_mutex_lock(&g_fbmu);
+        if (!r || l) { vkfb_punch(g_fb_fd, cut[i].off, e - a); rb += c; lostn += l; }
+        else { failed++; vkfb_tab_add(&g_fb, a, e, cut[i].off); atomic_store(&g_fb_n, g_fb.n); }   // still the file's: kept in the table (a later release or this range's next pool finds it)
+        pthread_mutex_unlock(&g_fbmu);
+    }
+    if (back) pthread_mutex_unlock(&g_pl);
+    free(cut);
+    if (!k) return;
+    char st[400]; pthread_mutex_lock(&g_fbmu); g_fbs.back += rb; g_fbs.back_fails += (uint64_t)failed; g_fbs.gone++; uint64_t ng = g_fbs.gone; fb_line(st, sizeof st); pthread_mutex_unlock(&g_fbmu);
+    if (failed) VRED("file-backed pools: %#lx-%#lx: %d of %d pieces did not go back to anonymous memory (a mapping or the protections failed): they stay file-backed with their bytes. %s", (unsigned long)lo, (unsigned long)hi, failed, k, st);
+    else if (ng <= 8 || !(ng & 63) || lostn) VLOG("file-backed pools: %#lx-%#lx %s: %d piece%s, %.1f MiB read back (%.1f ms)%s; %s", (unsigned long)lo, (unsigned long)hi, back ? "finalized, back to anonymous memory" : "released (dropped)",
+                                                  k, k == 1 ? "" : "s", rb / 1048576.0, (mono_ns() - t0) / 1e6, lostn ? " (a failed mremap took a range down: mapped again from the copy)" : "", st);
 }
 #endif

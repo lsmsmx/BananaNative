@@ -122,6 +122,7 @@ int vka_fp_guest(void);
 int vka_ok(void);
 uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal);
+VkResult vka_submit_fence(VkCommandBuffer cb, uint64_t signal, VkFence fence);   // (vka_exec.c: an unsignalled commit's own fence)
 
 // The fence ledger: fence n is "done" once the GPU passed it and its CPU-side effects (events, counters) have run
 uint64_t vka_fence_next(void);                      // reserve the next fence value (submit thread)
@@ -145,6 +146,7 @@ void vka_fence_post(uint64_t fence, void *ops, int n, void (*run)(void *ops, int
 uint64_t vka_done(void);
 void vka_fence_cpu(uint64_t fence, void *ops, int n, void (*run)(void *ops, int n));   // no GPU behind it (no device, a failed submit): the effects run now and fence is done
 int vka_wait_done(uint64_t fence, uint64_t timeout_ns);
+void vka_worker_cpu_wait(uint64_t fence);   // vka_worker.c: a CPU thread is about to block on fence (parked queues that hold it back are released)
 void vka_after(uint64_t fence, void (*fn)(void *), void *arg);   // deferred destruction: fn(arg) once fence is done
 
 // Host-visible scratch memory for one submission (uploads, deswizzled texels, readbacks); valid until the submission's fence
@@ -228,6 +230,7 @@ typedef struct vka_img {
     int refs, inited, gpu_owned, cpu_dirty;
     int is_video;
     uint64_t last_frame;
+    uint64_t pool_frame;     // the last prune that found a live texture pool slot naming it (vka_tex_prune_locked): shaders may read it through the pool, so it is in use
     uint64_t last_fence;
     int no_storage;          // remaking it with storage use was refused (img_storage_upgrade): not tried again
     int holds;               // references taken from outside the recording thread (vka_tex_acquire / vka_tex_ref: the present, frame generation, capture), which read img unlocked: the image is not remade while held (img_storage_upgrade)

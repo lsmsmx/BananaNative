@@ -208,6 +208,13 @@ def optional_keys(g):
     return {l.split('\t')[0] for l in f.read_text().splitlines() if l and not l.startswith('#')} if f.is_file() else set()
 
 
+def absent_optional(g, pkg):
+    """The keys a split's <package>/_absent.tsv lists (split_shaders), when every one is in the profile's shader_optional.tsv; else (none, or a list naming other keys) empty"""
+    f = pkg / '_absent.tsv'
+    keys = {l for l in f.read_text().splitlines() if l} if f.is_file() else set()
+    return keys if keys and keys <= optional_keys(g) else set()
+
+
 def nso_zbic(path):   # whether the module's segments are ZBIC (NSO flag bit 7, system 22.0.0 on), which nso.py needs a decoder for (nso.zbic_decoder)
     b = path.read_bytes()[:0x10]   # read_bytes: a module inside a .nup is a path of its own kind, as in nso_build_id
     return b[:4] == b'NSO0' and bool(int.from_bytes(b[0xc:0x10], 'little') & 0x80)
@@ -432,6 +439,10 @@ def pack_shaders(a, g, work, out, vdir, parts=None):
         print(f'shaders: building the Vulkan library {lib} from {pkg} with {py} (J={a.J}; about 10 minutes on DKB)', flush=True)
         (work / 'android-shaders' / 'work').mkdir(parents=True, exist_ok=True)
         env = child_env(DM_GAME=g.id, J=str(a.J), WORK=str(work / 'android-shaders' / 'work'))
+        if absent := absent_optional(g, pkg):   # a registered build without some of the map's shaders (shader_optional.tsv): the library is built without them
+            print(f'shaders: {len(absent)} of the profile\'s shaders are not in this build of the game (shader_optional.tsv); the library leaves them out '
+                  '(the [RED] "not in the package" line below counts them)', flush=True)
+            env['DMSH_VK_REQUIRE_ALL'] = '0'
         r = subprocess.run([py, str(VK_BUILD_WIN if WINDOWS else VK_BUILD), '--target', 'vulkan', str(pkg), str(cache)], env=env)
         if r.returncode: raise Error(f'vk_android_build.py exit code {r.returncode} (a package that lacks the profile\'s shaders stops it: delete {pkg} and the split runs again)')
         if not library_current(lib, g): raise Error(f'vk_android_build.py finished but {lib} is not a full library of {g.id} with the current inputs')

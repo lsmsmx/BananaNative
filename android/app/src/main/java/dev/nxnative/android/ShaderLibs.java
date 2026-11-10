@@ -290,4 +290,34 @@ final class ShaderLibs {
         }
         return new ArrayList<>(keys);
     }
+
+    /** The profile's keys that a dump of one of its registered builds may lack: column 1 of dm/games/&lt;title ID&gt;/shader_optional.tsv (scripts/pack_android.py optional_keys) */
+    static final String OPTIONAL = "shader_optional.tsv";
+
+    /** The keys of a shader_map.tsv (column 4 of its package rows, as pack_android.py map_keys reads them) */
+    static Set<String> mapKeys(File map) throws IOException {
+        Set<String> keys = new HashSet<>();
+        for (String l : Files.readAllLines(map.toPath(), StandardCharsets.UTF_8)) {
+            String[] c = l.split("\t", 6);
+            if (c.length > 4 && c[0].endsWith(".bin")) keys.add(c[3]);
+        }
+        return keys;
+    }
+
+    /**
+     * The keys of the profile's shader_map.tsv that a split's map (splitMap) lacks, sorted, when the split is the profile's but for keys its {@link #OPTIONAL} names
+     * (a registered build of the game without a few of its shaders: Mario Kart World's 1.8.0 as an update, docs/reference/packing.md "A game with several registered
+     * builds"); null when the split has a key the profile's map does not, lacks one that is not optional, or lacks none. The shaders step then builds the map's other keys.
+     */
+    static List<String> absentOptional(File profile, File splitMap) throws IOException {
+        File opt = new File(profile, OPTIONAL);
+        if (!opt.isFile()) return null;
+        Set<String> want = mapKeys(new File(profile, "shader_map.tsv")), have = mapKeys(splitMap);
+        if (!want.containsAll(have)) return null;
+        Set<String> optional = new HashSet<>();
+        for (String l : Files.readAllLines(opt.toPath(), StandardCharsets.UTF_8)) if (!l.isEmpty() && !l.startsWith("#")) optional.add(l.split("\t", 2)[0]);
+        TreeSet<String> absent = new TreeSet<>(want);
+        absent.removeAll(have);
+        return !absent.isEmpty() && optional.containsAll(absent) ? new ArrayList<>(absent) : null;
+    }
 }

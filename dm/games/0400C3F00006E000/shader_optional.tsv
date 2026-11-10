@@ -1,0 +1,4 @@
+# Keys of shader_map.tsv that a dump of a registered build may lack (scripts/pack_android.py optional_keys, the launcher's ShaderLibs.absentOptional): key <TAB> which dumps have it.
+# 1.8.0 comes two ways with the same main (d00e4f39...): as the base game's own content (version 0, the map's split: 206,326 RomFS files, 11,604 shaders) and as
+# update 917504 over an older base (206,202 files, 11,603 shaders: Forgejo #50's split logs). The update's RomFS lacks this agl compute program; the game cannot ask for it there.
+797e77c2ec4341c5	1.8.0 as version 0 only (agl_common.sharcb in Lib/agl/agl_resource.Nin_Ounce_NVN2.release.sarc, BAHS@0x5c778)

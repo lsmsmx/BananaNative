@@ -22,7 +22,7 @@ import android.widget.TextView;
 /**
  * The in-game panel: slides in from the right over the running game, which goes on behind it. It holds the frame rate cap (Native.fpsCapSet), frame generation
  * (Lsfg.rows, Native.frameGenSet), the Upscaler and the dynamic resolution (GameUpscaler.rows, DrsSlider), the picture (Fit / Stretch, its size and position: GameActivity.picture, TouchControls.positionRows),
- * the overlay's items (Overlay.rows), the on-screen controls' rows (TouchControls.controlRows), the panel's own size and text size (PanelLook), a shortcut to this
+ * the overlay's items (Overlay.rows), which gamepad is Player 1 (PadOrder), the on-screen controls' rows (TouchControls.controlRows), the panel's own size and text size (PanelLook), a shortcut to this
  * game's Button mapping (which applies at the next start) and Stop. Every other change applies at once, without going back to the launcher, and is
  * kept for the next start. Opened by Back (the phone's button or its edge swipe), a long press on the on-screen controls'
  * show / hide button, or a gamepad's Home / guide button (KEYCODE_BUTTON_MODE); closed the same ways, by a tap beside it, or by B on a gamepad, whose D-pad and A move
@@ -45,7 +45,7 @@ final class SidePanel extends FrameLayout {
     }
 
     // The ids of the choices a rebuild gives the focus back to (restyle)
-    private static final int ID_SIZE = 5000, ID_TEXT = 5100, ID_FIT = 5200, ID_MAP = 5300;
+    private static final int ID_SIZE = 5000, ID_TEXT = 5100, ID_FIT = 5200, ID_MAP = 5300, ID_ONE = 5400;
 
     SidePanel(Activity a, Rows rows) {
         super(a);
@@ -215,6 +215,8 @@ final class SidePanel extends FrameLayout {
         head("Overlay");
         Overlay.rows(act, box, null);
 
+        playerOneRow();
+
         head("On-screen controls");
         rows.controls(box);
         // Rumble: the game's vibration on the controller or the phone, this game's setting (Game settings › Rumble), applied at once (GameActivity.rumble)
@@ -316,8 +318,19 @@ final class SidePanel extends FrameLayout {
         if (!(act instanceof GameActivity)) return;
         GameActivity ga = (GameActivity) act;
         head("Next start");
+        String sum = PadMapUi.label(act, game());
+        Button map = row(ID_MAP, "Button mapping", sum);
+        map.setContentDescription("Button mapping: " + sum + ", applies at the next start");
+        map.setOnClickListener(v -> PadMapUi.forGame(act, ga.game(), () -> restyle(ID_MAP)));
+    }
+
+    /**
+     * One compact row: the label, then the value in grey and a chevron. A borderless Button, so that look() gives it the panel's row height and text size and the
+     * D-pad can focus it.
+     */
+    private Button row(int id, String label, String value) {
         Button map = new Button(act);
-        map.setId(ID_MAP);
+        map.setId(id);
         map.setAllCaps(false);
         TypedValue bg = new TypedValue();
         act.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, bg, true);
@@ -332,15 +345,39 @@ final class SidePanel extends FrameLayout {
         map.setMinimumWidth(0);
         int pv = Math.round(4 * getResources().getDisplayMetrics().density);
         map.setPadding(0, pv, 0, pv);
-        String sum = PadMapUi.label(act, game());
-        android.text.SpannableStringBuilder t = new android.text.SpannableStringBuilder("Button mapping  ");
+        android.text.SpannableStringBuilder t = new android.text.SpannableStringBuilder(label + "  ");
         int from = t.length();
-        t.append(sum).append("  ›");
+        t.append(value).append("  ›");
         t.setSpan(new android.text.style.ForegroundColorSpan(Color.LTGRAY), from, t.length(), android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         map.setText(t);
-        map.setContentDescription("Button mapping: " + sum + ", applies at the next start");
-        map.setOnClickListener(v -> PadMapUi.forGame(act, ga.game(), () -> restyle(ID_MAP)));
         box.addView(map, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        return map;
+    }
+
+    /**
+     * Player 1 (PadOrder): the gamepad on player 1, and a choice of the gamepads connected or Automatic (an external controller before a phone's own gamepad-like
+     * device). Applies at once and is kept for every game, by the device's descriptor.
+     */
+    private void playerOneRow() {
+        if (!(act instanceof GameActivity)) return;
+        GameActivity ga = (GameActivity) act;
+        java.util.List<PadOrder.Pad> pads = ga.gamepads();
+        if (pads.isEmpty()) return;
+        head("Controllers");
+        PadOrder.Pad one = ga.playerOne();
+        String chosen = Prefs.padFirst(act);
+        Button b = row(ID_ONE, "Player 1", (one != null ? one.name : "none") + (chosen.isEmpty() ? " (automatic)" : ""));
+        b.setOnClickListener(v -> {
+            String[] names = new String[pads.size() + 1];
+            names[0] = "Automatic";
+            int checked = 0;
+            for (int i = 0; i < pads.size(); i++) { names[i + 1] = pads.get(i).name; if (!chosen.isEmpty() && chosen.equals(pads.get(i).key)) checked = i + 1; }
+            new AlertDialog.Builder(act).setTitle("Player 1").setSingleChoiceItems(names, checked, (d, w) -> {
+                ga.choosePlayerOne(w == 0 ? "" : pads.get(w - 1).key);
+                d.dismiss();
+                restyle(ID_ONE);
+            }).setNegativeButton("Cancel", null).show();
+        });
     }
 
     /** Twice a second while open: what the game runs at, which caps it can hold, and the frame generation's state */

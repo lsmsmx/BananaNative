@@ -1,7 +1,7 @@
 // GPU time by step (DM_VK_GPUPROF=n, live): one frame in every n (n >= 1) gets a GPU timestamp after each full barrier the replay records (vka_barrier) and at the start of
 // each submission and of each part of one (vka_exec.c chunk). Every full barrier waits for all earlier work, so the time between two timestamps is the GPU time of what was
 // recorded between them: one render pass, or the clears / copies / uploads of one op. Once the frame's last submission is done the log gets one "gpu prof" block:
-// the frame's GPU time by kind (passes, transfers, barriers with nothing between them) and the steps that cost most, each with the recording site of the barrier that
+// the frame's GPU time by kind (passes, dispatches, transfers, barriers with nothing between them) and the steps that cost most, each with the recording site of the barrier that
 // ended it (file:line), the draws in it and the pass's attachments. Gaps between submissions and parts (the GPU waiting for recording) are left out.
 // Each step also names what ran in it (vka_gp_note from vka_draw / vka_dispatch): vertex, mesh and compute counts and the most used shaders (geometry key / pixel key,
 // with their draws or workgroups); a "by compute shader" line sums the dispatch steps' time by compute shader key (every dispatch ends in a full barrier: its own step).
@@ -74,16 +74,18 @@ static int by_ms(const void *a, const void *b) { double d = ((const step *)b)->m
 static void report(void) {
     static uint64_t t[NQ];
     if (g_get(V.dev, g_qp, 0, (uint32_t)g_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT)) { VLOG("gpu prof: frame %llu: results not ready", (unsigned long long)g_frame); return; }
-    static step s[NQ]; int ns = 0; double tot = 0, pass = 0, xfer = 0, bare = 0, first = 0; int npass = 0;
+    static step s[NQ]; int ns = 0; double tot = 0, pass = 0, xfer = 0, disp = 0, bare = 0, first = 0; int npass = 0, ndisp = 0;
     for (int i = 1; i < g_n; i++) {
         if (g_m[i].kind == 1 || g_m[i].kind == 2) continue;   // the gap before a submission or part: the GPU waited for recording
         double ms = t[i] > t[i - 1] ? (t[i] - t[i - 1]) * g_tick_ns / 1e6 : 0;
         tot += ms; s[ns++] = (step){i, ms};
-        if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; } else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws) xfer += ms; else bare += ms;
+        // a dispatch counts neither as a draw nor as an op: its step is told by what it recorded (vka_gp_note), or it would be taken for a bare barrier
+        if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; } else if (g_m[i].w.nc) { disp += ms; ndisp++; }
+        else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws) xfer += ms; else bare += ms;
         if (g_m[i - 1].kind == 1) first += ms;
     }
-    VLOG("gpu prof: frame %llu: %d timestamps, %.2f ms GPU: passes %.2f ms (%d), clears / copies / dispatches %.2f ms, steps with nothing recorded (barriers, uploads, writebacks) %.2f ms",
-         (unsigned long long)g_frame, g_n, tot, pass, npass, xfer, bare);
+    VLOG("gpu prof: frame %llu: %d timestamps, %.2f ms GPU: passes %.2f ms (%d), dispatches %.2f ms (%d), clears / copies %.2f ms, steps with nothing recorded (barriers, uploads, writebacks) %.2f ms",
+         (unsigned long long)g_frame, g_n, tot, pass, npass, disp, ndisp, xfer, bare);
     if (VKA_ENV("DM_VK_GPUPROF_LIST", 0))   // every step in order
         for (int k = 0; k < ns; k++) { const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i];
             char ws[200]; what_str(&b->w, ws, sizeof ws);

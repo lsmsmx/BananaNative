@@ -125,6 +125,9 @@ final class Native {
     /** The player a gamepad drives (0..7), -1 when it has none (yet). */
     static native int devicePlayer(int device);
 
+    /** The gamepad becomes player 1 (PadOrder); player 1's device moves to its old player. 0, or -1 (every player taken, or not in this host). */
+    static native int deviceFirst(int device, String name);
+
     /** Rumble (Rumble.java): the listener's onRumble(player, intensity, sharpness) gets every change of a player's vibration; set once, before start. False without rumble in this host. */
     static native boolean setRumbleListener(Object listener);
 

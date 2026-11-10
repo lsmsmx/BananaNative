@@ -50,6 +50,7 @@ static Result write_save(const char *path, const char *s) {           // open ->
     h_fs_SetFileSize(h, (int64_t)strlen(s));
     r = h_fs_WriteFile(h, 0, s, strlen(s), NULL); h_fs_CloseFile(h); return r;
 }
+static int mnt_find(const char *name) { for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) return 1; return 0; }
 static int read_fs(const char *path, char *out, size_t n) { uint64_t h; size_t got = 0; if (h_fs_OpenFile(&h, path, MODE_READ)) return 0; Result r = h_fs_ReadFile(&got, h, 0, out, n - 1); h_fs_CloseFile(h); out[got] = 0; return !r; }
 
 // ---------- NUP container (nup_image.h, android/NUP.md) ----------
@@ -151,6 +152,18 @@ static void nup_tests(const char *root) {
         CHECK(h_fs_QueryAocCache(&cache, 1) == RES_OK && cache > 0x30, "the add-on reports a table size (%zu)", cache);
         CHECK(h_fs_MountAoc("aocn", 1, NULL, 0) == RES_OK && read_fs("aocn:/d.txt", got, sizeof got) && !strcmp(got, "dlc"), "add-on 1 mounts from the addon package whose title ID ends in 001");
         CHECK(h_fs_MountAoc("aocm", 2, NULL, 0) == RES_TARGET_NOT_FOUND, "an index with no link is not found");
+        // Forgejo #30: a link to a .nup that has no add-on of that index (the launcher linked the game's own .nup for a pack's aoc row), a link to nothing and a cut-off
+        // image are not usable (aoc_load leaves them out with a [RED] line), and mounting one anyway answers "target not found" instead of a FATAL
+        CHECK(dm_aoc_usable(1), "add-on 1 in the .nup is usable");
+        snprintf(ln, sizeof ln, "%s/2.nup", aocd); unlink(ln); CHECK(!symlink(np, ln), "link 2.nup to the .nup, which has no add-on 2");
+        CHECK(!dm_aoc_usable(2), "a .nup without that add-on is not usable");
+        CHECK(h_fs_MountAoc("aocx", 2, NULL, 0) == RES_TARGET_NOT_FOUND && !mnt_find("aocx"), "mounting it answers target not found, no FATAL, no mount");
+        snprintf(ln, sizeof ln, "%s/3.nup", aocd); unlink(ln); CHECK(!symlink("/nonexistent/Game.nup", ln), "link 3.nup to nothing");
+        CHECK(!dm_aoc_usable(3) && h_fs_MountAoc("aocy", 3, NULL, 0) == RES_TARGET_NOT_FOUND, "a link to nothing is not usable, and not found");
+        snprintf(ln, sizeof ln, "%s/4.img", aocd); { FILE *f = fopen(ln, "wb"); fwrite("DMROMFS1", 1, 8, f); fclose(f); }
+        CHECK(!dm_aoc_usable(4) && h_fs_MountAoc("aocz", 4, NULL, 0) == RES_TARGET_NOT_FOUND, "a cut-off image is not usable, and its mount is not found");
+        CHECK(h_fs_MountAoc("aocn", 1, NULL, 0) == RES_OK && read_fs("aocn:/d.txt", got, sizeof got) && !strcmp(got, "dlc"), "the readable add-on still reads");
+        for (int i = 2; i <= 4; i++) { snprintf(ln, sizeof ln, "%s/%d.%s", aocd, i, i == 4 ? "img" : "nup"); unlink(ln); }
         unsetenv("DM_AOC_DIR");
     }
     // fd:<n>/<name> in place of the path (a .nup picked with Android's file picker: the launcher's descriptor, nup_image.h nup_fd_spec)

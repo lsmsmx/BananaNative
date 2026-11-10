@@ -23,6 +23,7 @@
 
 #define RES_PATH_NOT_FOUND 0x202u      // fs module 2, description 1
 #define RES_PATH_EXISTS    0x402u      // fs module 2, description 2
+#define RES_TARGET_NOT_FOUND 0x7D402u   // fs module 2, description 1002
 enum { MODE_READ = 1, MODE_WRITE = 2, MODE_APPEND = 4 };
 enum { ENT_DIR = 0, ENT_FILE = 1 };
 enum { DIRMODE_DIR = 1, DIRMODE_FILE = 2 };
@@ -191,7 +192,8 @@ static int img_path(const char *p, int *mi, int64_t *k) {
     }
     return 0;
 }
-static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
+// soft: game files that cannot be opened answer "target not found" with a [RED] line instead of stopping the host (add-on content: the game runs without that DLC)
+static Result mount_ex(const char *name, const char *dir, int ro, int txn, int soft) {
     pthread_once(&g_txn_lock_once, txn_locks_init);
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nmnt; i++)
@@ -240,10 +242,16 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     if (ro && !txn) {   // game files: a RomFS folder, or a RomFS image file in its place
         // A path that is neither is a stale or mistyped one (an old run command still naming the RomFS folder a rebuild replaced with RomFS.img): stop here, not at the game's
         // first failed read (Echoes of Wisdom crashed 0.3 s after nnMain, GitHub issue #615). Add-on content and system data check their own paths before they mount
-        if (nup_is_spec(dir)) { if (!(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s (%s:) cannot be used as a NUP package (the log line above says why)", dir, name); }
-        else if (stat(dir, &ist) || !(S_ISDIR(ist.st_mode) || S_ISREG(ist.st_mode)))
-            die("the game files %s (%s:) are missing: neither a folder nor a RomFS image (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)", dir, name);
-        else if (S_ISREG(ist.st_mode) && !(g_mnt[g_nmnt].img = img_open(dir))) die("the game files %s are not a complete RomFS image", dir);
+        const char *bad = NULL;
+        if (nup_is_spec(dir)) { if (!(g_mnt[g_nmnt].img = img_open(dir))) bad = "cannot be used as a NUP package (the log line above says why)"; }
+        else if (stat(dir, &ist) || !(S_ISDIR(ist.st_mode) || S_ISREG(ist.st_mode))) bad = "are missing: neither a folder nor a RomFS image";
+        else if (S_ISREG(ist.st_mode) && !(g_mnt[g_nmnt].img = img_open(dir))) bad = "are not a complete RomFS image";
+        if (bad && soft) {
+            pthread_mutex_unlock(&g_lock);
+            LOG("[RED] fs mount %s: the files %s %s: answered \"target not found\"", name, dir, bad);
+            return RES_TARGET_NOT_FOUND;
+        }
+        if (bad) die("the game files %s (%s:) %s%s", dir, name, bad, strstr(bad, "missing") ? " (the rom mount is DM_ROMFS, or $DM_ROOT/romfs when DM_ROMFS is unset)" : "");
     }
     g_nmnt++;
     pthread_mutex_unlock(&g_lock);
@@ -252,7 +260,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     LOG("fs mount %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? " (read-only)" : txn ? " (transactional save: work directory, swapped in atomically on Commit)" : "", g_mnt[g_nmnt - 1].overlay[0] ? " (overlay first)" : "");
     return RES_OK;
 }
-static Result mount(const char *name, const char *dir, int ro) { return mount_ex(name, dir, ro, 0); }
+static Result mount(const char *name, const char *dir, int ro) { return mount_ex(name, dir, ro, 0, 0); }
 
 // APFS is case-insensitive by default, Horizon paths are case-sensitive: every component is looked up exactly by guest name.
 // Ordinary host names are unchanged; only when a name collides on the host is a separate physical name chosen, with the guest name stored in an xattr.
@@ -460,7 +468,6 @@ HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", 
 }
 // Add-on content (DLC) RomFS: DM_AOC_DIR/<index>/, extracted from the player's DLC NSPs by the packing script; mounted read-only, using the directory index like rom.
 // The owned index list is reported by the aoc calls in hle_misc.c from the same directory; the game only mounts indices it was given, and a missing directory answers "target not found" (fs 2-1002, as on hardware without that DLC)
-#define RES_TARGET_NOT_FOUND 0x7D402u   // fs module 2, description 1002
 // The cache a Query…CacheSize asks for is, on Horizon, the RomFS's file table as RomFsFileSystem::GetRequiredWorkingMemorySize sizes it: the directory and file hash tables (4 bytes a bucket)
 // and entries (0x18 / 0x20 bytes plus the name, padded to 4). The host reads the files directly and needs no cache, but games take it from heaps sized for the real answer:
 // Mario Kart 8 Deluxe mounts its add-on content (two files) with a cache from its 0x3130-byte AocHeap, and with a 4 KB answer the decryption buffer that follows came back null (main+0x87376c).
@@ -510,6 +517,22 @@ static int aoc_dir(char *dir, size_t n, int index) {
     if (base && *base && snprintf(dir, n, "%s/%d.img", base, index) < (int)n && !stat(dir, &st) && S_ISREG(st.st_mode)) return 1;
     return base && *base && snprintf(dir, n, "%s/%d", base, index) < (int)n && !stat(dir, &st) && S_ISDIR(st.st_mode);
 }
+// Whether add-on content <index> can be mounted: its DM_AOC_DIR entry is there and, for a .nup or a RomFS image, opens as an image (a .nup: an addon package of that
+// index with a RomFS, nup_image.h "aoc/<index>"; an image: complete). hle_misc.c aoc_load reports only these as owned, so a DLC that cannot be read is one [RED] line and
+// the game runs as on hardware without it: a launcher link to a .nup without that add-on stopped the game with a FATAL at its mount (Forgejo #30, docs/reference/packing.md)
+int dm_aoc_usable(int index) {
+    char dir[1024]; struct stat st; const char *base = getenv("DM_AOC_DIR");
+    if (!aoc_dir(dir, sizeof dir, index)) {
+        LOG("[RED] aoc: add-on content %d in DM_AOC_DIR=%s is neither a folder, a RomFS image nor a .nup that is there: the game runs without it", index, base ? base : "unset");
+        return 0;
+    }
+    if (nup_is_spec(dir) || (!stat(dir, &st) && S_ISREG(st.st_mode))) {
+        romfs_img *m = img_open(dir);   // a red line says why when it does not open
+        if (!m) { LOG("[RED] aoc: add-on content %d (%s) cannot be read (the line above says why): the game runs without it", index, dir); return 0; }
+        romfs_image_close(m);
+    }
+    return 1;
+}
 HLE_FORCE("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", "fsp-srv; add-on content reads the host directory directly, the cache is the size of its RomFS file table", Result, h_fs_QueryAocCache, size_t *out, int index) {
     char dir[1024];
     *out = aoc_dir(dir, sizeof dir, index) ? romfs_work_size(dir) : 0x1000;   // an index the host does not have: the earlier minimum; the mount then fails
@@ -521,7 +544,7 @@ HLE_FORCE("_ZN2nn2fs17MountAddOnContentEPKciPvm", "fsp-srv; add-on content → D
         LOG("fs mount add-on content %s: index %d does not exist (DM_AOC_DIR=%s)", name, index, getenv("DM_AOC_DIR") ? getenv("DM_AOC_DIR") : "unset");
         return RES_TARGET_NOT_FOUND;
     }
-    return mount(name, dir, 1);   // mount_ex logs it
+    return mount_ex(name, dir, 1, 0, 1);   // mount_ex logs it; files that no longer open answer "target not found" (soft), never a FATAL
 }
 // System data archives are firmware content, which the host does not have. The one a game has needed so far is 0100000000000802, MiiModel (Mario Kart 8 Deluxe mounts it as MiiResource: and
 // builds Mii heads from it at boot, for the title screen's demo race): the host writes a stand-in with every part empty (hle_mii.c dm_mii_standin) into <DM_TEMP>_sysdata/<id> and mounts it
@@ -625,7 +648,7 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
     save_sync_mount(dd, DM_GAME_ID);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
-    return mount_ex(name, dd, 0, 1);
+    return mount_ex(name, dd, 0, 1, 0);
 }
 // Device save data: one save for the console instead of one per user. Animal Crossing: New Horizons keeps its island there (3.0.3's main mounts no account save data at all); the host
 // has one player, so it is the host save directory with its transaction, as the account save. Its size and extension follow the account save's.
@@ -639,7 +662,7 @@ HLE_FORCE("_ZN2nn2fs19MountDeviceSaveDataEPKc", "fsp-srv; device save data → t
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
     save_sync_mount(dd, DM_GAME_ID);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
     strlcat(dd, "_device", sizeof dd);
-    return mount_ex(name, dd, 0, 1);
+    return mount_ex(name, dd, 0, 1, 0);
 }
 HLE_FORCE("_ZN2nn2fs21GetDeviceSaveDataSizeEPlS1_", "fsp-srv; device save data size: 256 MB data + 256 MB journal", Result, h_fs_DeviceSaveSize, int64_t *size, int64_t *journal) { return h_fs_SaveSize(size, journal, NULL); }
 HLE_FORCE("_ZN2nn2fs20ExtendDeviceSaveDataEll", "fsp-srv; extend device save data: the host directory has no size limit", Result, h_fs_ExtendDeviceSave, int64_t size, int64_t journal) { return h_fs_ExtendSave(NULL, size, journal); }

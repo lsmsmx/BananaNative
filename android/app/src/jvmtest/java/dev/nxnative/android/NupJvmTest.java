@@ -155,6 +155,12 @@ public final class NupJvmTest {
         Pack p = Pack.read(packDir(t, "pack-nodlc", raw.getName() + ":update/458752/romfs", "1	" + raw.getName() + ":addon/" + AOC + "/romfs"));
         check(Nup.open(nodlc).of(Nup.ADDON).isEmpty() && raw.getAbsolutePath().equals(p.aocLinks(nodlc).get("1.nup")), "no add-on in the game's .nup: the row's .nup " + p.aocLinks(nodlc));
         check(p.romfsPath(nodlc).equals(nodlc.getAbsolutePath() + ":update/458752/romfs"), "the game's own RomFS all the same");
+        // Forgejo #30: an aoc row whose add-on neither the game's .nup nor the row's .nup has is no link (the host reported it owned and stopped at its mount), and a line names it
+        for (String row : new String[] {"1\tdlc/" + AOC + "/0/romfs", "1\tGone.nup:addon/" + AOC + "/romfs", "1\t" + nodlc.getName() + ":addon/" + AOC + "/romfs"}) {
+            List<String> skipped = new ArrayList<>();
+            Map<String, String> l = Pack.read(packDir(t, "pack-nodlc2", nodlc.getName() + ":update/458752/romfs", row)).aocLinks(nodlc, skipped);
+            check(l.isEmpty() && skipped.size() == 1 && skipped.get(0).contains("add-on 1") && skipped.get(0).contains("runs without it"), "no add-on anywhere (" + row + "): no link, one line " + l + " " + skipped);
+        }
         folderRows(t);
         dumps(repo, d, t);
         System.out.println("ok " + n);
@@ -410,6 +416,8 @@ public final class NupJvmTest {
         check(p.romfsPath(g).equals(new File(g, "updates/458752/romfs").getPath()) && p.romfsPath(g).equals(p.romfs(g).getPath()), "folder DM_ROMFS " + p.romfsPath(g));
         Map<String, String> l = p.aocLinks(g);
         check(l.size() == 1 && l.get("1").equals(new File(g, "dlc/" + AOC + "/0/romfs").getPath()), "folder aoc links: " + l);
+        List<String> skipped = new ArrayList<>();
+        check(p.aocLinks(g, skipped).equals(l) && skipped.size() == 1 && skipped.get(0).contains("add-on 2"), "a missing DLC folder is a line: " + skipped);
         aocLinkDir(t, l);
         // a pack made from a .nup, used with the folder: the folder's own RomFS (Pack.romfs falls back), no aoc link
         p = Pack.read(packDir(t, "pack-fold2", "game.nup:update/458752/romfs", "1\tgame.nup:addon/" + AOC + "/romfs"));

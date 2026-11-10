@@ -73,6 +73,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_android_imgmem
 	$(B)/t_android_zshare
 	$(B)/t_android_texlimit
+	$(B)/t_android_texown
 	$(B)/t_android_mapbudget
 	$(B)/t_android_pckeep
 	$(B)/t_android_pwlist
@@ -83,6 +84,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_android_gmem
 	$(B)/t_android_fpenv
 	$(B)/t_android_soft
+	$(B)/t_android_qsched
 run: $(B)/t_nro
 run: $(B)/t_pack_modules
 run: $(B)/t_symbols
@@ -365,7 +367,7 @@ coverage:
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
 # The Android host's pure parts (dm/host/android): resampler, channel map, SPS size, MediaCodec picture layouts; gamepad / touch / sensor mapping
-run: $(B)/t_android_av $(B)/t_android_input $(B)/t_android_shlib $(B)/t_android_spvpatch $(B)/t_android_imgmem $(B)/t_android_zshare $(B)/t_android_texlimit $(B)/t_android_mapbudget $(B)/t_android_pckeep $(B)/t_android_pwlist $(B)/t_android_fmtlist $(B)/t_android_place $(B)/t_android_ovl $(B)/t_android_pace $(B)/t_android_gmem $(B)/t_android_fpenv $(B)/t_android_soft
+run: $(B)/t_android_av $(B)/t_android_input $(B)/t_android_shlib $(B)/t_android_spvpatch $(B)/t_android_imgmem $(B)/t_android_zshare $(B)/t_android_texlimit $(B)/t_android_mapbudget $(B)/t_android_pckeep $(B)/t_android_pwlist $(B)/t_android_fmtlist $(B)/t_android_place $(B)/t_android_ovl $(B)/t_android_pace $(B)/t_android_gmem $(B)/t_android_fpenv $(B)/t_android_soft $(B)/t_android_qsched $(B)/t_android_texown
 $(B)/t_android_av: t_android_av.c ../android/av_android.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. $(WEAK_HOST) -o $@ t_android_av.c
 $(B)/t_android_input: t_android_input.c ../android/input_map.c ../android/input_map.h ../../gfx/vk_android/vka_present_fit.h ../motion_fusion.h ../dm_input.h | $(B)
@@ -385,6 +387,8 @@ $(B)/t_android_zshare: t_android_zshare.c $(VKA)/vka_zshare.h | $(B)
 # The texture cache's limit and eviction order (vka_texlimit.h; vka_tex.c vka_tex_prune_locked)
 $(B)/t_android_texlimit: t_android_texlimit.c $(VKA)/vka_texlimit.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_texlimit.c
+$(B)/t_android_texown: t_android_texown.c $(VKA)/vka_texown.h ../../gfx/nvn/nvn_hmap.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_texown.c
 # The memory maps budget: the dirty tracker's block size by share of vm.max_map_count, compaction's picks, the lines of /proc/self/maps (vka_mapbudget.h; vka_mem.c maps_tick)
 $(B)/t_android_mapbudget: t_android_mapbudget.c $(VKA)/vka_mapbudget.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_mapbudget.c
@@ -400,6 +404,16 @@ $(B)/t_android_fmtlist: t_android_fmtlist.c $(VKA)/vka_fmtlist.h | $(B)
 # Large memory pools placed by parts: the range arithmetic (vka_place.h; vka_mem.c mtl_pool_need)
 $(B)/t_android_place: t_android_place.c $(VKA)/vka_place.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_place.c
+# File-backed pools (vka_fileback.h; vka_mem.c "File-backed pools", DM_MEM_FILEBACK). Linux only (mremap, O_TMPFILE, SEEK_DATA, fallocate; the file in TMPDIR, made and
+# removed by the test): make fileback, in `run` on a Linux host. From Anka Native (MIT, EddizEge; NOTICE.md)
+.PHONY: fileback
+fileback: $(B)/t_android_fileback
+	TMPDIR="$(abspath $(B))" $(B)/t_android_fileback
+ifeq ($(shell uname -s),Linux)
+run: fileback
+endif
+$(B)/t_android_fileback: t_android_fileback.c $(VKA)/vka_fileback.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_fileback.c -lpthread
 # The launcher's overlay drawn into the swapchain image: where each block goes for every preTransform and corner (vka_ovl.h; vka_present.c ovl_draw)
 $(B)/t_android_ovl: t_android_ovl.c $(VKA)/vka_ovl.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_ovl.c
@@ -411,6 +425,9 @@ $(B)/t_android_pace: t_android_pace.c $(VKA)/vka_pace.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_pace.c -lm
 $(B)/t_android_fpenv: t_android_fpenv.c $(VKA)/vka_fpenv.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_fpenv.c
+# GPU waits across NVN queues on the Android replay (dm/gfx/vk_android/vka_qsched.h): parks, producers, the SDK's predicates, syncs, timeline signals, safety valves
+$(B)/t_android_qsched: t_android_qsched.c $(VKA)/vka_qsched.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_qsched.c
 
 # Soft textures and images that start at a finer texture level (vka_soft.h; vka_tex.c "Soft textures", sparse_base): candidates, level and view mapping, the whole-storage set
 $(B)/t_android_soft: t_android_soft.c $(VKA)/vka_soft.h | $(B)

@@ -306,7 +306,20 @@ int vka_init(void) {
 }
 int vka_ok(void) { return __atomic_load_n(&g_state, __ATOMIC_ACQUIRE) > 0; }
 
+static VkResult submit_x(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal, VkFence fence);
+// Every vka_submit's time waiting for the queue's lock and in the driver's vkQueueSubmit, and the calls (cumulative; the pace cost line, vka_perf.c)
+static _Atomic uint64_t g_qs_lock_ns, g_qs_call_ns, g_qs_n;
+void vka_submit_stats(uint64_t *lock_ns, uint64_t *call_ns, uint64_t *n) { *lock_ns = g_qs_lock_ns; *call_ns = g_qs_call_ns; *n = g_qs_n; }
+// Who else holds the queue lock, and for how long (the pace cost line): the present's submission and vkQueuePresentKHR, and the GPU clock floor
+static _Atomic uint64_t g_qh_ns[4];
+void vka_qhold_add(int k, uint64_t ns) { g_qh_ns[k & 3] += ns; }
+void vka_qhold_stats(uint64_t *v) { for (int i = 0; i < 4; i++) v[i] = g_qh_ns[i]; }
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal) {
+    return submit_x(cb, signal, nwait, wait, wait_vals, stages, bin_signal, VK_NULL_HANDLE);
+}
+// A submission with a fence of its own (vka_exec.c: a commit no timeline value signals yet, whose command buffer slot is reused once that fence is reached)
+VkResult vka_submit_fence(VkCommandBuffer cb, uint64_t signal, VkFence fence) { return submit_x(cb, signal, 0, NULL, NULL, NULL, VK_NULL_HANDLE, fence); }
+static VkResult submit_x(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal, VkFence fence) {
     VkSemaphore sig[2]; uint64_t sv[2]; uint32_t ns = 0;
     if (signal) { sig[ns] = V.tl; sv[ns++] = signal; }
     if (bin_signal) { sig[ns] = bin_signal; sv[ns++] = 0; }
@@ -314,12 +327,15 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
     VkSemaphore ws[9]; uint64_t wv[9]; VkPipelineStageFlags wst[9];
     if (nwait > 8) { VRED_ONCE("vka_submit: %u waits, at most 8 taken: the rest are dropped", nwait); nwait = 8; }
     for (uint32_t i = 0; i < nwait; i++) { ws[i] = wait[i]; wv[i] = wait_vals[i]; wst[i] = stages[i]; }
+    uint64_t t0 = now_ns();
     pthread_mutex_lock(&V.qmu);
+    uint64_t t1 = now_ns();
     vks_queue_locked(&nwait, ws, wv, wst);
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = nwait, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = ns, .pSignalSemaphoreValues = sv};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = nwait, .pWaitSemaphores = ws, .pWaitDstStageMask = wst,
                        .commandBufferCount = cb ? 1 : 0, .pCommandBuffers = &cb, .signalSemaphoreCount = ns, .pSignalSemaphores = sig};
-    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE);
+    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, fence);
+    g_qs_lock_ns += t1 - t0; g_qs_call_ns += now_ns() - t1; g_qs_n++;
     if (!r && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&V.qmu);
     return r;
@@ -368,6 +384,7 @@ uint64_t vka_done(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
 int vka_wait_done(uint64_t fence, uint64_t timeout_ns) {
     if (vka_done() >= fence) return 1;
     if (!timeout_ns) return 0;
+    vka_worker_cpu_wait(fence);   // a queue the replay parked at a GPU wait (vka_qsched.h) goes on now if it holds this fence back
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
     dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
@@ -405,6 +422,19 @@ static void hang_declare(uint64_t want, uint64_t at, double s, const char *what)
     pthread_t th; if (!pthread_create(&th, NULL, hang_exit_main, NULL)) pthread_detach(th);
 }
 
+// A host wait for the timeline. Test switch DM_VK_TL_POLL=1 (live): it reads the counter every 0.25 ms instead of blocking in vkWaitSemaphores (does a driver's
+// blocking wait hold its submissions back? Turnip v32 on KGSL, Ocarina of Time's note)
+VkResult vka_tl_wait(VkSemaphore s, uint64_t v, uint64_t timeout_ns) {
+    if (!VKA_ENV("DM_VK_TL_POLL", 0)) { VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &s, .pValues = &v}; return vk.vkWaitSemaphores(V.dev, &wi, timeout_ns); }
+    uint64_t end = now_ns() + timeout_ns;
+    for (;;) {
+        uint64_t c = 0; VkResult r = vk.vkGetSemaphoreCounterValue(V.dev, s, &c);
+        if (r) return r;
+        if (c >= v) return VK_SUCCESS;
+        if (now_ns() >= end) return VK_TIMEOUT;
+        struct timespec ts = {0, 250000}; nanosleep(&ts, NULL);
+    }
+}
 static void *completion_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-complete"); vka_fp_host("vk-complete"); void vka_perf_thread(int nice); vka_perf_thread(-8);   // vka_perf.c
     uint64_t stall_t0 = 0, stall_at = 0; int stall_logged = 0;
@@ -417,8 +447,7 @@ static void *completion_main(void *arg) {
         uint64_t sub = g_submitted, done = g_done, want = VKA_ENV("DM_VK_DONE_LAST", 0) ? sub : done + 1; pthread_mutex_unlock(&g_fmu);
         uint64_t v = 0;
         if (!vka_hung()) {
-            VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &V.tl, .pValues = &want};
-            VkResult r = vk.vkWaitSemaphores(V.dev, &wi, 500000000ull);
+            VkResult r = vka_tl_wait(V.tl, want, 500000000ull);
             vk.vkGetSemaphoreCounterValue(V.dev, V.tl, &v);
             uint64_t t = now_ns();
             if (r == VK_TIMEOUT && v <= done) {   // no progress in this wait
@@ -799,7 +828,7 @@ const char *vka_floor_state(int *pct, int *res) {
 static void floor_set_(int s, int tail, int again) {   // again: send it even if unchanged (the KGSL rule, see kg_apply)
     static _Atomic int cur = -1;
     if (!tail && !again && atomic_load(&cur) == s) return;
-    pthread_mutex_lock(&V.qmu);
+    pthread_mutex_lock(&V.qmu); uint64_t th = now_ns();
     if (tail) s = atomic_load(&g_tail_n) > 0 ? s : 0;
     if (!again && atomic_load(&cur) == s) { pthread_mutex_unlock(&V.qmu); return; }
     VkResult r;
@@ -808,6 +837,7 @@ static void floor_set_(int s, int tail, int again) {   // again: send it even if
         r = ((VkResult (*)(VkQueue, const void *))V.perf_hint)(V.q, &h);
     } else r = kg_apply(s);
     int was = atomic_exchange(&cur, s); atomic_store(&g_floor_cur, s); atomic_store(&g_floor_res, (int)r);
+    vka_qhold_add(2, now_ns() - th);
     pthread_mutex_unlock(&V.qmu);
     if (was < 0 || (was != s && VKA_ENV("DM_VK_GPU_FLOOR_LOG", 0) > 1)) VLOG("GPU clock floor%s: %d %% (%s): %d", V.perf_hint ? "" : " (KGSL)", s, s >= 100 ? "highest" : s ? "scaled" : "default governor", r);
 }

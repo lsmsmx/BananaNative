@@ -57,6 +57,10 @@ final class GameSettings {
         Ui.Setting pso = new Ui.Setting(a, "🧵", "Background pipelines", null).toggle(a, Prefs.psoAsync(a, id), (b, on) -> Prefs.psoAsync(a, id, on));
         pso.value("New pipelines are made in the background: a short pop-in instead of a stutter the first time something is drawn");
         Ui.add(box, pso.view, 0);
+        Ui.Setting ram = new Ui.Setting(a, "💾", "RAM saver (uses storage)", null).toggle(a, Prefs.ramSaver(a, id), (b, on) -> Prefs.ramSaver(a, id, on));
+        ram.value("Keeps the game's large texture data in a file instead of compressed RAM: more free RAM where the phone runs short, but each area load writes "
+                + "that data to storage (up to a few GB) and needs that much free space. Off: as before");
+        Ui.add(box, ram.view, 0);
         Ui.Setting ret = new Ui.Setting(a, "⏸️", "Pause on return", null).toggle(a, Prefs.pauseOnReturn(a, id), (b, on) -> Prefs.pauseOnReturn(a, id, on));
         ret.value("Coming back from the background, the game waits paused for a tap");
         Ui.add(box, ret.view, 0);

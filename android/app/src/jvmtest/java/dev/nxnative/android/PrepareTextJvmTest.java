@@ -50,6 +50,28 @@ public final class PrepareTextJvmTest {
         plain(f.text, "any other stop");
         check(f.fix.equals(PrepareText.FIX_RETRY) && f.text.startsWith("Rewriting the game code stopped.") && f.detail.endsWith("Log: " + log), "any other stop: Retry, Details has the log: " + f.detail);
 
+        // A tool that stops on an uncaught exception: the card had "Finding the shaders: exit code 1" and no reason (a player's split of Ocarina of Time from a .nup).
+        // The runner's [RED] line (dm_pack.c) is the reason; without one, the traceback's last line; an earlier red line gives way to a later traceback
+        String[] traced = {"targeted split: 1,442 of 186,583 RomFS files hold the shaders", "[RED] /Shader/a.bfsha: bad header (its shaders are left out)",
+                "progress: 16/1442", "Traceback (most recent call last):", "File \"/x/repo/dm/gfx/tools/shader_split.py\", line 3150, in main",
+                "want, why = profile_files(files, main_v)", "~~~~~~~~~~~~~^^^^^^^^^^^^^^^^", "raise KeyError(s)", "KeyError: 'Shader/b.bfsha'"};
+        PrepareText.StopReason sr = new PrepareText.StopReason();
+        for (String l : traced) sr.line(l);
+        check("KeyError: 'Shader/b.bfsha'".equals(sr.reason), "the traceback's last line, after an earlier red line: " + sr.reason);
+        sr.line("[RED] KeyError: 'Shader/b.bfsha' (shader_split.py:3150)");
+        check("[RED] KeyError: 'Shader/b.bfsha' (shader_split.py:3150)".equals(sr.reason), "the runner's red line: " + sr.reason);
+        f = PrepareText.toolStopped("Finding the shaders", 1, sr.reason, log);
+        plain(f.text, "an uncaught exception");
+        check(f.fix.equals(PrepareText.FIX_RETRY) && f.detail.startsWith("Finding the shaders: exit code 1\nKeyError: 'Shader/b.bfsha' (shader_split.py:3150)\nLog: "), "its reason in Details: " + f.detail);
+        sr = new PrepareText.StopReason();
+        for (String l : new String[] {"Traceback (most recent call last):", "File \"t.py\", line 1, in <module>", "MemoryError"}) sr.line(l);
+        f = PrepareText.toolStopped("Finding the shaders", 1, sr.reason, log);
+        check(f.text.contains("ran out of memory"), "a MemoryError traceback: the memory text: " + f.text);
+        sr = new PrepareText.StopReason();
+        for (String l : new String[] {"KeyError: 'x'", "shaders: 42848 (compute 4125)", "SystemExit"}) sr.line(l);
+        check(sr.reason == null, "no traceback, no reason: " + sr.reason);
+        check(sr.line("[RED] the dump has no RomFS") && !sr.line("progress: 1/2"), "red lines are said so (the Tail's missing-shader count)");
+
         f = PrepareText.crashed("Translating shaders", "java.io.IOException: /data/user/0/x: EACCES");
         plain(f.text, "an exception");
         check(f.detail.contains("EACCES") && f.fix.equals(PrepareText.FIX_RETRY), "the exception in Details");

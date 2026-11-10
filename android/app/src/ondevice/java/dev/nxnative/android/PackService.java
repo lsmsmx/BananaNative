@@ -320,6 +320,8 @@ public final class PackService extends Service {
                 Job.deleteTree(new File(j.dir(), "xlate"));
                 Job.deleteTree(new File(j.dir(), "lib"));
             }
+            ranNow.clear();
+            dropMissing(j, "before it goes on");
             j.state("running", null, null);
             save(j, true);
             int i;
@@ -351,6 +353,8 @@ public final class PackService extends Service {
                     break;
                 }
                 j.stepState(s, "done");
+                ranNow.add(s);
+                if (s.equals("rewrite")) j.codeModules(Outputs.codeModules(j.pack()));   // what the pack step and a later check of this step look for
                 save(j, true);
                 if (s.equals("split")) Job.deleteTree(j.splitScan(this));   // recorded done: the scan results are no longer needed
             }
@@ -447,6 +451,7 @@ public final class PackService extends Service {
         String tool;
         String[] argv;
         List<String> selected = null;
+        String keysFrom = ShaderLibs.SELECTED;   // where the shaders step's key list comes from, for its log line
         // The tools' arguments: the in-process forms (pack_android.py --in-process: the rewriter in the same Python; shader_split.py with J=1 below: no process pool;
         // vk_android_build.py with the translator and the validator as libraries, XLATE / SPIRV_VAL below; the app's process must not fork, ONDEVICE.md "No subprocesses").
         // The split is resumable by RomFS file: its scan results are kept in the app's own storage (Job.splitScan, DM_SPLIT_RESUME, shader_split.py ScanCache) and a rerun scans only the files
@@ -482,6 +487,14 @@ public final class PackService extends Service {
                 argv = new String[] {"--target", "vulkan", new File(split, "pkg").getPath(), lib.getPath()};
                 // a profile with a selected set (shader_seen.tsv): only its keys, with their paired pixel shaders, as the Mac's selected build (android/SHADERS.md "Selected shaders")
                 selected = selection(j);
+                // a split without some of the profile's optional shaders (shader_optional.tsv, splitMatchesProfile): the key list is the map's (or the selection's) other
+                // keys, so vk_android_build.py with DMSH_VK_REQUIRE_ALL=1 neither stops on them nor passes a shader that did not build
+                List<String> absent = j.tryAnyway() || engine.simulated() ? null : ShaderLibs.absentOptional(new File(PackNative.repo(), "dm/games/" + j.titleId()), new File(split, "shader_map.tsv"));
+                if (absent != null) {
+                    if (selected == null) selected = new java.util.ArrayList<>(new java.util.TreeSet<>(ShaderLibs.mapKeys(new File(PackNative.repo(), "dm/games/" + j.titleId() + "/shader_map.tsv"))));
+                    selected.removeAll(absent);
+                    keysFrom = "shader_map.tsv without " + absent.size() + " of " + ShaderLibs.OPTIONAL;
+                }
                 if (selected != null && selected.isEmpty()) return "the profile's " + ShaderLibs.SELECTED + " names none of the shaders of its shader_map.tsv";
                 // a split that kept the code of another selection (DM_SPLIT_SELECTED below; an older app's set): split again
                 if (!splitHolds(split, selected)) {
@@ -496,11 +509,23 @@ public final class PackService extends Service {
                 }
                 break;
             }
-            case "pack":
+            case "pack": {
+                // the code and the library it takes may have gone since their steps were recorded done (the pack folder went with an uninstalled app, BananaNative
+                // issue #3): those steps run again first, instead of pack_android.py --keep-code stopping at a missing module
+                List<String> gone = dropMissing(j, "before the pack step");
+                if (!gone.isEmpty()) {
+                    for (String g : gone) if (ranNow.contains(g)) {   // made in this very run and gone already: something else deletes it, a rerun would loop
+                        String why = "the " + g + " step's outputs are gone right after it finished (pack folder " + pack + ")";
+                        failure = new PrepareText.Failure("The app's files for " + j.name() + " went missing while it prepared the game. Tap Retry.", why, PrepareText.FIX_RETRY);
+                        return why;
+                    }
+                    return "interrupted";   // work() sets this step pending and goes on with the first step not done
+                }
                 tool = "scripts/pack_android.py";
                 argv = new String[] {dump.getPath(), "--version", v, "--out", pack.getPath(), "--shader-cache", j.shaderCache().getPath(), "--keep-code", "-j", "1", "--in-process",
                         "--made-by", "app " + BuildConfig.VERSION_NAME};   // the pack's own marker: the launcher updates its code by itself when only the tools change (Ondevice.ownPack)
                 break;
+            }
             default:
                 return "unknown step " + s;
         }
@@ -509,7 +534,7 @@ public final class PackService extends Service {
         File log = new File(logs, s + ".log");
         String head = "== " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT).format(new Date()) + " " + Prefs.buildTag(this) + ", engine " + BuildConfig.NX_PACK_ENGINE + ": "
                 + tool + " " + (selected == null ? String.join(" ", argv)
-                        : String.join(" ", java.util.Arrays.copyOf(argv, argv.length - selected.size())) + " <" + selected.size() + " keys of " + ShaderLibs.SELECTED + ">") + "\n";
+                        : String.join(" ", java.util.Arrays.copyOf(argv, argv.length - selected.size())) + " <" + selected.size() + " keys of " + keysFrom + ">") + "\n";
         Files.write(log.toPath(), head.getBytes(StandardCharsets.UTF_8), java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
         if (s.equals("shaders")) {   // a failed shader's kept result would fail every Retry the same way: those shaders are translated again (ShaderResults)
             List<ShaderResults.Failed> again = ShaderResults.dropFailed(xlate);
@@ -579,8 +604,9 @@ public final class PackService extends Service {
         Log.i(TAG, s + ": exit " + code);
         if (code == PackEngine.INTERRUPTED) return "interrupted";
         if (code != 0) {
-            failure = PrepareText.toolStopped(Job.STEP_TEXT[i], code, tail.lastRed, log.getPath());
-            return s + " stopped with code " + code + (tail.lastRed != null ? ": " + tail.lastRed : "") + " (log: " + log + ")";
+            String why = tail.reason();   // the last [RED] line, or a traceback's last line after it (PrepareText.StopReason)
+            failure = PrepareText.toolStopped(Job.STEP_TEXT[i], code, why, log.getPath());
+            return s + " stopped with code " + code + (why != null ? ": " + why.replaceFirst("^\\[RED\\] ", "") : "") + " (log: " + log + ")";
         }
         if (s.equals("split")) {
             Outputs.finish(split);   // every output synced, then the marker: a reboot after the step is recorded done cannot leave cut tables accepted in split/
@@ -589,6 +615,24 @@ public final class PackService extends Service {
         long t = j.stepTotal(i);
         j.stepProgress(s, t > 0 ? t : 1, t > 0 ? t : 1, "");
         return null;
+    }
+
+    /** The steps that finished in this run of the job (work()): a step whose outputs are already gone again is not run a third time */
+    private final java.util.Set<String> ranNow = new java.util.HashSet<>();
+
+    /** Job.dropMissing with a line in the step's log for each step that runs again; → those steps */
+    private List<String> dropMissing(Job j, String when) {
+        File cache = j.shaderCache();   // before the check: a library the pack held that went is no longer the job's
+        List<String> gone = j.dropMissing();
+        if (!gone.isEmpty()) {
+            stepLog(j, "outputs missing " + when + ": " + String.join(", ", gone) + " recorded done, but "
+                    + (gone.contains("rewrite") ? "the pack folder " + j.pack() + " has no complete " + String.join(", ", j.codeModules()) + " (patched.bin and its key)" : "")
+                    + (gone.contains("rewrite") && gone.contains("shaders") ? " and " : "")
+                    + (gone.contains("shaders") ? "no shader library v-" + BuildConfig.NX_DMSH_VK_CHAIN + " in " + cache : "")
+                    + ": running " + (gone.size() == 1 ? "it" : "them") + " again (finished shader results are kept)");
+            save(j, true);
+        }
+        return gone;
     }
 
     /** The profile's selected shader keys (ShaderLibs.selection), null when it has no selected set (or the engine is simulated: no repository) */
@@ -623,6 +667,7 @@ public final class PackService extends Service {
         try {
             File want = new File(PackNative.repo(), "dm/games/" + j.titleId() + "/shader_map.tsv");
             if (java.util.Arrays.equals(Files.readAllBytes(want.toPath()), Files.readAllBytes(have.toPath()))) return null;
+            if (ShaderLibs.absentOptional(want.getParentFile(), have) != null) return null;   // a registered build that lacks only the profile's optional shaders (the shaders step leaves them out)
         } catch (IOException | RuntimeException | UnsatisfiedLinkError e) {
             // the app's own list is missing (work() refuses a game this APK does not include, so this is an app built without the profile's tables) or the split's
             String why = "cannot compare the dump's shaders with the app's list: " + e.getMessage();
@@ -689,7 +734,7 @@ public final class PackService extends Service {
         }
     }
 
-    /** Reads the step's log as it grows: progress lines into the job, the last [RED] line for a failure's message */
+    /** Reads the step's log as it grows: progress lines into the job, the reason for a failure's message (the last [RED] line, or a traceback's: PrepareText.StopReason) */
     private final class Tail extends Thread {
         private final Job j;
         private final String step;
@@ -697,7 +742,7 @@ public final class PackService extends Service {
         private volatile boolean done;
         private long pos;
         private final StringBuilder partial = new StringBuilder();
-        volatile String lastRed;
+        private final PrepareText.StopReason stop = new PrepareText.StopReason();
 
         Tail(Job j, String step, File log) {
             super("nxpack-tail");
@@ -745,14 +790,16 @@ public final class PackService extends Service {
                 if (m.find()) {
                     j.stepProgress(step, Long.parseLong(m.group(1)), Long.parseLong(m.group(2)), m.group(3));
                     changed = true;
-                } else if (line.startsWith("[RED] ")) {
-                    lastRed = line.substring(6);
+                } else if (stop.line(line)) {
                     long[] miss = PrepareText.missingShaders(line);   // Try anyway: shaders this game version lacks, said once the game is ready (Ondevice.addGame)
                     if (miss != null) { j.shadersMissing(miss[0], miss[1]); changed = true; }
                 }
             }
             if (changed) save(j, false);
         }
+
+        /** Why the step stopped, read once the tool is done (finish): null when its log gave no reason */
+        String reason() { return stop.reason; }
     }
 
     // ---- State out: job.json, the notification, the launcher ----

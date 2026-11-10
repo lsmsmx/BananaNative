@@ -88,6 +88,26 @@ class SplitAbsent(unittest.TestCase):
         with self.assertRaises(pa.Error) as e: self.run_split(['k1'], ['k3'])
         self.assertIn('lack 1 of the 3', str(e.exception))
 
+    def test_absent_optional(self):
+        """pack_shaders builds the library without the keys of _absent.tsv only when the profile's shader_optional.tsv names every one"""
+        pkg = self.run_split(['k1', 'k2'], ['k3'])
+        g = Profile('main', {}); g.dir = pkg.parent / 'profile'
+        self.assertEqual(pa.absent_optional(g, pkg), {'k3'})
+        (pkg / '_absent.tsv').write_text('k2\nk3\n')
+        self.assertEqual(pa.absent_optional(g, pkg), set(), 'k2 is not optional')
+        (pkg / '_absent.tsv').unlink()
+        self.assertEqual(pa.absent_optional(g, pkg), set())
+
+
+class MarioKartWorldOptional(unittest.TestCase):
+    """Mario Kart World 1.8.0 as update 917504 (Forgejo #50): its split lacks only the profile's optional key, which the profile's map has"""
+
+    def test_profile(self):
+        d = REPO / 'dm/games/0400C3F00006E000'
+        g = Profile('main', {}); g.dir = d
+        self.assertEqual(pa.optional_keys(g), {'797e77c2ec4341c5'})
+        self.assertLessEqual(pa.optional_keys(g), pa.map_keys(d / 'shader_map.tsv'))
+
 
 if __name__ == '__main__':
     unittest.main()
