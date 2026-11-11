@@ -463,6 +463,13 @@ int vka_shader_fout_retyped(vka_shader *s, uint32_t umask, uint32_t smask);   //
 VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t smask);   // the base module with those float inputs as uvec4 / ivec4 (vka_spv_vin_retype), made once per masks   // the module of that variant (DMSH_VK_MOD_*), made on first use; VK_NULL_HANDLE = the entry has none   // the shader of key in library L (the game's, or the selftest's own); NULL = not there or refused
 int vka_shlib_check_all(const vka_shlib *L);   // every module and compute pipeline of L made (DM_VK_SHLIB_CHECK=1): the failures
 int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out);   // host-visible memory for the process's life (c1 bytes, the support and zero buffers)
+// ---------- Descriptor buffers (VK_EXT_descriptor_buffer, DM_VK_DESC_BUF=1; vka_dev.c) ----------
+int vka_db_ready(void);
+void vka_db_start(unsigned slot);                    // a submission begins on its ring slot (waits for the slot's previous submission)
+void vka_db_set_fence(uint64_t fence);               // the fence the submission being recorded will signal
+VkDeviceSize vka_db_alloc(VkDeviceSize n);            // an offset in the slot's region; UINT64_MAX = full
+void vka_db_bind(VkCommandBuffer cb);                // vkCmdBindDescriptorBuffersEXT, once per command buffer
+VkDeviceAddress vka_db_buffer_address(VkBuffer b);    // cached vkGetBufferDeviceAddress (the buffer descriptors name one)
 
 // ---------- Pipelines (vka_pso.c) ----------
 #include "vka_gkey.h"   // vka_gkey: what a graphics pipeline is made from beyond its shaders and layout (Vulkan-free: the prewarm list's unit test reads it)

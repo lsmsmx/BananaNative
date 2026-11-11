@@ -800,15 +800,72 @@ static uint64_t up_done(void) {   // the upload timeline's value (every batch co
     uint64_t v = 0; if (g_utl) vk.vkGetSemaphoreCounterValue(V.dev, g_utl, &v); return v;
 }
 static int sblk_idle(const sblk *b, uint64_t done, uint64_t udone) { return b->fence <= (b->up ? udone : done); }
+// ---------- Descriptor buffers (VK_EXT_descriptor_buffer, DM_VK_DESC_BUF=1) ----------
+// One host-visible buffer, one region per submission slot of the replay's ring (vka_exec.c): a submission's descriptors are read by the GPU until
+// its fence, so a region is written again only after the fence its slot's last submission carried (vka_db_start waits for it). The descriptors are
+// plain words in it, made with vkGetDescriptorEXT (vka_draw.c bind_sets). Nothing here runs unless V.db.
+enum { DB_REGION = 1 << 20, DB_SLOTS = 8 };
+static VkBuffer g_dbb; static VkDeviceMemory g_dbm; static void *g_dbp; static VkDeviceAddress g_dba;
+static unsigned g_dbslot; static VkDeviceSize g_dbcur; static int g_dbstate; static uint64_t g_dbfence[DB_SLOTS];
+static int db_ready(void) {
+    if (g_dbstate) return g_dbstate > 0;
+    g_dbstate = -1;
+    if (!V.db) return 0;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)DB_REGION * DB_SLOTS,
+                             .usage = VK_BUFFER_USAGE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_dbb)) { g_dbb = VK_NULL_HANDLE; VRED("descriptor buffer: vkCreateBuffer failed"); return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_dbb, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateFlagsInfo af = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &af, .allocationSize = mr.size, .memoryTypeIndex = t};
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_dbm) || vk.vkBindBufferMemory(V.dev, g_dbb, g_dbm, 0) || vk.vkMapMemory(V.dev, g_dbm, 0, VK_WHOLE_SIZE, 0, &g_dbp)) {
+        VRED("descriptor buffer: no host-visible memory for it"); if (g_dbm) vk.vkFreeMemory(V.dev, g_dbm, NULL); vk.vkDestroyBuffer(V.dev, g_dbb, NULL); g_dbb = VK_NULL_HANDLE; g_dbp = NULL; return 0;
+    }
+    VkBufferDeviceAddressInfo bdi = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = g_dbb};
+    g_dba = vk.vkGetBufferDeviceAddress(V.dev, &bdi);
+    if (!g_dba) { VRED("descriptor buffer: no device address"); return 0; }
+    g_dbstate = 1;
+    VLOG("descriptor buffer: %u MiB in %u slots of %u KiB, address %#llx", (unsigned)(((VkDeviceSize)DB_REGION * DB_SLOTS) >> 20), DB_SLOTS, DB_REGION >> 10, (unsigned long long)g_dba);
+    return 1;
+}
+int vka_db_ready(void) { return db_ready(); }
+void vka_db_start(unsigned slot) {
+    if (!db_ready()) return;
+    slot %= DB_SLOTS; g_dbslot = slot;
+    if (g_dbfence[slot]) { vka_wait_done(g_dbfence[slot], vka_hang_ns()); g_dbfence[slot] = 0; }
+    g_dbcur = 0;
+}
+void vka_db_set_fence(uint64_t fence) { if (db_ready()) g_dbfence[g_dbslot] = fence; }
+VkDeviceSize vka_db_alloc(VkDeviceSize n) {
+    if (!db_ready()) return UINT64_MAX;
+    n = (n + 63) & ~(VkDeviceSize)63;
+    if (g_dbcur + n > DB_REGION) { static _Atomic int nl; if (atomic_fetch_add(&nl, 1) < 4) VRED("descriptor buffer: a submission's region is full (%u KiB): its later draws use push descriptors", DB_REGION >> 10); return UINT64_MAX; }
+    VkDeviceSize o = (VkDeviceSize)g_dbslot * DB_REGION + g_dbcur; g_dbcur += n; return o;
+}
+void vka_db_bind(VkCommandBuffer cb) {
+    if (!db_ready()) return;
+    VkDescriptorBufferBindingInfoEXT bi = {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, .address = g_dba, .usage = VK_BUFFER_USAGE_DESCRIPTOR_BUFFER_BIT_EXT};
+    vk.vkCmdBindDescriptorBuffersEXT(cb, 1, &bi);
+}
+VkDeviceAddress vka_db_buffer_address(VkBuffer b) {
+    static struct { VkBuffer b; VkDeviceAddress a; } c[256];
+    uint32_t i = (uint32_t)(((uintptr_t)b >> 4) & 255);
+    if (c[i].b == b) return c[i].a;
+    VkBufferDeviceAddressInfo bi = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b};
+    VkDeviceAddress a = vk.vkGetBufferDeviceAddress(V.dev, &bi);
+    c[i].b = b; c[i].a = a; return a;
+}
+
 static sblk *sblk_new(VkDeviceSize n) {
     sblk *b = calloc(1, sizeof *b); b->size = n;
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};   // indirect: the {count, 1, 1} copies of indirect mesh draws (vka_exec.c mdx_copy)
+                                                                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | (V.bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0)};   // indirect: the {count, 1, 1} copies of indirect mesh draws (vka_exec.c mdx_copy); the address: descriptors in a descriptor buffer name one (DM_VK_DESC_BUF)
     if (vk.vkCreateBuffer(V.dev, &bi, NULL, &b->buf)) { free(b); return NULL; }
     VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, b->buf, &mr);
     uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
     if (t == UINT32_MAX) t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
+    VkMemoryAllocateFlagsInfo af = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = V.bda ? &af : NULL, .allocationSize = mr.size, .memoryTypeIndex = t};
     void *p = NULL;
     if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &b->mem) || vk.vkBindBufferMemory(V.dev, b->buf, b->mem, 0) || vk.vkMapMemory(V.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &p)) {
         VRED("scratch block of %llu bytes not allocated", (unsigned long long)n); if (b->mem) vk.vkFreeMemory(V.dev, b->mem, NULL); vk.vkDestroyBuffer(V.dev, b->buf, NULL); free(b); return NULL; }
