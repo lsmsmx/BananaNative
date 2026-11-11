@@ -3056,15 +3056,17 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         // all of them again (DM_VK_GW_SORT_KEEP, live, default 1; 0: filtered and sorted at each, as before). Which of them take part (from_mem, gpu_owned, vpool, a dead
         // pool can change) is checked at each use, and the scan's reach (maxsz) is the largest of those that take part, as before; images at one address keep an order qsort
         // does not promise either way
-        static vka_img **by; static int bycap, nall; static uint64_t by_gen = ~0ull; int nby = 0; uint64_t maxsz = 0, done = vka_done(); int k = 0, any = 0;
+        static vka_img **by; static int bycap, nall; static uint64_t by_gen = ~0ull, by_maxsz; int nby = 0; uint64_t maxsz = 0, done = vka_done(); int k = 0, any = 0;
         int keep = VKA_ENV("DM_VK_GW_SORT_KEEP", 1) != 0;
         #define GW_TAKES(im) ((im)->from_mem && !(im)->gpu_owned && (im)->mem && !(im)->vpool && !img_pool_dead(im))
         for (int i = 0; i < g_ngw && !any; i++) any = g_gw[i].fence && g_gw[i].fence <= done;
         if (any) {
             if (bycap < g_nlive) { bycap = g_nlive + 256; by = realloc(by, (size_t)bycap * sizeof *by); by_gen = ~0ull; }
             if (keep) {
-                if (by_gen != g_live_gen) { nall = 0; for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) by[nall++] = g_live[j]; qsort(by, (size_t)nall, sizeof *by, img_by_mem); by_gen = g_live_gen; }
-                nby = nall; for (int j = 0; j < nby; j++) if (GW_TAKES(by[j]) && by[j]->L.size > maxsz) maxsz = by[j]->L.size;
+                if (by_gen != g_live_gen) { nall = 0; uint64_t m = 0;
+                    for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) { by[nall++] = g_live[j]; if (g_live[j]->L.size > m) m = g_live[j]->L.size; }   // (every image with storage: one that starts taking part later only widens the scan's reach)
+                    qsort(by, (size_t)nall, sizeof *by, img_by_mem); by_gen = g_live_gen; by_maxsz = m; }
+                nby = nall; maxsz = by_maxsz;   // the reach is kept with the sorted list: the per-submission walk over every live image for it was the "images" phase's cost when no image came or went
             } else {
                 by_gen = ~0ull;
                 for (int j = 0; j < g_nlive; j++) { vka_img *im = g_live[j]; if (GW_TAKES(im)) { by[nby++] = im; if (im->L.size > maxsz) maxsz = im->L.size; } }
