@@ -1210,8 +1210,27 @@ static void class_note(const vka_shader *sh, int st, const vka_res *r, int tid, 
     VLOG("class: shader %016llx stage %d binding %u declares a %s %s, texture ID %d is %s (%s)", (unsigned long long)sh->key, st, r->binding, cn[want], storage ? "image" : "texture", tid, cn[have], why);
 }
 static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
+// A resolved image descriptor kept by (texture ID, shape, type, element, the view memo's generations, the open pass). The view memo answers 87-90 % of the
+// lookups, but each hit still walks the pass's attachments (in_fb) and stamps the image's frame and fence (stores into a scattered struct); a draw that binds a
+// texture it bound a moment ago - most of them, ~5 image descriptors a draw - copies two words instead. DM_VK_DESC_MEMO=1 (default 0 until phone-checked)
+typedef struct { uint32_t tid, ver, dim, desc, elem; uint64_t texgen, fbgen; VkImageView v; VkImageLayout lay; } dmemo_ent;
+static dmemo_ent g_dmemo[4096]; static uint64_t g_dm_hit;
+static int dmemo_on(void) { return VKA_ENV("DM_VK_DESC_MEMO", 0); }
+static inline int dmemo_get(int tid, int dim, int desc, int elem, uint64_t texgen, uint64_t fbgen, VkImageView *v, VkImageLayout *lay) {
+    if (!tid || desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !dmemo_on()) return 0;
+    const dmemo_ent *e = &g_dmemo[((uint32_t)tid * 31u + (uint32_t)dim) & 4095];
+    if (e->v && e->tid == (uint32_t)tid && e->dim == (uint32_t)dim && e->desc == (uint32_t)desc && e->elem == (uint32_t)elem && e->texgen == texgen && e->fbgen == fbgen && e->ver == vka_tex_ver(tid)) {
+        *v = e->v; *lay = e->lay; return 1;
+    }
+    return 0;
+}
+static inline void dmemo_put(int tid, int dim, int desc, int elem, uint64_t texgen, uint64_t fbgen, VkImageView v, VkImageLayout lay) {
+    if (!tid || desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !dmemo_on()) return;
+    g_dmemo[((uint32_t)tid * 31u + (uint32_t)dim) & 4095] = (dmemo_ent){(uint32_t)tid, vka_tex_ver(tid), (uint32_t)dim, (uint32_t)desc, (uint32_t)elem, texgen, fbgen, v, lay};
+}
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
 static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
+    uint64_t dmtg = vka_tex_gen(), dmfb = vka_tex_fb_gen();   // (the descriptor memo's generations, read once for this stage)
     for (int i = 0; i < n; i++) {
         if (g_w.n == 512) { VRED_ONCE("more than 512 descriptors in one draw"); return 0; }
         uint32_t k = g_w.n;
@@ -1258,6 +1277,8 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
                 int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
+                if (dmemo_get(tid, r[i].dim, r[i].desc, r[i].elem, dmtg, dmfb, &v, &lay)) { g_dm_hit++; }
+                else {
                 tw_ = g_prof && g_prof_img && tid ? cntvct() : 0;
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
                 if (tw_) { tv_ = cntvct() - tw_; g_ps[6] += tv_; }
@@ -1273,6 +1294,8 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                     VRED("shader %016llx binding %u: texture ID %d has no view of shape %#x%s: it reads as unbound (%s)", (unsigned long long)sh->key, r[i].binding, tid, r[i].dim, storage ? " (storage)" : "", why); } }
                 if (!v && !V.null_desc) v = placeholder(r[i].dim, storage);
                 if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", r[i].dim); g_skip_dev[VKS_FEATURE]++; return 0; }
+                if (tid && v) dmemo_put(tid, r[i].dim, r[i].desc, r[i].elem, dmtg, dmfb, v, lay);
+                }
             }
             if (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLER) {
                 s = r[i].sid ? vka_samp_id_rec(r[i].sid) : VK_NULL_HANDLE;
