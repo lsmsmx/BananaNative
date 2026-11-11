@@ -78,6 +78,20 @@ jobs:
           echo "--- ndk ---"; ls "$ANDROID_SDK_ROOT/ndk"
           echo "--- cmake ---"; ls "$ANDROID_SDK_ROOT/cmake"
 
+      - name: DNS for the package mirrors
+        run: |
+          # This runner's resolver has failed for archive.ubuntu.com, security.ubuntu.com and
+          # azure.archive.ubuntu.com while packages.microsoft.com resolved (2026-11-11), and it
+          # stayed broken across reruns. When the first look-up fails, pin public resolvers and
+          # print both states; the apt step below retries either way.
+          cat /etc/resolv.conf || true
+          if ! getent hosts archive.ubuntu.com; then
+            echo "resolver failed for archive.ubuntu.com: pinning 1.1.1.1 / 8.8.8.8"
+            sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+            cat /etc/resolv.conf
+            getent hosts archive.ubuntu.com || echo "[RED] still no resolution for archive.ubuntu.com"
+          fi
+
       - name: Build deps, shasum shim, Linux port of build.sh
         run: |
           # apt in three tries, with its own HTTP timeouts and IPv4 forced: a resolver hiccup on the
