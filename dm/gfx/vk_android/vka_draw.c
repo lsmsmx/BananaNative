@@ -1415,10 +1415,11 @@ typedef struct {
     uint64_t lay, texgen, memgen, fbgen, alpha, spush, pools, base, sk[VKA_NSTAGE], stemo[VKA_NSTAGE][2];
     int rast_discard;
 } sets_key;
-// Four entries, not one: a scene reaches back over a few patterns (material A, B, A ...), which a one-entry
-// memo misses almost always (20 % of the draws that could keep their writes on the phone).
+// Eight entries, not one: a scene reaches back over more patterns (material A, B, A ...) than a single entry covers
+// (20 % of the draws that could keep their writes on the phone; four entries measured 21-32 %). Sixteen is not tried:
+// an entry holds the walk's records, ~200 KB each
 typedef struct { sets_key k; int ok, any, n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint64_t rv[VKA_NSTAGE][512]; vka_res r[VKA_NSTAGE][512]; } sets_memo;
-enum { SNMEMO = 4 };
+enum { SNMEMO = 8 };
 static sets_memo g_sm[SNMEMO]; static unsigned g_smn;
 static int sets_memo_ways(void) {   // DM_VK_SETS_MEMO_WAYS: 1 is the earlier one-entry memo, for the A/B
     static int v = -1;
