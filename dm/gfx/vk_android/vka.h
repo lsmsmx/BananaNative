@@ -13,6 +13,11 @@
 #include "vka_fmtlist.h"
 #include "vka_soft.h"
 
+// The headers carry VK_EXT_descriptor_buffer's structs and entry points but not this bit (they know the newer VK_EXT_descriptor_heap instead): the spec's value
+#ifndef VK_BUFFER_USAGE_DESCRIPTOR_BUFFER_BIT_EXT
+#define VK_BUFFER_USAGE_DESCRIPTOR_BUFFER_BIT_EXT ((VkBufferUsageFlags)0x00040000)
+#endif
+
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
 #define VRED(...) LOG("[RED] vk: " __VA_ARGS__)
 #define VRED_ONCE(...) do { static _Atomic int once_; if (!atomic_exchange(&once_, 1)) VRED(__VA_ARGS__); } while (0)
