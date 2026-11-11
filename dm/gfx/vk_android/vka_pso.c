@@ -114,6 +114,29 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
     for (uint32_t i = 0; i < k.n; i++) lb[i] = (VkDescriptorSetLayoutBinding){k.b[i].binding, (VkDescriptorType)k.b[i].desc, k.b[i].count, k.b[i].stages, NULL};
     VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = L->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0, .bindingCount = k.n, .pBindings = lb};
     VkResult r = vk.vkCreateDescriptorSetLayout(V.dev, &li, NULL, &L->set0);
+    // VK_EXT_descriptor_buffer (DM_VK_DESC_BUF): the same bindings as a descriptor-buffer layout, with its pipeline layout and each binding's offset,
+    // beside the push one; nothing uses them until the writing path asks (vka_draw.c bind_sets)
+    if (!r && V.db) {
+        VkDescriptorSetLayoutCreateInfo dli = li; dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        if (vk.vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &L->db_set0)) { L->db_set0 = VK_NULL_HANDLE; VRED_ONCE("descriptor-buffer set layout of %u bindings: not made", k.n); }
+        else {
+            VkDescriptorSetLayout dsets[3] = {L->db_set0, vka_bindless_layout(), vka_pfb_layout()};
+            VkPipelineLayoutCreateInfo dpi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = !dsets[1] ? 1 : dsets[2] ? 3 : 2, .pSetLayouts = dsets};
+            if (vk.vkCreatePipelineLayout(V.dev, &dpi, NULL, &L->db_layout)) { L->db_layout = VK_NULL_HANDLE; VRED_ONCE("descriptor-buffer pipeline layout: not made"); }
+            else {
+                vk.vkGetDescriptorSetLayoutSizeEXT(V.dev, L->db_set0, &L->db_size);
+                if (k.n) {
+                    L->db_off = calloc(k.n, sizeof *L->db_off);
+                    for (uint32_t i = 0; i < k.n && L->db_off; i++) {
+                        VkDeviceSize off = 0;
+                        vk.vkGetDescriptorSetLayoutBindingOffsetEXT(V.dev, L->db_set0, k.b[i].binding, &off);
+                        L->db_off[i] = (vka_db_off){k.b[i].binding, (uint32_t)off};
+                    }
+                    L->db_n = L->db_off ? k.n : 0;
+                }
+            }
+        }
+    }
     free(lb);
     if (!r) {
         // set 1 the pool (bindless tables), set 2 the pool reads' bitmap when they are reported (vka_tex.c "Texture pool reads")

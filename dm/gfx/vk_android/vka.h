@@ -466,7 +466,10 @@ int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out);   // host-vis
 
 // ---------- Pipelines (vka_pso.c) ----------
 #include "vka_gkey.h"   // vka_gkey: what a graphics pipeline is made from beyond its shaders and layout (Vulkan-free: the prewarm list's unit test reads it)
-typedef struct { VkPipelineLayout layout; VkDescriptorSetLayout set0; int push; uint32_t ndesc; } vka_layout;
+typedef struct { uint16_t binding; uint32_t off; } vka_db_off;   // a set-0 binding and its offset in the descriptor-buffer layout
+typedef struct { VkPipelineLayout layout; VkDescriptorSetLayout set0; int push; uint32_t ndesc;
+                 VkPipelineLayout db_layout; VkDescriptorSetLayout db_set0; VkDeviceSize db_size;   // VK_EXT_descriptor_buffer (DM_VK_DESC_BUF): the same bindings, set 0 in a buffer
+                 uint32_t db_n; vka_db_off *db_off; } vka_layout;   // db_n/db_off: each binding's offset in db_set0 (vkGetDescriptorSetLayoutBindingOffsetEXT)
 int vka_layout_of(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out);   // the set-0 layout of these stages' records with the pools' set 1
 VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k);
 VkPipeline vka_cs_pipeline(vka_shader *cs, const vka_layout *lay);
