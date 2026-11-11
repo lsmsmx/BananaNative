@@ -31,7 +31,8 @@
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants) X(vkCmdSetLineWidth) \
     X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) \
-    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
+    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) \
+    X(vkCmdBindDescriptorBuffersEXT) X(vkCmdSetDescriptorBufferOffsetsEXT)
 #define ENC_ID(f) E_##f,
 enum { E_WRAP = 0, E_CALL, ENC_FNS(ENC_ID) E_N };
 #define ENC_REAL(f) PFN_##f f;
@@ -147,6 +148,8 @@ typedef struct { CB_FIELD VkPipelineBindPoint bp; VkPipelineLayout l; uint32_t s
 typedef struct { CB_FIELD uint32_t nb, na; const VkVertexInputBindingDescription2EXT *b; const VkVertexInputAttributeDescription2EXT *a; } r_vin;
 typedef struct { CB_FIELD VkPipelineLayout l; VkShaderStageFlags st; uint32_t o, n; const void *p; } r_pc;
 typedef struct { CB_FIELD void (*fn)(const void *); } r_call;   // a function of the replay's own, made in order with the calls (its argument bytes follow)
+typedef struct { CB_FIELD uint32_t n; const VkDescriptorBufferBindingInfoEXT *b; } r_dbb;   // the descriptor buffers bound (DM_VK_DESC_BUF)
+typedef struct { CB_FIELD VkPipelineBindPoint bp; VkPipelineLayout l; uint32_t first, n; const uint32_t *b; const VkDeviceSize *o; } r_dbo;   // set-0 offsets in them
 
 static inline int mine(VkCommandBuffer cb) { return cb && cb == atomic_load_explicit(&g_ecb, memory_order_relaxed); }
 static inline uint8_t *cpy(uint8_t **at, const void *src, size_t n) { uint8_t *d = *at; if (n) memcpy(d, src, n); *at += A8(n); return d; }
@@ -349,6 +352,16 @@ static void VKAPI_CALL e_vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout
     DIRECT(vkCmdPushConstants, cb, l, st, o, n, p);
     BEGIN(r_pc, E_vkCmdPushConstants, A8(n)); r->l = l; r->st = st; r->o = o; r->n = n; r->p = cpy(&at, p, n); END();
 }
+static void VKAPI_CALL e_vkCmdBindDescriptorBuffersEXT(VkCommandBuffer cb, uint32_t n, const VkDescriptorBufferBindingInfoEXT *b) {
+    DIRECT(vkCmdBindDescriptorBuffersEXT, cb, n, b);
+    for (uint32_t k = 0; k < n; k++) if (b[k].pNext) FALLBACK(vkCmdBindDescriptorBuffersEXT, cb, n, b);
+    BEGIN(r_dbb, E_vkCmdBindDescriptorBuffersEXT, A8(n * sizeof *b)); r->n = n; r->b = (const VkDescriptorBufferBindingInfoEXT *)cpy(&at, b, n * sizeof *b); END();
+}
+static void VKAPI_CALL e_vkCmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const uint32_t *b, const VkDeviceSize *o) {
+    DIRECT(vkCmdSetDescriptorBufferOffsetsEXT, cb, bp, l, first, n, b, o);
+    BEGIN(r_dbo, E_vkCmdSetDescriptorBufferOffsetsEXT, A8(n * sizeof *b) + A8(n * sizeof *o)); r->bp = bp; r->l = l; r->first = first; r->n = n;
+    r->b = (const uint32_t *)cpy(&at, b, n * sizeof *b); r->o = (const VkDeviceSize *)cpy(&at, o, n * sizeof *o); END();
+}
 
 // ---------- The encoder thread ----------
 static void run(const hdr *h) {
@@ -408,6 +421,8 @@ static void run(const hdr *h) {
     case E_vkCmdPushDescriptorSetKHR: { C(r_push); R.vkCmdPushDescriptorSetKHR(r->cb, r->bp, r->l, r->set, r->n, r->w); break; }
     case E_vkCmdSetVertexInputEXT: { C(r_vin); R.vkCmdSetVertexInputEXT(r->cb, r->nb, r->b, r->na, r->a); break; }
     case E_vkCmdPushConstants: { C(r_pc); R.vkCmdPushConstants(r->cb, r->l, r->st, r->o, r->n, r->p); break; }
+    case E_vkCmdBindDescriptorBuffersEXT: { C(r_dbb); R.vkCmdBindDescriptorBuffersEXT(r->cb, r->n, r->b); break; }
+    case E_vkCmdSetDescriptorBufferOffsetsEXT: { C(r_dbo); R.vkCmdSetDescriptorBufferOffsetsEXT(r->cb, r->bp, r->l, r->first, r->n, r->b, r->o); break; }
     case E_CALL: { C(r_call); r->fn((const uint8_t *)r + A8(sizeof *r)); break; }
     default: break;
     }
