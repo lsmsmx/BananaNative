@@ -1627,16 +1627,18 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
     uint64_t imgs = g_img_bytes + vka_imem_zbytes();
     int env = VKA_ENV("DM_VK_IMG_LIMIT_MB", 0);
     vktl_in in = {.img_bytes = imgs, .psi_some10 = -1};
+    // Memory pressure (vktl_pressure_limit): "some avg10=" of /proc/pressure/memory; DM_VK_IMG_PSI=0 leaves it out.
+    // Read even when DM_VK_IMG_LIMIT_MB is set: a fixed limit that ignores pressure never yields, so the kernel
+    // takes the guest's pages instead and the replay faults them all back (a 12 GB phone at 2560: 10-13 fps)
+    if (VKA_ENV("DM_VK_IMG_PSI", 1)) {
+        int pf = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC);
+        if (pf >= 0) { char pb[256]; ssize_t pn = read(pf, pb, sizeof pb - 1); close(pf);
+                       if (pn > 0) { pb[pn] = 0; const char *a = strstr(pb, "some avg10="); if (a) in.psi_some10 = strtod(a + 11, NULL); } }
+    }
     if (env <= 0) {
         int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
         if (fd >= 0) { char buf[2048]; ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
                        if (n > 0) { buf[n] = 0; in.mem_total = meminfo_kb(buf, "MemTotal:") << 10; in.mem_avail = meminfo_kb(buf, "MemAvailable:") << 10; } }
-        // Memory pressure (vktl_pressure_limit): "some avg10=" of /proc/pressure/memory; DM_VK_IMG_PSI=0 leaves it out
-        if (VKA_ENV("DM_VK_IMG_PSI", 1)) {
-            int pf = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC);
-            if (pf >= 0) { char pb[256]; ssize_t pn = read(pf, pb, sizeof pb - 1); close(pf);
-                           if (pn > 0) { pb[pn] = 0; const char *a = strstr(pb, "some avg10="); if (a) in.psi_some10 = strtod(a + 11, NULL); } }
-        }
         uint32_t heap = V.local_type < V.memp.memoryTypeCount ? V.memp.memoryTypes[V.local_type].heapIndex : 0;
         if (heap < V.memp.memoryHeapCount) in.heap_size = V.memp.memoryHeaps[heap].size;
         static PFN_vkGetPhysicalDeviceMemoryProperties2 gmp2;
@@ -1648,7 +1650,8 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
         }
     }
     uint64_t lim = env > 0 ? (uint64_t)env << 20 : vktl_limit(&in), old = g_img_lim;
-    int pressed = env <= 0 && in.psi_some10 >= VKTL_PSI_HOLD;
+    if (env > 0 && in.psi_some10 > 0) lim = vktl_pressure_limit(lim, imgs, in.psi_some10);   // (a fixed limit yields under pressure too)
+    int pressed = in.psi_some10 >= VKTL_PSI_HOLD;
     if (pressed != g_psi_pressed) {
         static _Atomic int np;
         if (atomic_fetch_add(&np, 1) < 32) VLOG("image cache: memory pressure %.1f %% (some avg10): %s, limit %llu MiB, images %.0f MiB", in.psi_some10 < 0 ? 0 : in.psi_some10,
