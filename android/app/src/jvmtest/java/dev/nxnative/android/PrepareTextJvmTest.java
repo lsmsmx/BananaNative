@@ -46,6 +46,28 @@ public final class PrepareTextJvmTest {
         plain(mt, "missing shaders");
         check(mt.contains("120 of its 8,161") && mt.endsWith("All of them are in update 655360."), "missing shaders text: " + mt);
 
+        // An APK whose translator library is not the one its own tools expect (2026-11-10: a stage made before a translator change): vk_android_build.py check_translator's
+        // lines, the last one the reason. Retry could never succeed: its own text, no Retry (FIX_UPDATE); every form of the refusal (tree, embedded source, no
+        // --tree-sha, the program form's dlls) is the same kind
+        String[] stale = {"[RED] translator does not match the lock file: translator library: embedded source c55667af1b257a46 / lock a50d55af6f34ac59 / in repo a50d55af6f34ac59",
+                "[RED] translator does not match the lock file: translator library: built from source tree 0295868e4589b4fa, this tree is e67cccd60c5f19ae (dmsh_xlate_android/build.sh builds it again)"};
+        PrepareText.StopReason xr = new PrepareText.StopReason();
+        for (String l : stale) xr.line(l);
+        check(stale[1].equals(xr.reason), "the last refusal line is the reason: " + xr.reason);
+        for (String red : new String[] {xr.reason, stale[0],
+                "[RED] translator does not match the lock file: translator library: built from source tree unknown (no --tree-sha: exit code 1, a library from before it), this tree is e67cccd60c5f19ae (dmsh_xlate_android/build.sh builds it again)",
+                "[RED] translator does not match the lock file: dmsh_xlate.dll: lock 0123456789abcdef / actual fedcba9876543210"}) {
+            f = PrepareText.toolStopped("Translating shaders", 1, red, log);
+            plain(f.text, "a translator that does not match its tools");
+            check(f.fix.equals(PrepareText.FIX_UPDATE), "app build mismatch: its own fix, not Retry: " + f.fix + " for " + red);
+            check(f.text.equals("Translating shaders stopped. This app build's shader translator does not match its own tools, so retrying will not help. "
+                    + "Install the latest release of the app, or report this with the log from Details."), "the mismatch text: " + f.text);
+            check(!f.text.contains("Tap Retry") && !f.text.contains("Try anyway"), "no Retry offered: " + f.text);
+            check(f.detail.contains(red.substring(6)) && f.detail.endsWith("Log: " + log), "the tool's line and the log in Details: " + f.detail);
+        }
+        f = PrepareText.toolStopped("Translating shaders", 1, "[RED] shader 1234: translator does not match the lock file: a phrase inside another line", log);
+        check(f.fix.equals(PrepareText.FIX_RETRY), "only the refusal's own line, at its start");
+
         f = PrepareText.toolStopped("Rewriting the game code", 2, null, log);
         plain(f.text, "any other stop");
         check(f.fix.equals(PrepareText.FIX_RETRY) && f.text.startsWith("Rewriting the game code stopped.") && f.detail.endsWith("Log: " + log), "any other stop: Retry, Details has the log: " + f.detail);

@@ -98,6 +98,8 @@ def header(g):
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+    fl = g.get('fps_limit', '0')   # Android: the host's frame limiter's default (hle_fpslock.c fps_limit_wait, a wait before each present): 0 = none, else at most that many frames a second; DM_FPS_LIMIT and the launcher's choice override it
+    if not fl.isdigit() or int(fl) and not 10 <= int(fl) <= 60: sys.exit(f'{g.id}: fps_limit must be 0 (none) or 10 to 60 frames a second: {fl}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
     utp = g.get('ue_texture_pool', '0')   # Unreal's r.Streaming.PoolSize in MB, raised to this on the Mac (hle_uecvar.c; DM_UE_TEXTURE_POOL overrides, and turns it on for iOS): 0 = the game's own pool
@@ -166,11 +168,19 @@ def header(g):
             w, h = map(int, r[3].split('x'))
             if not (0 < w < 65536 and 0 < h < 65536): sys.exit(f'{g.id}: window_fn size must be 1..65535 each: {r[3]}')
             wfn.append('{' + q(r[0]) + f', {r[1]}, {r[2]}, {w}, {h}' + '}')
-    fdc = []   # the frame-rate controller's sdiv the host switches to the measured rate, one row per main build: <main build ID> <offset> (hle_fpslock.c sead_decouple)
+    # fps_decouple sead: the game's speed follows its measured frame rate through sead's frame-rate controller, which the rewriter gates in main only for a profile with this key (dm/tools/nso_code.py sead_find,
+    # hle_fpslock.c sead_rate; pack_android.py build_rows keys it), and the Android launcher (build.gradle decoupleOf: a frame limit with presentation on the host's tick); a build's own place is an OBS row of its patches.py
     for r in g.values('fps_decouple') if g.get('fps_decouple', '') else []:
-        if len(r) != 2 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not re.fullmatch(r'0x[0-9a-fA-F]+', r[1]):
-            sys.exit(f"{g.id}: fps_decouple takes <main build ID (32 hex)> <offset of the frame-rate controller's sdiv>: {r}")
-        fdc.append('{' + q(r[0]) + f', {r[1]}' + '}')
+        if r != ['sead']: sys.exit(f"{g.id}: fps_decouple takes sead (the rewriter finds the controller; a build's own place is an OBS row of the profile's patches.py): {r}")
+    # fps_steps: the game's framework runs a whole number of fixed steps each frame and presents at that many vsyncs; the frame rate cap holds 60, 30 or 20 through it (hle_fpslock.c
+    # steps_tick). One row per main build: <main build ID> <global offset> <member offsets to the framework, comma-separated, or -> <mode field> <step count field>: the framework is at
+    # [main + global], then [that + each member]
+    fst = []
+    for r in g.values('fps_steps') if g.get('fps_steps', '') else []:
+        offs = r[2].split(',') if len(r) == 5 and r[2] != '-' else []
+        if len(r) != 5 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in [r[1], r[3], r[4], *offs]) or len(offs) > 3:
+            sys.exit(f"{g.id}: fps_steps takes <main build ID (32 hex)> <global offset> <member offsets, comma-separated (at most 3), or -> <mode field> <step count field>: {r}")
+        fst.append('{' + q(r[0]) + f', {r[1]}, {r[3]}, {r[4]}, {len(offs)}, ' + '{' + (', '.join(offs) or '0') + '}}')
     drs = []   # the dynamic resolution controller's places, one row per main build: <main build ID> <params probe> <pick> <budget load> <preset flag> (probe.c drs_install)
     for r in g.values('drs_ctl') if g.get('drs_ctl', '') else []:
         if len(r) != 5 or not re.fullmatch(r'[0-9a-f]{32}', r[0]) or not all(re.fullmatch(r'0x[0-9a-fA-F]+', x) for x in r[1:]):
@@ -236,6 +246,7 @@ def header(g):
          f'#define DM_GAME_ALLOC_BIG_ALIGN {int(aba == "on")}',
          f'#define DM_GAME_FPS_TARGET {int(ft)}',
          f'#define DM_GAME_FPS_HOLD {int(fh == "on")}',
+         f'#define DM_GAME_FPS_LIMIT {int(fl)}',
          f'#define DM_GAME_UE_TEXTURE_POOL {int(utp)}',
          f'#define DM_GAME_UE_FPS_CVAR {q(ufc)}',
          f'#define DM_GAME_PRESENT_SNAP {int(ps == "on")}',
@@ -257,7 +268,8 @@ def header(g):
          f'#define DM_GAME_ROMFS_SUBST {q(rsub)}',
          f'#define DM_GAME_WINDOW_FN {{{", ".join(wfn) or "{\"\", 0, 0, 0, 0}"}}}', f'#define DM_GAME_NWINDOW_FN {len(wfn)}',
          '#define DM_GAME_MESH_PREPASS_CUT {' + (', '.join(mpc) or '{0, 0}') + '}', f'#define DM_GAME_NMESH_PREPASS_CUT {len(mpc)}',
-         f'#define DM_GAME_FPS_DECOUPLE {{{", ".join(fdc) or "{\"\", 0}"}}}', f'#define DM_GAME_NFPS_DECOUPLE {len(fdc)}',
+
+         '#define DM_GAME_FPS_STEPS {' + (', '.join(fst) or '{"", 0, 0, 0, 0, {0}}') + '}', f'#define DM_GAME_NFPS_STEPS {len(fst)}',
          f'#define DM_GAME_DRS_CTL {{{", ".join(drs) or "{\"\", 0, 0, 0, 0}"}}}', f'#define DM_GAME_NDRS_CTL {len(drs)}',
          '#define DM_GAME_RES_LEVELS {' + (', '.join(rlv) or '{"", 0, 0, 0, {{0, 0}}}') + '}', f'#define DM_GAME_NRES_LEVELS {len(rlv)}',
          *([f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}', f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}'] if g.get('device_api', '') else []),   # without the key: by the SDK version (hle_nvn.c nvn_api)

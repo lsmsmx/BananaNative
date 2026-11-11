@@ -65,6 +65,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private SidePanel panel;
     private final HashSet<Integer> pads = new HashSet<>();   // the gamepads with a player: the on-screen controls hide while there is one
     private PadOrder order;   // which gamepad gets a player, and which is player 1 (hostSetup)
+    // The in-game panel with a controller (PadPanel): the open / close combination; the pad keys the host holds down (released when the panel opens: releaseGameInput),
+    // and the keys the panel took a press of (their release is the panel's too, also after it closed)
+    private PadPanel.Combo combo = new PadPanel.Combo(PadPanel.OPEN_BOTH);
+    private final HashMap<Integer, HashSet<Integer>> gameKeys = new HashMap<>();
+    private final HashSet<Integer> panelKeys = new HashSet<>();
+    private final Runnable comboHeld = () -> { if (panel != null && combo.fire(android.os.SystemClock.uptimeMillis())) panel.padToggle(); };
     private File log;
     private final Handler ui = new Handler(Looper.getMainLooper());
     private volatile Rumble rumble;   // the game's vibration on the controller's or the phone's vibrator
@@ -126,37 +132,33 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         });
         root.addView(panel, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         controls.openSettings = panel::open;
+        combo = new PadPanel.Combo(Prefs.panelPad(this));   // Settings › Controller: in-game panel
+        panel.padButtons(PadPanel.confirmBack(Prefs.padMap(this, id), Prefs.xboxButtons(this, id) == 2 ? 2 : 0));   // the game's own A and B, as the host maps them from this start
+        panel.onOpen = this::releaseGameInput;
         // The layout editor needs the whole screen: the panel closes, and Paused (over the controls: its first tap would continue the game) hides while it is open;
         // the game stays paused
         controls.onEditStart = () -> { panel.close(); pausedView.setVisibility(View.GONE); };
         controls.onEditEnd = () -> { if (paused) pausedView.setVisibility(View.VISIBLE); };
-        // The panel's handle: a small translucent arrow at the right edge, a quarter of the way down (above the shoulder and face buttons of the automatic layout on both of
-        // the PNM-N49's screens; half way down it covered A on the outer screen and ZR on the inner one), over the controls so it keeps its own touches wherever they are dragged
-        TextView handle = new TextView(this);
-        handle.setText("\u2039");
-        handle.setTextColor(Color.WHITE);
-        handle.setTextSize(22);
-        handle.setGravity(Gravity.CENTER);
-        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        // The panel's handle: an invisible strip along the right edge, from a sixth to a half of the way down (over the HUD rather than the controls), that opens the panel
+        // on a swipe in from the edge (a tap goes nowhere: a stray touch near the edge does not open it). Under gesture navigation the system's own Back swipe from that
+        // edge opens it too (onBackPressed). The one-time hint (panelHint) says so; TalkBack reads it as a button
         float dp = getResources().getDisplayMetrics().density;
-        bg.setColor(0x99000000);
-        bg.setCornerRadii(new float[] {12 * dp, 12 * dp, 0, 0, 0, 0, 12 * dp, 12 * dp});
-        handle.setBackground(bg);
-        // Faint while idle (0.4: it sits over the game picture), fully opaque while a finger is on it so the tap is seen
-        handle.setAlpha(0.4f);
+        View handle = new View(this);
+        float[] downX = {-1};
         handle.setOnTouchListener((v, e) -> {
             int a = e.getActionMasked();
-            if (a == MotionEvent.ACTION_DOWN) v.setAlpha(1f);
-            else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) v.setAlpha(0.4f);
-            return false;   // the click listener still opens the panel
+            if (a == MotionEvent.ACTION_DOWN) downX[0] = e.getRawX();
+            else if (a == MotionEvent.ACTION_MOVE && downX[0] >= 0 && downX[0] - e.getRawX() > 24 * dp) { downX[0] = -1; panel.open(); }
+            else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) downX[0] = -1;
+            return true;
         });
         handle.setContentDescription("Open the in-game panel");
-        handle.setOnClickListener(v -> panel.open());
-        root.addView(handle, root.indexOfChild(panel), new FrameLayout.LayoutParams(Math.round(22 * dp), Math.round(56 * dp), Gravity.END | Gravity.TOP));
+        handle.setOnClickListener(v -> panel.open());   // TalkBack's double tap
+        root.addView(handle, root.indexOfChild(panel), new FrameLayout.LayoutParams(Math.round(20 * dp), Math.round(140 * dp), Gravity.END | Gravity.TOP));
         // Auto with a gamepad connected, or Off: the handle goes with the controls (Back or a gamepad's Home button opens the panel)
         controls.onSwitch = v -> handle.setVisibility(v ? View.VISIBLE : View.GONE);
         controls.setMode(TouchControls.mode(this));
-        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> handle.setTranslationY((b - t) * 0.25f - 28 * dp));
+        root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> handle.setTranslationY((b - t) * 0.3f - 70 * dp));
         // Paused (pause(): the in-game panel's Pause, or the screen coming back with pause-on-return on): the game is suspended until a tap, or A / Start on a gamepad.
         // Under the panel and its handle, so Stop stays reachable
         pausedView = new TextView(this);
@@ -168,6 +170,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         pausedView.setVisibility(View.GONE);
         pausedView.setOnClickListener(v -> unpause());
         root.addView(pausedView, root.indexOfChild(handle), new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        panelHint(root);
         setContentView(root);
         immersive();
         TextInput.screen(this);   // the keyboard applet's input box shows on this screen (again, when the game was waiting on it as the screen was recreated)
@@ -357,6 +360,9 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (Prefs.paced(id)) {   // speed follows the measured rate: presents on the host's own tick at the display's refresh rate, no interval locking, and a frame limit (Prefs.PACE_CAPS)
             int pace = Prefs.paceCap(this, id);
             env.add("DM_PRESENT_INTERVAL=display"); env.add("DM_PRESENT_HZ=" + displayHz()); env.add("DM_FPS_TARGET=0"); env.add("DM_FPS_LIMIT=" + (pace > 0 ? pace : 60));
+            if (!Prefs.decouple(this, id)) env.add("DM_FPS_DECOUPLE=0");   // Full game speed at low frame rates off (the in-game panel changes it live)
+        } else if (Prefs.limited(id)) {   // a profile's default frame limit (fps_limit), which the host applies itself: only the player's own choice is passed (60 fps = none: the game's own interval)
+            if (Prefs.ownFpsCap(this, id)) { int pace = Prefs.paceCap(this, id); env.add("DM_FPS_LIMIT=" + Math.max(pace, 0)); }
         } else if (cap >= 0) env.add("DM_FPS_TARGET=" + cap);
         String gpuNote = GpuDriver.env(this, id, env);   // the game's GPU driver, else the main screen's (DM_VK_DRIVER)
         String ts = Prefs.gpuTs(this, id);   // Game settings › GPU timing; unset: the profile's gpu_timestamps (a DM_NVN_GPU_TS line of env.txt or the game's own lines comes later and wins)
@@ -913,6 +919,46 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     private String titleId() { return String.valueOf(getIntent().getStringExtra("title_id")); }
 
+    /**
+     * Once per install: how the in-game panel opens, now that it has no visible button (a pill at the right edge for 8 s, touches pass through it). Settings ›
+     * Controller: in-game panel says the same
+     */
+    private void panelHint(FrameLayout root) {
+        if (Prefs.panelHinted(this)) return;
+        Prefs.panelHinted(this, true);
+        int how = Prefs.panelPad(this);
+        String pad = how == PadPanel.OPEN_OFF ? "" : how == PadPanel.OPEN_HOME ? "\nController: press Home" : how == PadPanel.OPEN_MINUS_PLUS ? "\nController: hold − and +"
+                : "\nController: press Home, or hold − and +";
+        TextView h = new TextView(this);
+        h.setText("Menu: swipe in from the right edge, or press Back" + pad);
+        h.setTextColor(Color.WHITE);
+        h.setTextSize(14);
+        float dp = getResources().getDisplayMetrics().density;
+        int p = Math.round(10 * dp);
+        h.setPadding(p, p, p, p);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setColor(0xCC000000);
+        bg.setCornerRadius(10 * dp);
+        h.setBackground(bg);
+        h.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.END | Gravity.CENTER_VERTICAL);
+        lp.rightMargin = Math.round(28 * dp);
+        root.addView(h, root.indexOfChild(panel), lp);
+        h.postDelayed(() -> h.animate().alpha(0).setDuration(600).withEndAction(() -> root.removeView(h)).start(), 8000);
+    }
+
+    /**
+     * The panel opens over the running game: every pad button the host holds is released and every stick and trigger centred, so the game sees no press stuck
+     * while the panel takes the controller (their releases go to the panel)
+     */
+    private void releaseGameInput() {
+        if (!input) return;
+        for (Map.Entry<Integer, HashSet<Integer>> d : gameKeys.entrySet()) for (int k : d.getValue()) Native.key(d.getKey(), k, false);
+        gameKeys.clear();
+        for (Map.Entry<Integer, int[]> d : deviceAxes.entrySet())
+            if (order != null && order.plays(d.getKey()) && d.getValue().length > 0) Native.axes(d.getKey(), d.getValue(), new float[d.getValue().length]);
+    }
+
     /** The in-game panel's Pause */
     void pause() {
         if (!started || paused) return;
@@ -944,6 +990,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     @Override public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus) immersive();   // the bars come back after a dialog, the keyboard or the notification shade
+        else combo.reset();   // a dialog or the background: the combination's keys may come up elsewhere
+        // Gamepad sticks, triggers and a DualShock's d-pad (hat axes) come as joystick motion events, which Android batches by default and hands over at the window's next
+        // frame (Choreographer): up to one display refresh late (16.7 ms at 60 Hz), later when the main thread is busy then. Unbuffered, each reaches onGenericMotionEvent
+        // and the host (Native.axes) as it arrives; the game reads it at its next input read. Button presses (key events) were never batched. Asked of the window's root
+        // once it is attached (focus), so its ViewRootImpl takes it (View.requestUnbufferedDispatch(int), API 30)
+        if (hasFocus) getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
     }
 
     @Override protected void onStart() {
@@ -1027,9 +1079,25 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
         if (panel == null) return super.dispatchKeyEvent(e);   // no host for this game (onCreate): only the message is shown
-        // A gamepad's Home / guide button opens and closes the in-game panel; while it is open the pad moves through it and the game gets no pad keys
-        if (e.getKeyCode() == KeyEvent.KEYCODE_BUTTON_MODE) { if (e.getAction() == KeyEvent.ACTION_UP) panel.toggle(); return true; }
-        if (panel.isOpen() && gamepad(e.getSource())) return panel.padKey(e) || super.dispatchKeyEvent(e);
+        // A controller opens and closes the in-game panel (PadPanel.Combo: Home, or − and + held; Settings › Controller: in-game panel); while it is open the pad moves
+        // through it and the game gets no pad keys. A key the panel took a press of stays the panel's until it comes up
+        int k = e.getKeyCode();
+        boolean down = e.getAction() == KeyEvent.ACTION_DOWN, up = e.getAction() == KeyEvent.ACTION_UP;
+        if (gamepad(e.getSource()) || k == KeyEvent.KEYCODE_BUTTON_MODE) {
+            int c = combo.key(k, down, e.getRepeatCount(), e.getEventTime());
+            if (c == PadPanel.TOGGLE) { panel.padToggle(); return true; }
+            if (c == PadPanel.EAT) { if (up) panelKeys.remove(k); return true; }   // the pair's release after it fired (the panel may have taken its press)
+            long due = combo.due();
+            ui.removeCallbacks(comboHeld);
+            if (due >= 0) ui.postAtTime(comboHeld, due);   // the event's time is uptimeMillis
+        }
+        if (panel.isOpen() && gamepad(e.getSource())) {
+            boolean took = panel.padKey(e);
+            if (took && down) panelKeys.add(k);
+            if (up) panelKeys.remove(k);
+            return took || super.dispatchKeyEvent(e);
+        }
+        if (gamepad(e.getSource()) && panelKeys.contains(k)) { if (up) panelKeys.remove(k); return true; }
         if (paused && gamepad(e.getSource())) {   // paused: A or Start continues; no pad key reaches the game
             if (e.getAction() == KeyEvent.ACTION_UP && (e.getKeyCode() == KeyEvent.KEYCODE_BUTTON_A || e.getKeyCode() == KeyEvent.KEYCODE_BUTTON_START)) unpause();
             return true;
@@ -1039,7 +1107,12 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (input && gamepad(e.getSource()) && e.getDevice() != null && !e.getDevice().isVirtual()
                 && (e.getAction() == KeyEvent.ACTION_DOWN || e.getAction() == KeyEvent.ACTION_UP)
                 && (order.plays(e.getDeviceId()) || e.getAction() == KeyEvent.ACTION_DOWN && padKey(e.getKeyCode()) && order.active(pad(e.getDevice())))
-                && Native.key(e.getDeviceId(), e.getKeyCode(), e.getAction() == KeyEvent.ACTION_DOWN)) { padConnected(e.getDeviceId()); return true; }
+                && Native.key(e.getDeviceId(), e.getKeyCode(), e.getAction() == KeyEvent.ACTION_DOWN)) {
+            HashSet<Integer> held = gameKeys.computeIfAbsent(e.getDeviceId(), x -> new HashSet<>());
+            if (down) held.add(k); else held.remove(k);
+            padConnected(e.getDeviceId());
+            return true;
+        }
         return super.dispatchKeyEvent(e);
     }
 
@@ -1061,6 +1134,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
 
     @Override public boolean onGenericMotionEvent(MotionEvent e) {
+        if (panel != null && panel.isOpen() && (e.getSource() & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return panel.padMotion(e);   // the panel's, never the game's
         if (!input || panel.isOpen() || paused || (e.getSource() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK || e.getAction() != MotionEvent.ACTION_MOVE || e.getDevice() == null)
             return super.onGenericMotionEvent(e);
         int[] have = axesOf(e.getDevice(), e.getSource());

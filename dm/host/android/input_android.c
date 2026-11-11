@@ -410,10 +410,11 @@ void nxhost_codecs_log(void) {
 }
 
 // ---- Frame rate cap ----
-void dm_fps_target_set(int t, const char *src); int dm_fps_target(void); int dm_fps_lock_rates(void); int nvn_game_fps(void);
+void dm_fps_target_set(int t, const char *src); int dm_fps_target(void); int dm_fps_lock_rates(void); int nvn_game_fps(void); int nxhost_fps_limit_get(void);
 void nxhost_fps_cap_set(int fps) { dm_fps_target_set(fps, "the launcher's in-game panel"); }
 int nxhost_fps_cap_status(char *buf, int n) {
     int loaded = dm_main_build()[0] != 0, cap = dm_fps_target(), rates = loaded ? dm_fps_lock_rates() : 0;   // the limiters are looked for once, so only after main is loaded
-    if (buf && n > 0) snprintf(buf, (size_t)n, "%d %d %d", cap, rates, loaded ? nvn_game_fps() : 0);
+    // the fourth: the rate the frame limit holds (hle_fpslock.c nxhost_fps_limit_get; a frame-step game holds 60, 30 or 20 only, so 45 and 40 run at 30), 0 = none
+    if (buf && n > 0) snprintf(buf, (size_t)n, "%d %d %d %d", cap, rates, loaded ? nvn_game_fps() : 0, loaded ? nxhost_fps_limit_get() : 0);
     return cap;
 }

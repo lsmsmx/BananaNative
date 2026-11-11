@@ -1,0 +1,180 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+//============================================================================================================
+//
+//
+//                  Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+//
+//============================================================================================================
+// Snapdragon Game Super Resolution 1 (SGSR 1), ported to a compute shader from Qualcomm's
+// sgsr/v1/include/glsl/sgsr1_shader_mobile_edge_direction.frag (https://github.com/SnapdragonStudios/snapdragon-gsr, d926f074), under its licence:
+//
+// Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+// 1. Redistributions of source code must retain the above copyright notice,
+//    this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution.
+//
+// 3. Neither the name of the copyright holder nor the names of its contributors
+//    may be used to endorse or promote products derived from this software
+//    without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+//
+// SPDX-License-Identifier: BSD-3-Clause
+//============================================================================================================
+// In place of a game's neural upscaler dispatch (vka_draw.c / vka_ndsr_sgsr.h, DM_VK_NDSR=4): the game's input texture scaled to its output image in one pass,
+// one output pixel per invocation; the store and its variants are FSR's (../fsr/ndsr_out.h: floats into B10G11R11, or packed words through an R32_UINT view; SQ squares).
+// Qualcomm's configuration: OperationMode 1 (RGBA: green leads the edge test), UseEdgeDirection on (the edge-direction weights, as in the high-quality and VR targets of
+// Qualcomm's Unreal plugin), EdgeThreshold 8/255 (Qualcomm's value for mobile), EdgeSharpness 2.0 (its default). Changes from the fragment shader: the texture
+// coordinate is the output pixel's centre; ViewportInfo comes in push constants; no highp on the constructors (desktop GLSL); the result is clamped below at 0 but not above at 1 (the input is a float colour
+// or its square root and may exceed 1: Qualcomm's clamp suits a UNORM target and would clip highlights at edges only)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(push_constant) uniform P { vec4 ViewportInfo; uvec2 size; } pc;   // ViewportInfo: 1 / input width, 1 / input height, input width, input height
+#include "../fsr/ndsr_out.h"
+
+precision mediump float;
+precision highp int;
+
+layout(set = 0, binding = 0) uniform mediump sampler2D ps0;
+
+#define OperationMode 1
+#define UseEdgeDirection
+#define EdgeThreshold 8.0/255.0
+#define EdgeSharpness 2.0
+
+float fastLanczos2(float x)
+{
+	float wA = x-4.0;
+	float wB = x*wA-wA;
+	wA *= wA;
+	return wB*wA;
+}
+
+#if defined(UseEdgeDirection)
+vec2 weightY(float dx, float dy, float c, vec3 data)
+#else
+vec2 weightY(float dx, float dy, float c, float data)
+#endif
+{
+#if defined(UseEdgeDirection)
+	float std = data.x;
+	vec2 dir = data.yz;
+
+	float edgeDis = ((dx*dir.y)+(dy*dir.x));
+	float x = (((dx*dx)+(dy*dy))+((edgeDis*edgeDis)*((clamp(((c*c)*std),0.0,1.0)*0.7)+-1.0)));
+#else
+	float std = data;
+	float x = ((dx*dx)+(dy* dy))* 0.55 + clamp(abs(c)*std, 0.0, 1.0);
+#endif
+
+	float w = fastLanczos2(x);
+	return vec2(w, w * c);
+}
+
+vec2 edgeDirection(vec4 left, vec4 right)
+{
+	vec2 dir;
+	float RxLz = (right.x + (-left.z));
+	float RwLy = (right.w + (-left.y));
+	vec2 delta;
+	delta.x = (RxLz + RwLy);
+	delta.y = (RxLz + (-RwLy));
+	float lengthInv = inversesqrt((delta.x * delta.x+ 3.075740e-05) + (delta.y * delta.y));
+	dir.x = (delta.x * lengthInv);
+	dir.y = (delta.y * lengthInv);
+	return dir;
+}
+
+void main()
+{
+	uvec2 p = gl_GlobalInvocationID.xy;
+	if (any(greaterThanEqual(p, pc.size))) return;
+	highp vec4 ViewportInfo[1]; ViewportInfo[0] = pc.ViewportInfo;
+	highp vec2 in_TEXCOORD0 = (vec2(p) + 0.5) / vec2(pc.size);
+
+	vec4 color;
+	if(OperationMode == 1)
+		color.xyz = textureLod(ps0,in_TEXCOORD0.xy,0.0).xyz;
+	else
+		color.xyzw = textureLod(ps0,in_TEXCOORD0.xy,0.0).xyzw;
+
+	if ( OperationMode!=4)
+	{
+		highp vec2 imgCoord = ((in_TEXCOORD0.xy*ViewportInfo[0].zw)+vec2(-0.5,0.5));
+		highp vec2 imgCoordPixel = floor(imgCoord);
+		highp vec2 coord = (imgCoordPixel*ViewportInfo[0].xy);
+		vec2 pl = (imgCoord+(-imgCoordPixel));
+		vec4  left = textureGather(ps0,coord, OperationMode);
+
+		float edgeVote = abs(left.z - left.y) + abs(color[OperationMode] - left.y)  + abs(color[OperationMode] - left.z) ;
+		if(edgeVote > EdgeThreshold)
+		{
+			coord.x += ViewportInfo[0].x;
+
+			vec4 right = textureGather(ps0,coord + vec2(ViewportInfo[0].x, 0.0), OperationMode);
+			vec4 upDown;
+			upDown.xy = textureGather(ps0,coord + vec2(0.0, -ViewportInfo[0].y),OperationMode).wz;
+			upDown.zw  = textureGather(ps0,coord+ vec2(0.0, ViewportInfo[0].y), OperationMode).yx;
+
+			float mean = (left.y+left.z+right.x+right.w)*0.25;
+			left = left - vec4(mean);
+			right = right - vec4(mean);
+			upDown = upDown - vec4(mean);
+			color.w =color[OperationMode] - mean;
+
+			float sum = (((((abs(left.x)+abs(left.y))+abs(left.z))+abs(left.w))+(((abs(right.x)+abs(right.y))+abs(right.z))+abs(right.w)))+(((abs(upDown.x)+abs(upDown.y))+abs(upDown.z))+abs(upDown.w)));
+			float sumMean = 1.014185e+01/sum;
+			float std = (sumMean*sumMean);
+
+#if defined(UseEdgeDirection)
+			vec3 data = vec3(std, edgeDirection(left, right));
+#else
+			float data = std;
+#endif
+			vec2 aWY = weightY(pl.x, pl.y+1.0, upDown.x,data);
+			aWY += weightY(pl.x-1.0, pl.y+1.0, upDown.y,data);
+			aWY += weightY(pl.x-1.0, pl.y-2.0, upDown.z,data);
+			aWY += weightY(pl.x, pl.y-2.0, upDown.w,data);
+			aWY += weightY(pl.x+1.0, pl.y-1.0, left.x,data);
+			aWY += weightY(pl.x, pl.y-1.0, left.y,data);
+			aWY += weightY(pl.x, pl.y, left.z,data);
+			aWY += weightY(pl.x+1.0, pl.y, left.w,data);
+			aWY += weightY(pl.x-1.0, pl.y-1.0, right.x,data);
+			aWY += weightY(pl.x-2.0, pl.y-1.0, right.y,data);
+			aWY += weightY(pl.x-2.0, pl.y, right.z,data);
+			aWY += weightY(pl.x-1.0, pl.y, right.w,data);
+
+			float finalY = aWY.y/aWY.x;
+			float maxY = max(max(left.y,left.z),max(right.x,right.w));
+			float minY = min(min(left.y,left.z),min(right.x,right.w));
+			float deltaY = clamp(EdgeSharpness*finalY, minY, maxY) -color.w;
+
+			//smooth high contrast input
+			deltaY = clamp(deltaY, -23.0 / 255.0, 23.0 / 255.0);
+
+			color.x = max((color.x+deltaY),0.0);   // (Qualcomm: clamp(..., 0.0, 1.0); see above)
+			color.y = max((color.y+deltaY),0.0);
+			color.z = max((color.z+deltaY),0.0);
+		}
+	}
+
+	ndsr_store(ivec2(p), color.xyz);
+}

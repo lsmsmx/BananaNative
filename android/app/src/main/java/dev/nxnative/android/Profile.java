@@ -10,7 +10,7 @@ import java.util.Map;
 /**
  * A game this APK runs: its profile (dm/games/&lt;title ID&gt;) was compiled into a host of its own, libnxhost_&lt;title ID&gt;.so (build.gradle nxGames,
  * src/main/cpp/CMakeLists.txt), and what the launcher needs of it comes from build.gradle as BuildConfig.NX_PROFILES: one line per game, tab-separated: title ID,
- * name, the shader count Prepare translates, the shader inputs digest, the builds (game.tsv build rows, "version module=build ID …", ';' between builds), and, when the APK has them, the readiness rows (the profile's readiness.tsv: "level|fact|min|what", ';' between rows: Readiness.parseReqs), its status row (playable or bring-up; dm/games/README.md "Readiness rows"), the shader delta rows (vk_delta.tsv's "from" rows: "version=count", ',' between them), its "stamp" rows ("version:old SHA-256:new SHA-256", ';' between them), what Game resolution sets (resolutionEnv), the RomFS checks (romfsChecks) and the GPU timestamp mode (gpuTs).
+ * name, the shader count Prepare translates, the shader inputs digest, the builds (game.tsv build rows, "version module=build ID …", ';' between builds), and, when the APK has them, the readiness rows (the profile's readiness.tsv: "level|fact|min|what", ';' between rows: Readiness.parseReqs), its status row (playable or bring-up; dm/games/README.md "Readiness rows"), the shader delta rows (vk_delta.tsv's "from" rows: "version=count", ',' between them), its "stamp" rows ("version:old SHA-256:new SHA-256", ';' between them), what Game resolution sets (resolutionEnv), the RomFS checks (romfsChecks), the GPU timestamp mode (gpuTs), the default Game resolution (window), whether the game is paced (decoupled), dynamic resolution (drs) and the default frame limit (fpsLimit).
  * A game without a profile here cannot run in this APK (its host has no profile for it): the launcher says so instead of starting it.
  * No Android classes: the JVM test (android/app/src/jvmtest) runs it on the Mac.
  */
@@ -22,6 +22,7 @@ final class Profile {
     String resolution = "";   // what Game resolution sets (build.gradle resolutionOf): "window", "scale:<choice>=<scale>/<console|handheld>,…" or "" (nothing: not offered)
     String gpuTs = "submission";   // game.tsv gpu_timestamps (build.gradle gpuTsOf): "segment" or "submission", what the host does without DM_NVN_GPU_TS (Game settings › GPU timing)
     String window = "";   // game.tsv android_window (build.gradle windowOf): the default Game resolution when the player chose none (Prefs.gameWindow), "" for the main screen's
+    int fpsLimit;   // game.tsv fps_limit (build.gradle fpsLimitOf): the host's frame limit by default, frames a second (0 = none); the launcher offers a frame limit for it (Prefs.limited)
     boolean drs;   // game.tsv has drs_ctl rows (build.gradle drsOf): the host can steer the game's dynamic resolution (Prefs.drsGame)
     boolean decoupled;   // game.tsv has fps_decouple rows (build.gradle decoupleOf): the game's speed follows its measured frame rate, so it gets a frame limit (Prefs.paced)
     String romfsChecks = "";   // game.tsv romfs_check rows (build.gradle romfsChecksOf): "<path>|<line>|<expected or main>", ';' between them (RomfsCheck)
@@ -31,22 +32,81 @@ final class Profile {
 
     /**
      * The host's environment lines for a Game resolution choice (Prefs.WINDOWS: "original", "2560x1440", "1920x1080", "1280x720", "960x540", "848x480"): DM_WINDOW_SIZE=&lt;choice&gt; for a game with
-     * window_fn rows (its window size) or res_levels rows (a cap on its dynamic resolution); DM_GRAPHICS_SCALE and DM_OPMODE from the choice's graphics_scale row for a game that sizes its scenes by the graphics scale (none for a choice
-     * without a row: the game's own); none for a game with neither.
+     * window_fn rows (its window size) or res_levels rows (a cap on its dynamic resolution); DM_GRAPHICS_SCALE and DM_OPMODE from the choice's graphics_scale row for a game that sizes its scenes by the graphics scale. Such a
+     * game has only the few sizes its scales give, so a size choice without a row of its own takes the row of the largest size that fits in it, or the smallest row when none fits (Phone 540p on a game whose
+     * smallest is 1280x720); Original without a row sets nothing (the game's own). None for a game with neither.
      */
     List<String> resolutionEnv(String choice) {
         List<String> env = new ArrayList<>();
         if (resolution.equals("window")) env.add("DM_WINDOW_SIZE=" + choice);
-        else if (resolution.startsWith("scale:")) {
-            for (String r : resolution.substring(6).split(",")) {
-                int eq = r.indexOf('='), sl = r.indexOf('/');
-                if (eq <= 0 || sl < eq || !r.substring(0, eq).equals(choice)) continue;
-                env.add("DM_GRAPHICS_SCALE=" + r.substring(eq + 1, sl));
-                env.add("DM_OPMODE=" + (r.substring(sl + 1).equals("handheld") ? 0 : 1));
-                break;
-            }
+        else {
+            int[] m = scaleRow(choice);
+            if (m != null) { env.add("DM_GRAPHICS_SCALE=" + m[0]); env.add("DM_OPMODE=" + m[1]); }
         }
         return env;
+    }
+
+    /**
+     * Whether Game resolution changes while the game runs (the in-game panel): only for a game with graphics_scale rows, whose host changes the graphics scale and operation mode
+     * live and posts the console's notifications (Native.graphicsModeSet). A window_fn game's window size is written into its code at load, and a res_levels game's level lists
+     * are rewritten in its read-only data at load (loader.c): both apply at the next start.
+     */
+    boolean resolutionLive() { return resolution.startsWith("scale:"); }
+
+    /**
+     * The graphics scale and operation mode for a choice while the game runs (Native.graphicsModeSet): the row resolutionEnv takes, or {-1, -1} where it sets nothing
+     * (Original without a row: the game's own, as a start without the lines); null for a game without graphics_scale rows.
+     */
+    int[] resolutionLive(String choice) {
+        if (!resolutionLive()) return null;
+        int[] m = scaleRow(choice);
+        return m != null ? m : new int[] {-1, -1};
+    }
+
+    /** The choice's graphics_scale row as {scale, operation mode (0 handheld, 1 console)}: its own row, else the largest that fits in it, else the smallest; null when none applies */
+    private int[] scaleRow(String choice) {
+        String r = scalePick(choice);
+        if (r == null) return null;
+        int eq = r.indexOf('='), sl = r.indexOf('/');
+        try { return new int[] {Integer.parseInt(r.substring(eq + 1, sl)), r.substring(sl + 1).equals("handheld") ? 0 : 1}; } catch (NumberFormatException e) { return null; }
+    }
+
+    /**
+     * A choice's label for this game: Prefs' name, plus the size the game really draws when its graphics_scale rows have no row of that size
+     * ("Phone 540p (960x540) · draws 1280x720 here"), so a choice that falls back to another does not look like it did nothing
+     */
+    String windowLabel(String choice, String name) {
+        String r = scalePick(choice);
+        if (r == null || r.startsWith(choice + "=")) return name;
+        String c = r.substring(0, r.indexOf('='));
+        return size(c) == null ? name : name + " \u00b7 draws " + c + " here";
+    }
+
+    /** The graphics_scale row a choice takes ("WxH=scale/mode"): its own, else the largest that fits in it, else the smallest; null without rows */
+    private String scalePick(String choice) {
+        if (!resolution.startsWith("scale:")) return null;
+        String hit = null, fit = null, least = null;
+        long fitPx = -1, leastPx = Long.MAX_VALUE;
+        int[] want = size(choice);
+        for (String r : resolution.substring(6).split(",")) {
+            int eq = r.indexOf('='), sl = r.indexOf('/');
+            if (eq <= 0 || sl < eq) continue;
+            String c = r.substring(0, eq);
+            if (c.equals(choice)) { hit = r; break; }
+            int[] s = size(c);
+            if (s == null || want == null) continue;
+            long px = (long) s[0] * s[1];
+            if (s[0] <= want[0] && s[1] <= want[1] && px > fitPx) { fit = r; fitPx = px; }
+            if (px < leastPx) { least = r; leastPx = px; }
+        }
+        return hit != null ? hit : fit != null ? fit : least;
+    }
+
+    /** "WxH" as {w, h}; null for "original" or anything else */
+    private static int[] size(String c) {
+        int x = c.indexOf('x');
+        if (x <= 0) return null;
+        try { return new int[] {Integer.parseInt(c.substring(0, x)), Integer.parseInt(c.substring(x + 1))}; } catch (NumberFormatException e) { return null; }
     }
 
     /** Whether any game of this APK has Game resolution (Settings shows its default only then) */
@@ -79,6 +139,7 @@ final class Profile {
             p.window = c.length > 12 ? c[12] : "";
             p.decoupled = c.length > 13 && c[13].equals("1");
             p.drs = c.length > 14 && c[14].equals("1");
+            try { p.fpsLimit = c.length > 15 && !c[15].isEmpty() ? Math.max(0, Integer.parseInt(c[15])) : 0; } catch (NumberFormatException e) { p.fpsLimit = 0; }
             out.add(p);
         }
         return Collections.unmodifiableList(out);

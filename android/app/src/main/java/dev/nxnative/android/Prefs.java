@@ -88,18 +88,38 @@ final class Prefs {
     /** The in-game panel's own size and text size (PanelLook: 0 Small, 1 Normal, 2 Large), for every game */
     static int panelSize(Context c) { return PanelLook.of(of(c).getInt("panel_size", PanelLook.NORMAL)); }
     static void panelSize(Context c, int v) { of(c).edit().putInt("panel_size", PanelLook.of(v)).commit(); }
+    /** Settings › Controller: in-game panel (PadPanel.OPEN_*): how a controller opens and closes the in-game panel, for every game; Home, or − and + held, by default */
+    static int panelPad(Context c) { return PadPanel.open(of(c).getInt("panel_pad", PadPanel.OPEN_BOTH)); }
+    static void panelPad(Context c, int v) { of(c).edit().putInt("panel_pad", PadPanel.open(v)).commit(); }
+    /** The one-time hint over the game that says how the panel opens (GameActivity.panelHint), once it has been shown */
+    static boolean panelHinted(Context c) { return of(c).getBoolean("panel_hint", false); }
+    static void panelHinted(Context c, boolean v) { of(c).edit().putBoolean("panel_hint", v).commit(); }
     static int panelText(Context c) { return PanelLook.of(of(c).getInt("panel_text", PanelLook.NORMAL)); }
     static void panelText(Context c, int v) { of(c).edit().putInt("panel_text", PanelLook.of(v)).commit(); }
-    /** Games whose speed follows the measured frame rate (their profile has fps_decouple rows: the host's sead_decouple) get a frame limit instead of 60 / 30 / 20 locking.
+    /** Games whose speed follows the measured frame rate (their profile has fps_decouple sead: the host's sead_rate) get a frame limit instead of 60 / 30 / 20 locking.
      *  The limit is one of PACE_CAPS: 0 = 60 fps (the game's fastest rate, where the measured rate is clamped), or at most that many frames a second (paceOf) */
-    static final int[] PACE_CAPS = {0, 45, 40, 30};
+    static final int[] PACE_CAPS = {0, 45, 40, 30, 20};   // saved as the rate itself (fps_cap), not an index: 20 was added last, the others keep their meaning
     static boolean paced(String titleId) { Profile p = Profile.of(titleId); return p != null && p.decoupled; }
-    static int paceOf(int v) { return v <= 0 || v >= 60 ? 0 : v >= 45 ? 45 : v >= 40 ? 40 : 30; }
+    /** Games the host's frame limiter caps (hle_fpslock.c fps_limit_wait, DM_FPS_LIMIT): the paced ones, and those whose profile sets a default limit (game.tsv fps_limit, a game
+     *  with no limiter of its own the host can write). Both get a frame limit (PACE_CAPS) in place of 60 / 30 / 20 locking */
+    /** Full game speed at low frame rates (per game, default on), for paced games: sead's controller hands the game the measured frame rate (hle_fpslock.c sead_rate).
+     *  Off: the game's own 60 / interval, as on the console (DM_FPS_DECOUPLE=0 at start, Native.decoupleSet while it runs). Game settings and the in-game panel share it */
+    static boolean decouple(Context c, String titleId) { return of(c).getBoolean(gameKey("decouple", titleId), true); }
+    static void decouple(Context c, String titleId, boolean on) { of(c).edit().putBoolean(gameKey("decouple", titleId), on).commit(); }
+    static boolean limited(String titleId) { Profile p = Profile.of(titleId); return p != null && (p.decoupled || p.fpsLimit > 0); }
+    /** The profile's default frame limit (game.tsv fps_limit), 0 without one */
+    static int profileLimit(String titleId) { Profile p = Profile.of(titleId); return p == null ? 0 : p.fpsLimit; }
+    /** A saved cap as one of PACE_CAPS: the highest at or below it, 20 below that (the main screen's 15 for the other games). Since 20 was added a saved 20 or 15 (only the main
+     *  screen's default can be one) is 20 fps here, where it was 30 */
+    static int paceOf(int v) { return v <= 0 || v >= 60 ? 0 : v >= 45 ? 45 : v >= 40 ? 40 : v >= 30 ? 30 : 20; }
     static String paceLabel(int v) { return (v <= 0 ? 60 : v) + " fps"; }   // 0 is 60: the game's own fastest rate, where the decoupling's rate is clamped
-    /** A paced game's cap as saved, without capOf (which turns 45 and 40 into 30 for the other games): its own, else the default, as one of PACE_CAPS */
-    static int paceCap(Context c, String titleId) { return paceOf(of(c).getInt(gameKey("fps_cap", titleId), of(c).getInt("fps_cap", -1))); }
+    /** A limited game's cap as saved, without capOf (which turns 45 and 40 into 30 for the other games): its own, else its profile's fps_limit, else the main screen's default, as one of PACE_CAPS */
+    static int paceCap(Context c, String titleId) {
+        int pl = profileLimit(titleId);
+        return paceOf(of(c).getInt(gameKey("fps_cap", titleId), pl > 0 ? pl : of(c).getInt("fps_cap", -1)));
+    }
     /** Game settings › Reset to defaults: every choice of the game's own back to the main screen's default (Extra environment's lines stay) */
-    static final String[] GAME_SETTINGS = {"window", "fps_cap", "gpu_driver", "gpu_ts", "pause_return", "ndsr_choice2", "ndsr_sharp", "drs2", "ram_saver"};
+    static final String[] GAME_SETTINGS = {"window", "fps_cap", "gpu_driver", "gpu_ts", "pause_return", "ndsr_choice2", "ndsr_sharp", "drs2", "ram_saver", "decouple"};
     static void resetGame(Context c, String titleId) {
         SharedPreferences.Editor e = of(c).edit();
         for (String k : GAME_SETTINGS) e.remove(gameKey(k, titleId));

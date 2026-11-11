@@ -36,8 +36,26 @@ sys_resource	0x3000000
 shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=layout
 shader_note	Ocarina of Time shaders
 
+# ---- Frame rate ----
+# Android: held to 30 fps by the host's frame limiter by default (the launcher's Frame rate cap and DM_FPS_LIMIT override it). Link's house runs 37-38 fps from cool and
+# 27-32 once hot, the phone 23 C warmer over a run; at 30 every frame is 33.3 ms and it warms 12 C (README.md "Profile"). Kokiri Forest is below 30 anyway
+fps_limit	30
+# The frame step (patches.py) in whole vsyncs decided by the host, also with no limit (the launcher's 60): left to the game's own controller, the game kept interval 1 at 25 fps on the
+# phone (0.4 of real time; its controller's frame costs, framework +0x148 / +0x150, said 60 fits). The limit above caps the step (hle_fpslock.c dm_fps_step_fold): 30 fps = 2 vsyncs a frame
+fps_target	60
+
 # ---- Graphics ----
 op_mode	handheld
+# The window crop the scene is upscaled into follows the operation mode and the Switch 2 graphics scale, not a window getter (README, Render size): the display state
+# (main+0x6502e0) takes the scale from oe::GetCurrentGraphicsScale (main+0xe376d8) and picks the crop from a size table (main+0x112c5e0, as Mario Kart World):
+# handheld scale 0 or 1 1920x1080, scale 2 1280x720 where the handheld parameters allow it; console scale 1 2560x1440 (at most: the crop is also capped by the mode's
+# base size times the scale's factor, 2048x1152 on Mario Kart World). The Android launcher's Game resolution sets these. Phone 1440p and Original are console scale 1,
+# the console's own docked picture (console mode: the game reports a docked controller and runs its scale-1-only passes). 540p and 480p have no row: no mode and scale
+# goes below 1280x720, so they take the smallest row, 1280x720 (Profile.resolutionEnv)
+graphics_scale	original	1	console
+graphics_scale	2560x1440	1	console
+graphics_scale	1920x1080	0	handheld
+graphics_scale	1280x720	2	handheld
 # agl wraps its clears in render conditions on Donkey Kong Bananza and Splatoon Raiders; the same library here
 render_cond	on
 pool_skip_retired	on

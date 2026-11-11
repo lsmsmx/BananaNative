@@ -104,9 +104,11 @@ void mtl_set_frame(uint64_t f) {
           vka_enc_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           vka_floor_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb);
           vka_rp_bar_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
+          vka_gbar_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           oq_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           { void vka_drv_memo_stats(char *b, size_t n); vka_drv_memo_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb); } }
         { static uint64_t fc; if (f - fc >= 1800) { vka_disp_census(f); fc = f; } }   // (every 1,800 frames)
+        vka_dobj_census(f);   // DM_VK_DISP_OBJ (its own interval)
         f0 = f; d0 = g_stat_draws; rp0 = vka_n_rp; b0 = vka_n_bar; ub0 = g_n_ub; s0 = g_n_sub; r0 = g_rec_ns; o0 = g_stat_ops; pc0 = g_n_pclear; ch0 = g_n_chunks;
     }
 }
@@ -287,7 +289,8 @@ static void post_run(void *ops_, int n) {   // the completion thread, in submiss
             uint64_t rec[2] = {DM_GAME_RENDER_COND ? 0 : tk, tk}; (void)tt;
             memcpy((void *)(uintptr_t)ops[i].addr, rec, sizeof rec); continue;
         }
-        if (ops[i].kind == 1) { volatile uint32_t *v = (volatile uint32_t *)(uintptr_t)ops[i].addr; if (ops[i].mode == NVN_EVENT_SIGNAL_MODE_ADD) *v += ops[i].v; else *v = ops[i].v; }
+        if (ops[i].kind == 1) { volatile uint32_t *v = (volatile uint32_t *)(uintptr_t)ops[i].addr; if (ops[i].mode == NVN_EVENT_SIGNAL_MODE_ADD) *v += ops[i].v; else *v = ops[i].v;
+                                vka_qtrace(QT_LAND, 0, vka_done(), 0, ops[i].mode, ops[i].v, *v, 0, v); }
         else {
             // A timestamp report's counter: the time, or 0 under render_cond (as on the GPU, nvn_mtl.m rc_value). Samples passed not counted (oq_report: DM_VK_OCCLUSION=0, no query
             // pool, no reset before it, no GPU): 1, so occlusion culling keeps everything visible
@@ -375,12 +378,18 @@ void vka_exec_hang_report(uint64_t fence) {
     uint64_t t = now_ns();
     for (uint64_t f = fence; f < fence + NHREC; f++) {
         int i = (int)(f % NHREC); if (g_hrec[i].fence != f) continue;
-        VRED("GPU hang: submission %llu (frame %llu, queue serial %llu): %llu draws, %llu clears / copies, %llu skipped, recorded in %.2f ms, handed to the queue %.2f s before",
+        // sub_ns 0: its commit had not returned from the submit yet (the submit that failed is this one's), so nothing of it after its last part split went to the queue.
+        // (Printed as "-1.00 s before" until 2026-11-10.) A submission cut at a GPU wait is entered at each of its commits: these are its latest
+        char when[96];
+        if (g_hrec[i].sub_ns) snprintf(when, sizeof when, "its latest commit handed to the queue %.2f s before", (t - g_hrec[i].sub_ns) / 1e9);
+        else snprintf(when, sizeof when, "its latest commit is the submit that failed (not handed to the queue)");
+        VRED("GPU hang: submission %llu (frame %llu, queue serial %llu): %llu draws, %llu clears / copies, %llu skipped, recorded in %.2f ms, %s",
              (unsigned long long)g_hrec[i].fence, (unsigned long long)g_hrec[i].frame, (unsigned long long)g_hrec[i].queue, (unsigned long long)g_hrec[i].draws,
-             (unsigned long long)g_hrec[i].ops, (unsigned long long)g_hrec[i].skipped, g_hrec[i].t_ns / 1e6, g_hrec[i].sub_ns ? (t - g_hrec[i].sub_ns) / 1e9 : -1.0); }
+             (unsigned long long)g_hrec[i].ops, (unsigned long long)g_hrec[i].skipped, g_hrec[i].t_ns / 1e6, when); }
     unsigned k = (g_slot_i - 1) % NSLOT;
     if (g_slot_ts[k]) VRED("GPU hang: the submission being recorded (frame %llu) had handed %u parts to the queue, %u of them seen finished", (unsigned long long)g_slot_frame[k],
                            g_slot_parts[k] - 1, g_part_seen);
+    vka_qtrace_dump();   // the scheduler's and the submissions' last events (vka_worker.c, DM_VK_QS_TRACE)
 }
 
 // Where a submission's recording time goes besides its draws, for the pace line (vka_exec_phases, cumulative ns): mtl_sub_begin (the slot's fence, the command buffer's reset
@@ -409,7 +418,15 @@ static void replay_nice(void) {
     else { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("replay thread %d: priority %d (was %d; DM_VK_REPLAY_NICE=%d)", t, nice, orig, want); }
     cur = want;
 }
+// A submission cut at a GPU wait (vka_qsched.h) goes on in a submission of the replay's own once its producer has been replayed. It is still the game's one submission:
+// the texture work of a submission's start (vka_tex_prepare: re-uploads of textures the CPU wrote, the texture pool's table, the scans over every live image) was done at
+// its first part, at or after the game submitted it, and the CPU's writes since belong to the game's later submissions, whose own start takes them. Done again at each
+// continuation it cost Mario Kart World 1.8.0, which parks 6 times a frame (5 of them after a cut), ~0.7 ms each on the Adreno 840 phone: 9 submissions a frame
+// instead of 4, texture prepare 6.8 ms a frame instead of 3.9
+static int g_sub_cont;
+void vka_rp_sub_cont(int on) { g_sub_cont = on != 0; }
 void vka_rp_sub_begin(void) {
+    int cont = g_sub_cont; g_sub_cont = 0;
     uint64_t tb0 = now_ns();
     vka_perf_thread(0); vka_ctl_sub();
     atomic_store_explicit(&g_rec_tid, gettid(), memory_order_relaxed); replay_nice();
@@ -418,6 +435,7 @@ void vka_rp_sub_begin(void) {
     if (!vka_init()) return;
     vka_gpu_floor();
     if (vka_hung()) { VRED_ONCE("GPU hang: submissions from now on run their effects without the GPU"); return; }   // no command buffer: mtl_sub_commit takes the CPU path
+    vka_mem_join_due();   // parts of a pool placed by parts that a range given to the GPU lies across, joined into one (vka_mem.c "Joining parts"): before anything is recorded
     g_sub_draws0 = g_stat_draws; g_sub_ops0 = g_stat_ops; g_sub_skip0 = g_stat_skipped; g_sub_t0 = now_ns(); g_n_sub++; g_rc_rec = 1;
     if (!g_pool) {
         VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qf};
@@ -441,6 +459,7 @@ void vka_rp_sub_begin(void) {
     vk.vkResetCommandBuffer(g_cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vk.vkBeginCommandBuffer(g_cb, &bi);
+    vka_gbar_cb(g_cb);   // the game's barriers between dispatches (vka_gbar.c) follow this command buffer
     if (ts_init()) {
         qf.reset(g_cb, g_qp, k * QPS, QPS); qf.write(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_qp, k * QPS);
         g_slot_frame[k] = g_frame; g_slot_ts[k] = 1; g_slot_parts[k] = 1; g_part_seen = 0; gpu_tag_begin(g_frame);
@@ -455,8 +474,8 @@ void vka_rp_sub_begin(void) {
     vka_gp_sub_begin(g_cb, g_frame);
     vka_enc_start(g_cb);
     vka_barrier(g_cb);   // the host's writes to guest memory before this submission (made available by the submit), and earlier submissions' writes
-    { uint64_t tp0 = now_ns(); vka_tex_prepare(g_cb); g_t_prep += now_ns() - tp0; }
-    vka_barrier(g_cb);   // the re-uploads of CPU-written textures before the submission's draws read them
+    if (!cont) { uint64_t tp0 = now_ns(); vka_tex_prepare(g_cb); g_t_prep += now_ns() - tp0;
+                 vka_barrier(g_cb); }   // the re-uploads of CPU-written textures before the submission's draws read them
     vka_draw_sub_begin(g_cb, k);
     { void vka_pso_pause(int on); vka_pso_pause(0); }   // the game submits: resumed (mtl_drain paused the pipeline threads)
     g_chunk_draws = VKA_ENV("DM_VK_CHUNK", 600);   // live: from the next submission
@@ -468,13 +487,17 @@ void vka_rp_sub_begin(void) {
 // 600; 0 = one part) of the part in progress, the part is ended and submitted without a signal, and the submission goes on in the slot's next command buffer. The parts run
 // in order on the one queue, and the barriers recorded in a part cover what later parts do (submission order); only the last part signals the submission's fence.
 // On the Adreno 840 phone, Donkey Kong Bananza's level recorded ~45 ms a frame before its GPU work (~30 ms) began, and the game waited for that frame's fence (@sync_ms ~64)
-typedef struct { VkCommandBuffer cb; uint32_t q; } part_arg;   // q: the part's bottom (part_submit) or top (part_begin) timestamp query, UINT32_MAX = none
+typedef struct { VkCommandBuffer cb; uint32_t q; uint64_t gate; } part_arg;   // q: the part's bottom (part_submit) or top (part_begin) timestamp query, UINT32_MAX = none; gate: see g_gate_next
+// A gate (vka_qsched.h "Waits for the CPU", vka_dev.c "Gates"): the replay's next submission to the queue waits for this value of the gate semaphore (0: none)
+static uint64_t g_gate_next;
+static uint64_t gate_take(void) { uint64_t g = g_gate_next; g_gate_next = 0; return g; }
 static void part_submit(const void *a) {   // the part ends and goes to the queue (on the encoder thread when it is on)
     part_arg pa; memcpy(&pa, a, sizeof pa); VkCommandBuffer cb = pa.cb;
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, pa.q);
     VkResult r = vk.vkEndCommandBuffer(cb);
-    if (!r) r = vka_submit(cb, 0, 0, NULL, NULL, NULL, VK_NULL_HANDLE);
-    if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); }
+    VkSemaphore gs = vka_gate_sem(); VkPipelineStageFlags gst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (!r) r = vka_submit(cb, 0, pa.gate && gs ? 1 : 0, &gs, &pa.gate, &gst, VK_NULL_HANDLE);
+    if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("part of a submission: %d", r); vka_qtrace(QT_SUBMIT_ERR, 0, 0, 0, (uint32_t)r, 0, 0, 0, NULL); }
 }
 static void part_begin(const void *a) {
     part_arg pa; memcpy(&pa, a, sizeof pa); VkCommandBuffer cb = pa.cb;
@@ -497,6 +520,7 @@ static void parts_peek(unsigned k) {
         g_part_seen++;
     }
 }
+static uint64_t g_cur_fence;   // (below)
 static void chunk(void) {
     unsigned k = (g_slot_i - 1) % NSLOT;
     parts_peek(k);
@@ -509,15 +533,17 @@ static void chunk(void) {
     VkCommandBuffer next = g_slot[k].x[g_nx++];
     // The part's bottom and the next part's top timestamps (the slot's queries were reset at the submission's start, in its first part)
     uint32_t part = g_slot_parts[k]; int ts = g_slot_ts[k] && part < NCHUNK + 1;
-    part_arg pe = {g_cb, ts ? k * QPS + 2 * (part - 1) + 1 : UINT32_MAX}, pb = {next, ts ? k * QPS + 2 * part : UINT32_MAX};
+    part_arg pe = {g_cb, ts ? k * QPS + 2 * (part - 1) + 1 : UINT32_MAX, gate_take()}, pb = {next, ts ? k * QPS + 2 * part : UINT32_MAX, 0};
     if (ts) g_slot_parts[k] = part + 1;
     if (VKA_ENV("DM_VK_PARTLOG", 0)) { char zb[400]; vka_rp_zstats(zb, sizeof zb);
         VLOG("part %u of the submission of frame %llu ended at %.3f s: %llu draws%s", part, (unsigned long long)g_frame, now_ns() / 1e9, (unsigned long long)(g_stat_draws - g_chunk_d0), zb); }
+    vka_gbar_settle(g_cb);   // a game barrier left pending (vka_gbar.c), in this part: it covers the parts after it
     vka_up_flush(); vka_up_throttle();   // the upload batch goes first: the part may use what it made (vka_dev.c "Upload batches")
     // With the encoder the part's end, its submit and the next part's reset and begin are made on its thread, in order with the calls before: the replay thread goes on
     if (vka_enc_call(part_submit, &pe, sizeof pe)) { vka_enc_call(part_begin, &pb, sizeof pb); vka_enc_switch(next); }
     else { part_submit(&pe); part_begin(&pb); }
-    g_cb = next;
+    vka_qtrace(QT_PART, S.serial, g_cur_fence, 0, part, 0, 0, 0, NULL);
+    g_cb = next; vka_gbar_cb(g_cb);
     vka_draw_cb_switch(g_cb); vka_gp_part(g_cb);
     g_chunk_d0 = g_stat_draws; g_n_chunks++;
 }
@@ -526,6 +552,14 @@ static void chunk(void) {
 // all of it was recorded then starts on the GPU while the rest is recorded. Donkey Kong Bananza's level (Adreno 840, DM_VK_GPUPROF): the extra splits cost no measurable GPU
 // time (20.2-20.5 ms a frame with them, 20.8-21.0 without); with the GPU clock floor the GPU finished 6-10 ms after recording instead of 10-33
 static inline void chunk_check(void) {
+    int gs = vka_gp_split();   // DM_VK_GPUPROF_SPLIT (vka_gprof.c): in the profiled frame a pass ends after every gs draws and opens again at the next one, with no new part
+    if (gs > 0 && g_cb) {   // nd: draws in the open pass; ob: the draw about to come opens a pass (none open over its targets, or this split ended it)
+        static uint64_t rp; static uint32_t nd; static int ob;
+        if (vka_rp_open_for(&S.rt, S.has_rt)) {
+            if (vka_n_rp != rp) { rp = vka_n_rp; nd = (uint32_t)ob; }   // a pass a draw opened holds that draw; one a clear opened holds none yet
+            if (nd >= (uint32_t)gs) { vka_rp_end(); ob = 1; } else { nd++; ob = 0; }
+        } else ob = 1;
+    }
     if (!g_cb || g_nx >= NCHUNK) return;   // no part left: chunk() would do nothing and leave the draw count, so every later draw would end its pass
     uint64_t in = g_stat_draws - g_chunk_d0;
     if (g_chunk_draws > 0 && in >= (uint64_t)g_chunk_draws && vka_rp_split_ok(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); return; }
@@ -583,6 +617,7 @@ static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     vka_disp_settle(g_cb);   // the submission's last dispatches before the steps below and the next submission's (vka_draw.c "Dispatch order")
     vka_rw_point(g_cb, 'e', 0, 0, 0); vka_rw_commit(fence);   // DM_VK_RANGE_WATCH: the bytes at the submission's end, logged once it is done
     vka_tex_writeback(g_cb);   // linear textures the GPU wrote, back into their storage for the CPU
+    vka_tex_pfb_commit(g_cb, fence);   // the texture IDs its shaders read through the pool: copied out for the host (the barrier below) and cleared
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT};
     vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     uint64_t tc0 = now_ns();
@@ -601,7 +636,7 @@ static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     uint64_t tc1 = now_ns(); g_t_cm_up += tc1 - tc0;
     unsigned ks = (g_slot_i - 1) % NSLOT;
     if (!signal && !g_slot[ks].vf) { VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; if (vk.vkCreateFence(V.dev, &fi, NULL, &g_slot[ks].vf)) g_slot[ks].vf = VK_NULL_HANDLE; }
-    if (!r) r = vka_submit_fence(g_cb, signal, !signal ? g_slot[ks].vf : VK_NULL_HANDLE);
+    if (!r) r = vka_submit_fence(g_cb, signal, !signal ? g_slot[ks].vf : VK_NULL_HANDLE, gate_take());
     if (!r && !signal && g_slot[ks].vf) g_slot[ks].vf_on = 1;   // (no fence made: the slot waits for the timeline, as a signalled one)
     g_t_cm_sub += now_ns() - tc1;
     g_hrec[fence % NHREC].sub_ns = now_ns();
@@ -610,11 +645,11 @@ static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     vka_scratch_retire(fence);
     if (r) {
         static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("submission %llu: %d (its effects run without the GPU)", (unsigned long long)fence, r);
+        vka_qtrace(QT_SUBMIT_ERR, S.serial, fence, 0, (uint32_t)r, 0, 0, 0, NULL);
         VkResult sr = VK_SUCCESS;
         if (signal) {
-            VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = V.tl, .value = signal};
             pthread_mutex_lock(&V.qmu);   // signalled by the host: later submissions may wait for it
-            sr = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkSignalSemaphore(V.dev, &si);
+            sr = vka_hung() ? VK_ERROR_DEVICE_LOST : vka_host_signal(V.tl, signal);
             if (!sr && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
             pthread_mutex_unlock(&V.qmu);
         }
@@ -1144,12 +1179,19 @@ static void seg_write(const void *a) { struct { VkCommandBuffer cb; VkPipelineSt
 int vka_wait_pass(uint32_t op, const void *a, const uint8_t *rec);   // vka_worker.c
 void vka_event_replayed(volatile uint32_t *w, uint32_t mode, uint32_t v);
 static qs_cont *g_pk;
+// A later record of an indirect-count multi-draw that its first record makes whole (vka_draw.c vka_mdi_gpu): nothing of its own to record
+static int mdi_rest(uint32_t op, const void *a, uint32_t size) {   // (a multi-draw's record is always whole: hle_nvn.c rec_draw; a plain draw's stops before ind)
+    if (op == OP_DRAW) { if (size - 8 < sizeof(p_draw)) return 0; const p_draw *d = a; return d->mdi_cnt && d->mdi_i > 0 && d->prim != NVN_PRIM_MESH && vka_mdi_gpu(0, d->mdi_n, d->mdi_stride); }
+    if (op == OP_DRAW_IDX) { if (size - 8 < sizeof(p_draw_idx)) return 0; const p_draw_idx *d = a; return d->mdi_cnt && d->mdi_i > 0 && vka_mdi_gpu(1, d->mdi_n, d->mdi_stride); }
+    return 0;
+}
 static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk holds where it goes on)
     if (g_rec_prof_on < 0) g_rec_prof_on = VKA_ENV("DM_VK_REC_PROF", 0) != 0;
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         uint64_t rk0 = g_rec_prof_on == 1 ? rk_cnt() : 0;
         const void *a = p + 8;
+        if ((h.op == OP_DRAW || h.op == OP_DRAW_IDX) && h.size >= 8 && mdi_rest(h.op, a, h.size)) { p += h.size; continue; }
         int bar_kept = 0;   // a game barrier taken inside the open pass (vka_rp_game_barrier): no pass end, no full barrier
         switch (h.op) {   // GPU work other than a dispatch: after the barrier the dispatches before it left pending (vka_draw.c "Dispatch order"), and before a part ends at a draw
         case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_TEX: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_CLEAR_TEX: case OP_CLEAR_BUF: case OP_COPY_B2B: case OP_COPY_B2T:
@@ -1216,7 +1258,7 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
         case OP_COPY_B2T: if (g_cb) copy_bt(a, 1); break;
         case OP_COPY_T2B: mdx_write(); if (g_cb) { vka_rw_pre(g_cb); copy_bt(a, 0); vka_rw_point(g_cb, 't', 0, 0, 0); } break;
         case OP_COPY_T2T: if (g_cb) copy_t2t(a); break;
-        case OP_BARRIER: if (g_cb && !bar_kept) vka_barrier(g_cb); break;
+        case OP_BARRIER: if (g_cb && !bar_kept) { int32_t bits; memcpy(&bits, a, 4); if (!vka_gbar_game(g_cb, (uint32_t)bits)) vka_barrier(g_cb); } break;   // (vka_gbar.c: between dispatches, a compute-to-compute barrier at the next one)
         case OP_DRAW: if (S.rc_skip) vka_rtlog_skip(&S.rt, S.has_rt, &S.d, "skipped by a render condition");
                       if (!S.rc_skip && g_cb) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t); g_stat_draws++; mdx_before_draw(p, d); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);
                           vka_draw(&S.d, &S.rt, S.has_rt, &S.sc, S.has_sc, d, NULL); oq_lost(sk); } else if (!S.rc_skip && g_oq_count) g_oq_lost++; break;
@@ -1231,6 +1273,24 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
 if (rk0 && h.op < OP_COUNT_) { g_rk_t[h.op] += rk_cnt() - rk0; g_rk_n[h.op]++; }
         if (h.size < 8) { VRED("command record of size %u at %p (op %u): the list is cut here", h.size, (const void *)p, h.op); return 0; }
         p += h.size;
+    }
+}
+// A gate at a wait of the submission being replayed (vka_worker.c): what it recorded so far goes to the queue as a part of its own (when a part is left), so only the
+// commands after the wait wait for the gate; at a submission's first wait nothing is recorded yet and its first submission waits. ev: the gate's host event (vka_dev.c
+// "Gates"): the commands after the wait wait for it too, with the host's writes before it in scope (the CPU's writes before its signal, made after this went to the queue)
+typedef struct { VkCommandBuffer cb; VkEvent ev; } gate_ev_arg;
+static void gate_ev_wait(const void *a) {   // (on the encoder thread when it is on: in order with the calls before)
+    gate_ev_arg ga; memcpy(&ga, a, sizeof ga);
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+    vk.vkCmdWaitEvents(ga.cb, 1, &ga.ev, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 1, &mb, 0, NULL, 0, NULL);
+}
+void vka_rp_gate(uint64_t g, VkEvent ev) {
+    if (g_cb && g_nx < NCHUNK && g_stat_ops > g_sub_ops0) { vka_disp_settle(g_cb); vka_rp_end(); chunk(); }
+    if (g > g_gate_next) g_gate_next = g;   // (two gates before a submission: the later one, as gates open in order)
+    if (g_cb && ev) {   // (outside a pass: a wait with the host stage may not be in one)
+        vka_rp_end();
+        gate_ev_arg ga = {g_cb, ev};
+        if (!vka_enc_call(gate_ev_wait, &ga, sizeof ga)) gate_ev_wait(&ga);
     }
 }
 void vka_rp_exec(const uint8_t *handle, uint64_t fence) { if (fence) g_cur_fence = fence; if (handle) { g_pk = NULL; g_nxret = 0; exec(handle, 0); } }

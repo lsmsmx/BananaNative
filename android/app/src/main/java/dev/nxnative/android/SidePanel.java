@@ -7,6 +7,7 @@ import android.graphics.Typeface;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
@@ -20,23 +21,41 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 
 /**
- * The in-game panel: slides in from the right over the running game, which goes on behind it. It holds the frame rate cap (Native.fpsCapSet), frame generation
- * (Lsfg.rows, Native.frameGenSet), the Upscaler and the dynamic resolution (GameUpscaler.rows, DrsSlider), the picture (Fit / Stretch, its size and position: GameActivity.picture, TouchControls.positionRows),
+ * The in-game panel: slides in from the right over the running game, which goes on behind it, in four tabs (TAB_NAMES: Performance, Display, Controls, General;
+ * a tab bar at its top with a close button, switched by a tap or a controller's L / R) so that each fits the screen of a phone held in landscape. It holds the frame rate cap (Native.fpsCapSet), frame generation
+ * (Lsfg.rows, Native.frameGenSet), the Upscaler and the dynamic resolution (GameUpscaler.rows, DrsSlider), Game resolution (resolutionRow, in Display: live for a game with graphics_scale rows), the picture (Fit / Stretch, its size and position: GameActivity.picture, TouchControls.positionRows),
  * the overlay's items (Overlay.rows), which gamepad is Player 1 (PadOrder), the on-screen controls' rows (TouchControls.controlRows), the panel's own size and text size (PanelLook), a shortcut to this
  * game's Button mapping (which applies at the next start) and Stop. Every other change applies at once, without going back to the launcher, and is
  * kept for the next start. Opened by Back (the phone's button or its edge swipe), a long press on the on-screen controls'
- * show / hide button, or a gamepad's Home / guide button (KEYCODE_BUTTON_MODE); closed the same ways, by a tap beside it, or by B on a gamepad, whose D-pad and A move
- * through it meanwhile (GameActivity.dispatchKeyEvent).
+ * show / hide button, a swipe in from the right edge, or a controller (PadPanel: Home, or − and + held; Settings › Controller: in-game panel); closed the same
+ * ways, by a tap beside it or its ✕, or by the controller's B. With a controller (padKey, padMotion) the D-pad and the left stick move the focus (held: repeated),
+ * left / right also step a radio group or a slider, A presses, L / R switch tabs; A and B are the buttons that are the Switch's A and B in this game
+ * (PadPanel.confirmBack, the game's Button mapping). The focused row has a yellow frame (focusMoved): the theme's own focus highlight is hard to see on the panel.
  */
 final class SidePanel extends FrameLayout {
     private final Activity act;
-    private final LinearLayout box;
+    private final LinearLayout box, tabs;
     private final View sheet;
+    private final ScrollView scroll;
     private final Rows rows;
     private TextView fpsNow, lsfgNow;
     private RadioGroup caps;
     private boolean open;
     private final Runnable tick = this::refresh;
+
+    // The tabs: each a builder of its own (build); Performance's rows refresh twice a second while it shows
+    static final String[] TAB_NAMES = {"Performance", "Display", "Controls", "General"};
+    private static final int TAB_PERF = 0, TAB_DISPLAY = 1, TAB_CONTROLS = 2, TAB_GENERAL = 3;
+    private int tab = TAB_PERF;
+    private static final int FOCUS = 0xFFFFD54F;   // the tab bar's selected tab and the focus frame: a banana yellow, dark text on it
+
+    // A controller: its confirm and back keys (padButtons), the held direction and its repeat
+    private int confirm = KeyEvent.KEYCODE_BUTTON_B, back = KeyEvent.KEYCODE_BUTTON_A;
+    private int heldDir = PadPanel.NONE, stickHeld = PadPanel.NONE, repeats;
+    private final Runnable repeat = this::repeatTick;
+    private View lit;   // the view with the focus frame
+    /** GameActivity: the game's held buttons released when the panel opens (releaseGameInput) */
+    Runnable onOpen;
 
     /** The rows GameActivity adds from its on-screen controls (TouchControls) */
     interface Rows {
@@ -45,7 +64,7 @@ final class SidePanel extends FrameLayout {
     }
 
     // The ids of the choices a rebuild gives the focus back to (restyle)
-    private static final int ID_SIZE = 5000, ID_TEXT = 5100, ID_FIT = 5200, ID_MAP = 5300, ID_ONE = 5400;
+    private static final int ID_SIZE = 5000, ID_TEXT = 5100, ID_FIT = 5200, ID_MAP = 5300, ID_ONE = 5400, ID_RES = 5500;
 
     SidePanel(Activity a, Rows rows) {
         super(a);
@@ -60,27 +79,41 @@ final class SidePanel extends FrameLayout {
         box.setOrientation(LinearLayout.VERTICAL);
         int p = Math.round(16 * dp);
         box.setPadding(p, p, p, p);
-        ScrollView sv = new ScrollView(a);
-        sv.setBackgroundColor(0xF0202124);
-        sv.addView(box);
-        addView(sv, new LayoutParams(PanelLook.widthPx(Prefs.panelSize(a), dp, a.getResources().getDisplayMetrics().widthPixels), LayoutParams.MATCH_PARENT, Gravity.END));
-        sheet = sv;
+        scroll = new ScrollView(a);
+        scroll.addView(box);
+        LinearLayout sh = new LinearLayout(a);   // the tab bar fixed at the top, the tab's rows scrolling under it
+        sh.setOrientation(LinearLayout.VERTICAL);
+        sh.setBackgroundColor(0xF0202124);
+        tabs = new LinearLayout(a);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setBackgroundColor(0xFF2D2E31);
+        sh.addView(tabs, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        sh.addView(scroll, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        addView(sh, new LayoutParams(PanelLook.widthPx(Prefs.panelSize(a), dp, a.getResources().getDisplayMetrics().widthPixels), LayoutParams.MATCH_PARENT, Gravity.END));
+        sheet = sh;
+        getViewTreeObserver().addOnGlobalFocusChangeListener(this::focusMoved);
         setVisibility(GONE);
     }
 
+    /** The controller's confirm and back keys (PadPanel.confirmBack: the buttons that are the Switch's A and B in this game) */
+    void padButtons(int[] cb) { confirm = cb[0]; back = cb[1]; }
+
     boolean isOpen() { return open; }
     void toggle() { if (open) close(); else open(); }
+    /** Opened or closed by a controller (GameActivity: Home, or − and + held): opened, the focus on its first row, out of touch mode */
+    void padToggle() { if (open) close(); else { open(); post(this::ensureFocus); } }
 
     void open() {
         if (open) return;
         open = true;
+        if (onOpen != null) onOpen.run();
         box.removeAllViews();
         build();
         look();
         setVisibility(VISIBLE);
         sheet.setTranslationX(sheet.getLayoutParams().width);
         sheet.animate().translationX(0).setDuration(180).start();
-        box.post(() -> { View f = box.focusSearch(View.FOCUS_DOWN); if (f != null) f.requestFocus(); else box.requestFocus(); });
+        post(() -> { if (open && !isInTouchMode()) focusFirst(); });
         removeCallbacks(tick);
         refresh();
     }
@@ -88,19 +121,207 @@ final class SidePanel extends FrameLayout {
     void close() {
         if (!open) return;
         open = false;
+        heldDir = stickHeld = PadPanel.NONE;
+        removeCallbacks(repeat);
         sheet.animate().translationX(sheet.getLayoutParams().width).setDuration(150).withEndAction(() -> { if (!open) setVisibility(GONE); }).start();
     }
 
-    /** A gamepad key while the panel is open: B closes it, A presses what has focus, the D-pad moves the focus (the view system's own handling) */
+    /**
+     * A controller key while the panel is open (GameActivity.dispatchKeyEvent): back closes it, confirm presses what has the focus, the D-pad moves the focus (held:
+     * repeated; left / right step a radio group or a slider), L / R switch tabs. Each acts on its press. Every key but Back is the panel's: false lets Back through
+     */
     boolean padKey(KeyEvent e) {
         int k = e.getKeyCode();
-        if (k == KeyEvent.KEYCODE_BUTTON_B) { if (e.getAction() == KeyEvent.ACTION_UP) close(); return true; }
-        if (k == KeyEvent.KEYCODE_BUTTON_A) {
-            View f = findFocus();
-            if (e.getAction() == KeyEvent.ACTION_UP && f != null) f.performClick();
-            return true;
+        if (k == KeyEvent.KEYCODE_BACK) return false;   // the activity's Back closes the panel
+        boolean press = e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0, up = e.getAction() == KeyEvent.ACTION_UP;
+        int dir = PadPanel.ofKey(k);
+        if (dir != PadPanel.NONE) { if (press) press(dir); else if (up) release(dir); return true; }
+        if (!press) return true;
+        boolean lost = findFocus() == null || isInTouchMode();
+        if (k == back) close();
+        else if (k == KeyEvent.KEYCODE_BUTTON_L1 || k == KeyEvent.KEYCODE_BUTTON_R1) { if (lost) ensureFocus(); showTab(PadPanel.tab(tab, k == KeyEvent.KEYCODE_BUTTON_L1 ? -1 : 1, TAB_NAMES.length)); }
+        else if (k == confirm || k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER) { if (lost) ensureFocus(); else activate(); }   // the first press only shows where the focus is
+        return true;
+    }
+
+    /** A controller's sticks and hat while the panel is open: the hat or the left stick as a direction (PadPanel.stick), held like a D-pad key. The game gets none */
+    boolean padMotion(MotionEvent e) {
+        if (e.getAction() != MotionEvent.ACTION_MOVE) return true;
+        int d = PadPanel.stick(e.getAxisValue(MotionEvent.AXIS_HAT_X), e.getAxisValue(MotionEvent.AXIS_HAT_Y), stickHeld);
+        if (d == PadPanel.NONE) d = PadPanel.stick(e.getAxisValue(MotionEvent.AXIS_X), e.getAxisValue(MotionEvent.AXIS_Y), stickHeld);
+        if (d != stickHeld) {
+            if (stickHeld != PadPanel.NONE) release(stickHeld);
+            stickHeld = d;
+            if (d != PadPanel.NONE) press(d);
         }
+        return true;
+    }
+
+    private void press(int dir) {
+        if (dir == heldDir) return;   // the same direction from the D-pad's keys and its hat
+        heldDir = dir;
+        repeats = 0;
+        move(dir);
+        removeCallbacks(repeat);
+        postDelayed(repeat, PadPanel.repeatDelay(0));
+    }
+    private void release(int dir) { if (dir == heldDir) { heldDir = PadPanel.NONE; removeCallbacks(repeat); } }
+    private void repeatTick() {
+        if (!open || heldDir == PadPanel.NONE) return;
+        move(heldDir);
+        postDelayed(repeat, PadPanel.repeatDelay(++repeats));
+    }
+
+    /** One step: left / right on a slider or a radio group change it, otherwise the focus moves to the nearest row that way (the ScrollView keeps it in sight) */
+    private void move(int dir) {
+        View f = findFocus();
+        if (f == null || isInTouchMode()) { ensureFocus(); return; }
+        if (dir == PadPanel.LEFT || dir == PadPanel.RIGHT) {
+            int code = dir == PadPanel.LEFT ? KeyEvent.KEYCODE_DPAD_LEFT : KeyEvent.KEYCODE_DPAD_RIGHT;
+            if (f instanceof SeekBar) { f.onKeyDown(code, new KeyEvent(KeyEvent.ACTION_DOWN, code)); return; }   // its own step, as the user's change (keyProgressIncrement)
+            if (f instanceof RadioButton && f.getParent() instanceof RadioGroup && stepRadio((RadioGroup) f.getParent(), f, dir == PadPanel.RIGHT ? 1 : -1)) return;
+        }
+        int fd = dir == PadPanel.UP ? View.FOCUS_UP : dir == PadPanel.DOWN ? View.FOCUS_DOWN : dir == PadPanel.LEFT ? View.FOCUS_LEFT : View.FOCUS_RIGHT;
+        View n = f.focusSearch(fd);
+        if (n != null && inside(n)) n.requestFocus();
+        else if (fd == View.FOCUS_UP || fd == View.FOCUS_DOWN) scroll.smoothScrollBy(0, (fd == View.FOCUS_UP ? -1 : 1) * scroll.getHeight() / 3);   // the notes past the last row
+    }
+
+    /** Left / right on a radio group: the next choice that can be chosen, from the checked one in a list (vertical), from the focused one in a row */
+    private boolean stepRadio(RadioGroup g, View f, int delta) {
+        boolean[] can = new boolean[g.getChildCount()];
+        for (int i = 0; i < can.length; i++) { View c = g.getChildAt(i); can[i] = c instanceof RadioButton && c.isEnabled() && c.getVisibility() == VISIBLE; }
+        View checked = g.getCheckedRadioButtonId() != View.NO_ID ? g.findViewById(g.getCheckedRadioButtonId()) : null;
+        int cur = g.getOrientation() == LinearLayout.VERTICAL && checked != null ? g.indexOfChild(checked) : g.indexOfChild(f);
+        int t = PadPanel.step(can, cur, delta);
+        if (t == cur) return g.getOrientation() == LinearLayout.VERTICAL;   // a list's ends: stay; a row's ends: on to what is beside it
+        View c = g.getChildAt(t);
+        c.requestFocus();
+        c.performClick();
+        return true;
+    }
+
+    /** Confirm: presses what has the focus (a slider takes left / right instead) */
+    private void activate() {
+        View f = findFocus();
+        if (f != null && !(f instanceof SeekBar)) f.performClick();
+    }
+
+    private boolean inside(View v) {
+        for (Object p = v; p instanceof View; p = ((View) p).getParent()) if (p == sheet) return true;
         return false;
+    }
+
+    /** Out of touch mode (a controller is in use: requestFocusFromTouch), the focus on the panel: kept where it is, else on the tab's first row */
+    private void ensureFocus() {
+        if (!open) return;
+        View f = findFocus();
+        if (f != null && !isInTouchMode()) return;
+        View t = tabs.getChildAt(tab);
+        if (t != null) t.requestFocusFromTouch();
+        focusFirst();
+    }
+    private void focusFirst() {
+        java.util.ArrayList<View> l = box.getFocusables(View.FOCUS_FORWARD);
+        View f = l.isEmpty() ? tabs.getChildAt(tab) : l.get(0);
+        if (f != null) f.requestFocus();
+    }
+
+    /** The focus frame: a yellow outline on the focused row of the panel (not in touch mode, where nothing has the focus) */
+    private void focusMoved(View old, View now) {
+        if (lit != null) { lit.setForeground(null); lit = null; }
+        if (now == null || !inside(now) || isInTouchMode()) return;
+        float dp = getResources().getDisplayMetrics().density;
+        android.graphics.drawable.GradientDrawable d = new android.graphics.drawable.GradientDrawable();
+        d.setColor(0x26FFD54F);
+        d.setStroke(Math.round(2.5f * dp), FOCUS);
+        d.setCornerRadius(6 * dp);
+        now.setForeground(d);
+        lit = now;
+    }
+
+    /**
+     * A dialog opened from the panel with a controller's confirm and back keys (on their press), as in the panel: Android's own fallback would take the bottom
+     * button as confirm and the right one as back. Its focus starts on the safe choice (negative), so a confirm press does nothing that cannot be undone
+     */
+    private AlertDialog padDialog(AlertDialog d) {
+        d.setOnKeyListener((di, k, e) -> {
+            if (k != confirm && k != back) return false;
+            if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
+                if (k == back) di.cancel();
+                else { d.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER)); d.dispatchKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_CENTER)); }
+            }
+            return true;
+        });
+        Button no = d.getButton(AlertDialog.BUTTON_NEGATIVE);
+        if (no != null && !isInTouchMode()) no.requestFocus();
+        return d;
+    }
+
+    /** The tab bar: one button per tab (the selected one filled), then ✕; large enough to tap (the panel's row height, 48 dp at least), named for TalkBack */
+    private void tabBar() {
+        tabs.removeAllViews();
+        float dp = getResources().getDisplayMetrics().density;
+        int h = Math.max(Math.round(48 * dp), PanelLook.rowPx(Prefs.panelSize(act), dp)), pad = Math.round(4 * dp);
+        for (int i = 0; i < TAB_NAMES.length; i++) {
+            int k = i;
+            boolean on = i == tab;
+            TextView t = new TextView(act);
+            t.setText(TAB_NAMES[i]);
+            t.setGravity(Gravity.CENTER);
+            t.setMaxLines(1);
+            t.setIncludeFontPadding(false);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);   // one size for every tab, set once the bar is laid out (tabTextSize)
+            t.setPadding(pad, 0, pad, 0);
+            t.setTypeface(on ? Typeface.DEFAULT_BOLD : Typeface.DEFAULT);
+            t.setTextColor(on ? 0xFF000000 : 0xFFE8EAED);
+            t.setBackgroundColor(on ? FOCUS : 0);
+            t.setSelected(on);
+            t.setFocusable(true);
+            t.setOnClickListener(v -> showTab(k));
+            t.setContentDescription(TAB_NAMES[i] + " tab, " + (i + 1) + " of " + TAB_NAMES.length + (on ? ", selected" : ""));
+            tabs.addView(t, new LinearLayout.LayoutParams(0, h, 1f));
+        }
+        TextView x = new TextView(act);
+        x.setText("✕");
+        x.setGravity(Gravity.CENTER);
+        x.setTextSize(18);
+        x.setTextColor(0xFFE8EAED);
+        x.setFocusable(true);
+        x.setOnClickListener(v -> close());
+        x.setContentDescription("Close the panel, back to the game");
+        tabs.addView(x, new LinearLayout.LayoutParams(h, h));
+        tabs.post(this::tabTextSize);
+    }
+
+    /** One text size for all tab labels: the largest (16 sp at most, 10 at least) at which the widest label, in bold as when selected, fits its tab.
+     *  Auto-sizing each label on its own shrank "Performance" alone and set it lower than the others */
+    private void tabTextSize() {
+        if (tabs.getChildCount() <= TAB_NAMES.length) return;
+        float sp = getResources().getDisplayMetrics().scaledDensity, fit = 16;
+        android.graphics.Paint p = new android.graphics.Paint();
+        p.setTypeface(Typeface.DEFAULT_BOLD);
+        p.setTextSize(16 * sp);
+        for (int i = 0; i < TAB_NAMES.length; i++) {
+            TextView t = (TextView) tabs.getChildAt(i);
+            int room = t.getWidth() - t.getPaddingLeft() - t.getPaddingRight();
+            float w = p.measureText(TAB_NAMES[i]);
+            if (room > 0 && w > room) fit = Math.min(fit, 16 * room / w);
+        }
+        float size = Math.max(10, (float) Math.floor(fit * 2) / 2);
+        for (int i = 0; i < TAB_NAMES.length; i++) ((TextView) tabs.getChildAt(i)).setTextSize(TypedValue.COMPLEX_UNIT_SP, size);
+    }
+
+    /** Another tab: its rows built, scrolled to its top; with a controller the focus on its first row */
+    private void showTab(int k) {
+        if (!open || k == tab) return;
+        tab = k;
+        box.removeAllViews();
+        build();
+        look();
+        scroll.scrollTo(0, 0);
+        if (!isInTouchMode()) focusFirst();
+        refresh();
     }
 
     /** The panel's size and text size (Prefs.panelSize / panelText): its width, and every row's least height and text size, over what build() made */
@@ -123,12 +344,12 @@ final class SidePanel extends FrameLayout {
     private void restyle(int focusId) {
         post(() -> {
             if (!open) return;
-            int y = sheet.getScrollY();
+            int y = scroll.getScrollY();
             box.removeAllViews();
             build();
             look();
-            sheet.post(() -> {
-                sheet.scrollTo(0, y);
+            scroll.post(() -> {
+                scroll.scrollTo(0, y);
                 View f = focusId != 0 ? box.findViewById(focusId) : null;
                 if (f != null) f.requestFocus();
             });
@@ -158,17 +379,18 @@ final class SidePanel extends FrameLayout {
     /** The running game's title ID (GameActivity's intent): the panel's settings are that game's own */
     private String game() { return String.valueOf(act.getIntent().getStringExtra("title_id")); }
 
+    /** The tab's rows (TAB_NAMES); Performance's here: the frame rate cap, the Upscaler, the dynamic resolution and frame generation */
     private void build() {
-        TextView title = new TextView(act);
-        title.setText("Banana Native");
-        title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextSize(20);
-        box.addView(title);
-        note("The game runs on behind this panel; every change applies now and is kept, except those marked for the next start.");
+        tabBar();
+        fpsNow = lsfgNow = null;
+        caps = null;
+        if (tab == TAB_DISPLAY) { display(); return; }
+        if (tab == TAB_CONTROLS) { controls(); return; }
+        if (tab == TAB_GENERAL) { general(); return; }
 
         head("Frame rate cap");   // the game's own frame rate; frame generation (below, its own heading) adds frames on top
         caps = new RadioGroup(act);
-        if (Prefs.paced(game())) {   // a frame limit, no locking (Prefs.PACE_CAPS)
+        if (Prefs.limited(game())) {   // a frame limit, no locking (Prefs.PACE_CAPS)
             int cur = Prefs.paceCap(act, game());
             for (int i = 0; i < Prefs.PACE_CAPS.length; i++) {
                 RadioButton b = new RadioButton(act);
@@ -179,7 +401,7 @@ final class SidePanel extends FrameLayout {
             caps.setOnCheckedChangeListener((g, id) -> {
                 int v = Prefs.PACE_CAPS[id - 3000];
                 Prefs.fpsCap(act, game(), v);
-                Native.fpsLimitSet(v > 0 ? v : 60);
+                Native.fpsLimitSet(v > 0 ? v : Prefs.paced(game()) ? 60 : 0);   // 60 fps: a paced game's fastest rate; for another, no limit (the game's own interval)
                 refresh();
             });
         } else {
@@ -200,21 +422,39 @@ final class SidePanel extends FrameLayout {
             });
         }
         box.addView(caps);
+        if (Prefs.paced(game())) {   // Full game speed at low frame rates: sead's controller at the measured rate (Game settings has the same), live in the host
+            android.widget.CheckBox full = new android.widget.CheckBox(act);
+            full.setText("Full game speed at low frame rates");
+            full.setChecked(Prefs.decouple(act, game()));
+            full.setOnCheckedChangeListener((b, on) -> { Prefs.decouple(act, game(), on); Native.decoupleSet(on); });
+            box.addView(full);
+        }
         fpsNow = note("");
-        GameUpscaler.rows(act, game(), box);   // right under the frame rate cap: the Upscaler (the game's own upscaler and the window's scaling to the screen
+        if (GameUpscaler.shown(act, game())) {   // right under the frame rate cap: the Upscaler (the game's own upscaler and the window's scaling to the screen), for games whose network it replaces
+            GameUpscaler.rows(act, game(), box);
+            note(act instanceof GameActivity && ((GameActivity) act).live() ? "Applies from the next frame, kept for this game (the same setting as Game settings › Upscaler)."
+                    : "Applies at the next start (this run takes no live changes: DM_CTL is off).");
+        }
         if (Prefs.drsGame(game())) {
             TextView drsHead = head("Dynamic resolution");   // the render size's range (Prefs.DRS), applied at each step; the heading shows it
             box.addView(DrsSlider.view(act, Prefs.drs(act, game()), drsHead::setText, i -> { Prefs.drs(act, game(), i); Native.drsSet(Prefs.DRS[i][0], Prefs.DRS[i][1]); }));
         }
 
         lsfgNow = Lsfg.rows(act, box, "", () -> { Lsfg.push(act); refresh(); });
+    }
 
+    /** Display: the picture (Fit / Stretch, size, position) and the overlay's items */
+    private void display() {
+        resolutionRow();
 
         picture();
 
         head("Overlay");
         Overlay.rows(act, box, null);
+    }
 
+    /** Controls: Player 1, the on-screen controls, rumble and the Button mapping shortcut */
+    private void controls() {
         playerOneRow();
 
         head("On-screen controls");
@@ -226,9 +466,13 @@ final class SidePanel extends FrameLayout {
         rum.setOnCheckedChangeListener((b, on) -> { if (act instanceof GameActivity) ((GameActivity) act).rumble(on); else Prefs.rumble(act, game(), on); });
         box.addView(rum);
 
-        panelRows();
-
         nextStartRows();
+    }
+
+    /** General: the panel's own look, Pause, Stop and Back to the game */
+    private void general() {
+        note("The game runs on behind this panel; every change applies now and is kept, except those marked for the next start.");
+        panelRows();
 
         Button pause = new Button(act);   // the game suspended (clock, graphics, threads, audio) until a tap on the screen, or A / Start: GameActivity.pause
         pause.setText("Pause the game");
@@ -243,9 +487,9 @@ final class SidePanel extends FrameLayout {
         box.addView(ret);
         Button stop = new Button(act);
         stop.setText("Stop the game");
-        stop.setOnClickListener(v -> new AlertDialog.Builder(act).setTitle("Stop the game?").setMessage("The game ends; unsaved progress is lost. The log stays for Share log.")
+        stop.setOnClickListener(v -> padDialog(new AlertDialog.Builder(act).setTitle("Stop the game?").setMessage("The game ends; unsaved progress is lost. The log stays for Share log.")
                 .setPositiveButton("Stop", (d, w) -> { Native.note("stopped by the user"); ExitWatch.stopped(); if (act instanceof GameActivity) ((GameActivity) act).backToFrontend(); android.os.Process.killProcess(android.os.Process.myPid()); })
-                .setNegativeButton("Keep running", null).show());
+                .setNegativeButton("Keep running", null).show()));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = Math.round(24 * getResources().getDisplayMetrics().density);
         box.addView(stop, lp);
@@ -253,6 +497,39 @@ final class SidePanel extends FrameLayout {
         done.setText("Back to the game");
         done.setOnClickListener(v -> close());
         box.addView(done, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+    }
+
+    /**
+     * Resolution: this game's Game resolution (the same choices and the same setting as Game settings › Game resolution), only for a game whose profile has a lever
+     * (Profile.hasResolution). A game with graphics_scale rows changes now: the host takes the choice's graphics scale and operation mode and posts the console's change
+     * notifications, which the game answers by querying them again and resizing its scenes (Native.graphicsModeSet, hle_oe.c nxhost_graphics_mode_set). A window_fn or res_levels
+     * game takes it at the next start.
+     */
+    private void resolutionRow() {
+        Profile p = Profile.of(game());
+        if (p == null || !p.hasResolution()) return;
+        head("Resolution");
+        boolean now = p.resolutionLive() && act instanceof GameActivity;
+        String cur = Prefs.gameWindow(act, game());
+        Button r = row(ID_RES, "Game resolution", (Prefs.ownWindow(act, game()) ? "" : "Default · ") + Prefs.windowName(cur, false));
+        r.setOnClickListener(v -> {
+            String[] labels = new String[Prefs.WINDOWS.length + 1];
+            labels[0] = "Default (" + Prefs.windowName(Prefs.defaultWindow(act, game()), false) + ")";
+            { Profile lp = Profile.of(game()); for (int li = 0; li < Prefs.WINDOWS.length; li++) labels[li + 1] = lp != null ? lp.windowLabel(Prefs.WINDOWS[li], Prefs.WINDOW_NAMES[li]) : Prefs.WINDOW_NAMES[li]; }   // a choice the game draws at another size says so (Profile.windowLabel)
+            int checked = Prefs.ownWindow(act, game()) ? 1 + Math.max(0, java.util.Arrays.asList(Prefs.WINDOWS).indexOf(cur)) : 0;
+            new AlertDialog.Builder(act).setTitle("Game resolution").setSingleChoiceItems(labels, checked, (d, w) -> {
+                Prefs.gameWindow(act, game(), w == 0 ? null : Prefs.WINDOWS[w - 1]);   // the game's own setting: the next start takes it too
+                if (now) {
+                    int[] m = p.resolutionLive(Prefs.gameWindow(act, game()));
+                    if (m != null && !Native.graphicsModeSet(m[0], m[1])) Native.note("Game resolution: this host cannot change it live; it applies at the next start");
+                }
+                d.dismiss();
+                restyle(ID_RES);
+            }).setNegativeButton("Cancel", null).show();
+        });
+        note(now ? "Applies now: the game resizes its picture within a few frames. Kept for this game (the same setting as Game settings › Game resolution)."
+                + (p.resolution.contains("/console") ? " The larger sizes run the game as on a docked console." : "")
+                : "Applies at the next start (the same setting as Game settings › Game resolution).");
     }
 
     /** Picture: Fit / Stretch and the size (GameActivity.picture: live through DM_CTL, kept for this game), then the position on this screen (TouchControls) */
@@ -372,21 +649,26 @@ final class SidePanel extends FrameLayout {
             names[0] = "Automatic";
             int checked = 0;
             for (int i = 0; i < pads.size(); i++) { names[i + 1] = pads.get(i).name; if (!chosen.isEmpty() && chosen.equals(pads.get(i).key)) checked = i + 1; }
-            new AlertDialog.Builder(act).setTitle("Player 1").setSingleChoiceItems(names, checked, (d, w) -> {
+            padDialog(new AlertDialog.Builder(act).setTitle("Player 1").setSingleChoiceItems(names, checked, (d, w) -> {
                 ga.choosePlayerOne(w == 0 ? "" : pads.get(w - 1).key);
                 d.dismiss();
                 restyle(ID_ONE);
-            }).setNegativeButton("Cancel", null).show();
+            }).setNegativeButton("Cancel", null).show());
         });
     }
 
     /** Twice a second while open: what the game runs at, which caps it can hold, and the frame generation's state */
     private void refresh() {
-        if (!open) return;
+        if (!open || tab != TAB_PERF) return;   // only Performance has live lines (showTab calls it again)
         String[] f = Native.fpsCapStatus().split(" ");
         int cap = Integer.parseInt(f[0]), rates = Integer.parseInt(f[1]), now = Integer.parseInt(f[2]);
-        if (Prefs.paced(game())) {   // the frame limiter's caps are always available
-            fpsNow.setVisibility(GONE);   // the overlay shows the frame rate, the cap is checked above
+        if (Prefs.limited(game())) {   // the frame limiter's caps are always available
+            // The overlay shows the frame rate, the cap is checked above; one line only when the limit holds another rate: a game whose frame step moves in whole
+            // vsyncs (hle_fpslock.c dm_fps_limit_step) runs 45 and 40 at 30, at full speed
+            int chosen = Prefs.paceCap(act, game()), held = f.length > 3 ? Integer.parseInt(f[3]) : 0;
+            boolean other = now > 0 && chosen > 0 && held > 0 && 60 % chosen != 0 && held < chosen;
+            fpsNow.setVisibility(other ? VISIBLE : GONE);
+            if (other) fpsNow.setText("This game moves in whole frames: " + chosen + " fps runs at " + held + " fps, at full game speed.");
         } else {
             for (int i = 0; i < Prefs.FPS_CAPS.length; i++) {
                 int v = Prefs.FPS_CAPS[i], bit = v == 15 ? 0 : v == 20 ? 1 : v == 30 ? 2 : 5;   // the host's bits: 15, 20, 30, (40, 45,) 60

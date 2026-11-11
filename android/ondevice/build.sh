@@ -73,5 +73,6 @@ if [[ $WHAT == all || $WHAT == tools ]]; then
   zsh $G/build.sh $W/xlate lib > $W/xlate.log 2>&1 || { tail -20 $W/xlate.log; echo "[RED] the translator did not build (log: $W/xlate.log)"; exit 1; }
   zsh $G/build_spirv_tools.sh $W/spvtools > $W/spvtools.log 2>&1 || { tail -20 $W/spvtools.log; echo "[RED] SPIRV-Tools did not build (log: $W/spvtools.log)"; exit 1; }
   cp $W/xlate/lib/libdmsh_xlate.so $W/spvtools/libSPIRV-Tools-shared.so $S/lib/
+  python3 $HERE/../../dm/gfx/tools/xlate_tree.py --check-lib $S/lib/libdmsh_xlate.so || exit 1   # built from this tree (build.gradle checks it again at every APK build)
 fi
 du -sh $S/lib/* $S/python $S/bin/*

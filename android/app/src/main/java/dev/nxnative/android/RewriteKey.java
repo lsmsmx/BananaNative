@@ -12,8 +12,8 @@ import java.util.Map;
 
 /**
  * scripts/pack_android.py's rewrite_key and rewrite_keys, plain Java (PackCheck.code; checked on the JVM by dm/tools/tests/test_android_rewritekey.py with
- * RewriteKeyJvmTest): SHA-256 over name\0bytes of the REWRITER files, the module, the profile's patches.py (when there is one) and game.tsv's build rows, the
- * only part of game.tsv the rewriter reads (buildRows, hashed under the name ROWS; the rest is the host's, and a change there must not make packs stale). The keys
+ * RewriteKeyJvmTest): SHA-256 over name\0bytes of the REWRITER files, the module, the profile's patches.py (when there is one) and game.tsv's build and
+ * fps_decouple rows, the only part of game.tsv the rewriter reads (buildRows, hashed under the name ROWS; the rest is the host's, and a change there must not make packs stale). The keys
  * that count as the current rewriter's are its own and those with an earlier equivalent file in place of a REWRITER file: dm/tools/rewriter_equiv/&lt;file&gt;.&lt;commit&gt;,
  * which holds a file there ONLY when the rewrite output with it was verified byte-identical (pack_android.py EQUIV). Each also in the earlier (v1) formula, which
  * hashed the whole game.tsv: with the APK's, and with the pack's copy (&lt;pack&gt;/game.tsv) when its build rows are the APK's: the key proves the copy is the file
@@ -27,7 +27,7 @@ final class RewriteKey {
     static final String ROWS = "game.tsv build rows";
 
     /**
-     * game.tsv's build rows as patch_nso.py reads them (rows split at tabs, each cell stripped, first cell "build"), one a line (pack_android.py build_rows;
+     * game.tsv's build and fps_decouple rows as patch_nso.py reads them (rows split at tabs, each cell stripped, first cell "build" or "fps_decouple"), one a line (pack_android.py build_rows;
      * bytes kept as they are). A narrower strip and split than the rewriter's own: two tables that differ for it never come out the same here.
      */
     static byte[] buildRows(byte[] tsv) {
@@ -35,7 +35,7 @@ final class RewriteKey {
         for (String row : new String(tsv, StandardCharsets.ISO_8859_1).split("\n", -1)) {
             String[] c = row.split("\t", -1);
             for (int i = 0; i < c.length; i++) c[i] = strip(c[i]);
-            if (c[0].equals("build")) out.append(String.join("\t", c)).append('\n');
+            if (c[0].equals("build") || c[0].equals("fps_decouple")) out.append(String.join("\t", c)).append('\n');
         }
         return out.toString().getBytes(StandardCharsets.ISO_8859_1);
     }

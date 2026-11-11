@@ -270,6 +270,7 @@ void dm_perf_time_constraint(uint64_t period_ns, uint64_t comp_ns) {
 // waiting for the recording, i.e. a CPU stall on the replay thread, not GPU work
 void vka_worker_waits(uint64_t *room_ns, uint64_t *sub_ns); uint64_t vka_enc_waits(void); uint64_t vka_worker_sub_cpu(void);
 void vka_mem_waits(uint64_t *place_ns, uint64_t *place_bytes, uint64_t *place_n, uint64_t *give_ns, uint64_t *wait_rec_ns, uint64_t *wait_other_ns);
+void vka_tex_new_stats(uint64_t *n, uint64_t *ns);   // vka_tex.c: new images and the time they took on the replay thread (with their first content), for "new images" below
 // The busiest threads of a long frame. A sampler thread (dm-lfthreads) reads every thread's run time (/proc/self/task/<tid>/schedstat, ns; else stat's utime + stime in
 // clock ticks) every DM_LONGFRAME_THREADS ms (250; 0 = off, restart) into a ring. A frame of at least 100 ms posts a request at its end; the sampler takes a fresh reading
 // and names the 3 threads that ran most since the newest reading older than the frame's start (the window is the frame plus at most one period, and the moment the sampler
@@ -349,15 +350,17 @@ static void *ts_main(void *a) {
     return NULL;
 }
 void mtl_frame_extra(uint64_t f, char *out, size_t n) {
-    static uint64_t proom, psub, penc, psave, ppw, ppl, pplb, ppln, pgv, pwr, pwo, pt, psc; static int init;
+    static uint64_t proom, psub, penc, psave, ppw, ppl, pplb, ppln, pgv, pwr, pwo, pt, psc, pnn, pnns; static int init;
+    uint64_t nn = 0, nns = 0; vka_tex_new_stats(&nn, &nns);
     uint64_t room = 0, sub = 0, enc = vka_enc_waits(), save = 0, pw = 0, pl = 0, plb = 0, pln = 0, gv = 0, wr = 0, wo = 0, t = ts_now(), sc = vka_worker_sub_cpu(); vka_worker_waits(&room, &sub); vka_pso_waits(&save, &pw);
     vka_mem_waits(&pl, &plb, &pln, &gv, &wr, &wo);
     static int ts_on = -1; if (ts_on < 0) { ts_on = ts_period_ms() > 0; if (ts_on) { pthread_t th; if (pthread_create(&th, NULL, ts_main, NULL)) ts_on = 0; else pthread_detach(th); } }
     if (init && n) {
         snprintf(out, n, "game waited for the replay worker %.1f, replay recording %.1f (its CPU %.1f), replay waited for the encoder %.1f, cache save %.1f, waited for prewarm %.1f; "
-                         "pool placement %.1f ms (%llu pools, %.1f MB), give-back %.1f ms, the pool table's lock waited for: replay %.1f, others %.1f",
+                         "pool placement %.1f ms (%llu pools, %.1f MB), give-back %.1f ms, the pool table's lock waited for: replay %.1f, others %.1f; new images %llu, %.1f ms with their first content",
                  (room - proom) / 1e6, (sub - psub) / 1e6, (sc - psc) / 1e6, (enc - penc) / 1e6, (save - psave) / 1e6, (pw - ppw) / 1e6,
-                 (pl - ppl) / 1e6, (unsigned long long)(pln - ppln), (plb - pplb) / 1048576.0, (gv - pgv) / 1e6, (wr - pwr) / 1e6, (wo - pwo) / 1e6);
+                 (pl - ppl) / 1e6, (unsigned long long)(pln - ppln), (plb - pplb) / 1048576.0, (gv - pgv) / 1e6, (wr - pwr) / 1e6, (wo - pwo) / 1e6,
+                 (unsigned long long)(nn - pnn), (nns - pnns) / 1e6);
         if (ts_on && t - pt >= 100000000ull) {   // a long frame: the sampler names its busiest threads (read back at print time, mtl_gpu_extra)
             pthread_mutex_lock(&g_tsmu);
             int q = (int)(f % TS_REQ); g_tsq[q].f = f; g_tsq[q].since = pt; g_tsq[q].state = 1; g_tsq[q].s[0] = 0;
@@ -365,7 +368,7 @@ void mtl_frame_extra(uint64_t f, char *out, size_t n) {
             pthread_mutex_unlock(&g_tsmu);
         }
     } else if (n) out[0] = 0;
-    proom = room; psub = sub; penc = enc; psave = save; ppw = pw; ppl = pl; pplb = plb; ppln = pln; pgv = gv; pwr = wr; pwo = wo; pt = t; psc = sc; init = 1;
+    proom = room; psub = sub; penc = enc; psave = save; ppw = pw; ppl = pl; pplb = plb; ppln = pln; pgv = gv; pwr = wr; pwo = wo; pt = t; psc = sc; pnn = nn; pnns = nns; init = 1;
 }
 void mtl_gpu_extra(uint64_t f, char *out, size_t n) {
     double s = vka_gpu_span_ms(f), b = mtl_gpu_ms(f);

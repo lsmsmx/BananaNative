@@ -58,6 +58,24 @@ class GuardedWrites(Translated):
         self.assertRegex(msl, r'bool \w+ = \w+ != 0;\s+float \w+ = \w+;\s+if \(\w+\)')   # the copy only where it held
 
 
+class AtomgCas(Translated):
+    # ATOMG.CAS R30, [R38.64], R30 (compare), R31 (new value), 0x3a9, as Zelda: Ocarina of Time's foliage compute 3b8ecb1aa4207240 encodes it at 0x8ae0; then SUATOM.ADD
+    # of R30, so the CAS's result (the old value, which the game compares with the comparand) has a use
+    CAS = (0x000ea400001ee11f, 0x0000001e261e73a9)
+    USE = (0x004ea200001ee000, 0x00000c1e031e7593)
+
+    def test_cas_returns_the_old_value(self):
+        msl = self.translate(inst(*self.CAS) + inst(*self.USE) + inst(*EXIT), ssbo_align=64, subgroup_size=64, gs_passthrough=False)
+        self.assertIn('atomic_compare_exchange', msl)   # through the memory pool table (no storage buffer traced)
+        call = re.search(r'int (_\d+) = (_\d+)\(_\d+, _\d+, _\d+, _\d+, ', msl)
+        self.assertTrue(call, msl)   # the helper takes the address pair, the comparand and the value
+        self.assertRegex(msl, r'int \w+ = ' + call.group(1) + r';[\s\S]*atomic_fetch_add')   # its result is what the next instruction reads
+
+    def test_refused_64_bit(self):
+        with self.assertRaises(AssertionError):
+            self.translate(inst(self.CAS[0] | 1 << 9, self.CAS[1]) + inst(*EXIT))
+
+
 class Suatom(Translated):
     def test_add_u32_on_a_1d_image(self):
         msl = self.translate(inst(*SUATOM) + inst(*EXIT))

@@ -12,13 +12,13 @@ void dm_audio_suspend(int on) { (void)on; }   // stubs for the bg item of DM_OE_
 void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
 void dm_gfx_suspend(int on) { (void)on; }
 // The notification event (hle_thread.c binds a kernel event): the unit test only tracks whether it is signalled
-static int ev_bound, ev_sig;
-void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; ev_bound = 1; }
-void hle_signal_system_event(void *g) { (void)g; ev_sig = 1; }
+static int ev_bound, ev_sig, defres_sig;   // defres_sig: signals of any other event (the default display resolution change event)
+void hle_bind_system_event(void *g, int autoclear) { (void)autoclear; if (g == g_mq_ev) ev_bound = 1; }
+void hle_signal_system_event(void *g) { if (g == g_mq_ev) ev_sig = 1; else defres_sig++; }
 void hle_clear_system_event(void *g) { (void)g; ev_sig = 0; }
 static int checks, fails;
 #define CHECK(c, s) do { checks++; int ok = !!(c); fails += !ok; printf("%s %s\n", ok ? "✓" : "✗", s); } while (0)
-static void reset(void) { g_mqh = g_mqn = 0; g_focus = 1; g_seen = 1; g_applets = 0; g_opmode = 1; g_ntf_opmode = g_ntf_perfmode = 0; g_focus_mode = -1; }
+static void reset(void) { g_mqh = g_mqn = 0; g_focus = 1; g_seen = 1; g_applets = 0; g_opmode = 1; g_ntf_opmode = g_ntf_perfmode = g_ntf_gfxscale = 0; g_gfx_scale = 3; g_focus_mode = -1; }
 static int pop_is(uint32_t want) { uint32_t m = 999; return h_oe_TryPopMsg(&m) && m == want; }
 static int empty(void) { uint32_t m = 999; return !h_oe_TryPopMsg(&m) && m == 999; }
 static int child_kind;
@@ -165,6 +165,31 @@ int main(void) {
         CHECK(p > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0, "DM_GRAPHICS_SCALE=2: scale 2 / parameters 30 in both modes");
         g_opmode = 1;
     }
+    // Live graphics scale (the launcher's in-game panel, nxhost_graphics_mode_set): the state changes first, then 30 / 31 for a mode change and 300 for a scale change, each
+    // only when the game turned it on. Mario Kart World, Ocarina of Time and Splatoon Raiders turn 300 on and take it to GetCurrentGraphicsScale (main+0x29957b8 in MKW 1.8.0)
+    reset(); g_opmode = 0; g_gfx_scale = 0;
+    nxhost_graphics_mode_set(2, 0);
+    CHECK(empty() && h_oe_GfxScale() == 2 && h_oe_GfxScaleParams() == 30, "scale change with the notification off: the new scale is queried, nothing queued");
+    reset(); g_opmode = 0; g_gfx_scale = 0; h_oe_GfxScaleNotify(0x101); g_ntf_opmode = g_ntf_perfmode = 1;
+    nxhost_graphics_mode_set(2, 0);
+    CHECK(pop_is(300) && empty() && h_oe_GfxScale() == 2 && h_oe_GetOpMode() == 0, "handheld scale 0 → 2: only 300, mode unchanged");
+    nxhost_graphics_mode_set(2, 0); CHECK(empty(), "the same scale again: nothing queued");
+    nxhost_graphics_mode_set(1, 1);
+    CHECK(pop_is(30) && pop_is(31) && pop_is(300) && empty() && h_oe_GetOpMode() == 1 && h_oe_GetPerfMode() == 1 && h_oe_GfxScale() == 1,
+          "handheld 2 → console 1: 30, 31, 300 in that order, the whole new state queried");
+    nxhost_graphics_mode_set(0, 0); nxhost_graphics_mode_set(2, 0);
+    CHECK(pop_is(30) && pop_is(31) && pop_is(300) && empty() && h_oe_GfxScale() == 2, "two changes before a pop: one of each, the latest scale queried");
+    nxhost_graphics_mode_set(-1, 1);
+    CHECK(pop_is(30) && pop_is(31) && pop_is(300) && empty() && g_gfx_scale == 3 && h_oe_GfxScale() == 1, "-1: back to the game's own, the scale follows the mode (console 1)");
+    dm_set_opmode(0);
+    CHECK(pop_is(30) && pop_is(31) && pop_is(300) && empty() && h_oe_GfxScale() == 0, "following the mode: a mode change alone changes the scale too, so 300 as well");
+    nxhost_graphics_mode_set(0, 1);
+    CHECK(pop_is(30) && pop_is(31) && empty() && h_oe_GfxScale() == 0, "a fixed scale equal to the one the mode gave: the mode messages only");
+    { uint8_t ev[0x80]; defres_sig = 0; h_oe_DefResEv(ev); h_oe_DefResEv(ev);
+      nxhost_graphics_mode_set(0, 1); CHECK(defres_sig == 0, "default display resolution change event: not signalled without a mode change");
+      nxhost_graphics_mode_set(0, 0); CHECK(defres_sig == 1, "default display resolution change event: signalled once on a mode change (asked for twice, kept once)");
+      while (h_oe_TryPopMsg(&(uint32_t){0})) {}
+      g_defres_n = 0; }
     // DM_LANG: the console's codes as they are, BCP-47 style tags mapped to them (fr-FR fell back to Japanese when it went to the game as typed), others en-US
     static const char *const lang_in[][2] = {
         {"ja", "ja"}, {"en-US", "en-US"}, {"en-GB", "en-GB"}, {"fr", "fr"}, {"fr-CA", "fr-CA"}, {"de", "de"}, {"it", "it"}, {"es", "es"}, {"es-419", "es-419"}, {"nl", "nl"},

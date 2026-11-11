@@ -63,12 +63,13 @@ double vka_env_slow(vka_envc *c, const char *key, double def) {
 static const char *const g_restart[] = {"DM_VK_VALIDATE", "DM_VK_DRIVER", "DM_VK_HOOKDIR", "DM_VK_PLACED", "DM_VK_PREFAULT", "DM_VK_PCACHE", "DM_VK_GUEST_FPCR", "DM_VK_SHLIB", "DM_VK_SHLIB_CHECK", "DM_VK_GS_CLAIM", "DM_VK_SUBGROUP_PIN", "DM_VK_GPL", "DM_VK_MESH", "DM_VK_SUBGROUP_GS", "DM_VK_SHUFFLE_LDS", "DM_VK_ADPF", "DM_VK_ADPF_PIPELINE", "DM_VK_NANSCAN",
                                         "DM_VK_NANSCAN_STEP", "DM_VK_NANSCAN_DRAWS", "DM_VK_NANSCAN_SERIAL", "DM_VK_NANSCAN_FS", "DM_VK_WORKER",
                                         "DM_VK_WORKER_FRAMES", "DM_VK_TEST_HANG", "DM_LSFG_DLL", "DM_FPS", "NXHOST_VK_SELFTEST", "DM_CTL", "DM_VK_PREWARM", "DM_VK_PREWARM_MAX", "DM_VK_PREWARM_FILE", "DM_VK_LC_GLOBAL",
-                                        "DM_VK_PSO_ASYNC", NULL};
+                                        "DM_VK_PSO_ASYNC", "DM_VK_TL_HOST", NULL};
 // Switches the replay reads again after a change (VKA_ENV, or at use); a table, so the log line can say which kind a key is
 static const char *const g_live[] = {"DM_VK_DRAW", "DM_VK_STATS", "DM_VK_HANG_S", "DM_VK_HANG_EXIT", "DM_VK_FRAME_RATE", "DM_VK_FRAME_RATE_HOLD", "DM_VK_PCACHE_SAVE_S", "DM_VK_GPL_GIVEUP", "DM_VK_GPL_PROBE", "DM_VK_PREWARM_KEEP", "DM_VK_PRETRANSFORM", "DM_VK_FSR", "DM_VK_FSR_SHARP", "DM_VK_TEX_TRACK",
                                      "DM_VK_CHUNK", "DM_VK_PASS_CLEARS", "DM_VK_PASS_KEEP", "DM_VK_DYN_FILTER", "DM_VK_PROF", "DM_VK_ROWS", "DM_VK_SYNCLOG", "DM_VK_UBWC", "DM_VK_IMG_UPGRADE", "DM_VK_DONE_LAST", "DM_VK_AFF_REPLAY", "DM_VK_AFF_ALL",
                                      "DM_VK_NANSCAN_DUMP", "DM_VK_TEX_STATS", "DM_VK_TEX_STATS_LINES", "DM_VK_TEX_STATS_DRAWS", "DM_VK_TEX_STATS_TABLE", "DM_VK_RT_LOG", "DM_VK_RT_LOG_LINES", "DM_VK_VB_FILTER", "DM_VK_ENC_BATCH", "DM_VK_ENC_SPIN", "DM_VK_BAR_KEEP", "DM_VK_DRV_MEMO", "DM_VK_PUSH_DELTA", "DM_VK_UPLOAD_MT", "DM_VK_UPLOAD_MT_MIN",
-                                     "DM_LSFG", "DM_LSFG_MULT", "DM_LSFG_TARGET", "DM_LSFG_FLOW", "DM_VK_DISPATCH_ORDER", NULL};
+                                     "DM_LSFG", "DM_LSFG_MULT", "DM_LSFG_TARGET", "DM_LSFG_FLOW", "DM_VK_DISPATCH_ORDER",
+                                     "DM_VK_NDSR", "DM_VK_NDSR_SHARP", "DM_VK_NDSR_INPUT", "DM_VK_PRESENT_NEAREST", NULL};   // (the Upscaler: the in-game panel sends the first, second and fourth)
 static int in(const char *const *t, const char *k) { for (; *t; t++) if (!strcmp(*t, k)) return 1; return 0; }
 
 void dm_gfx_ctl_env(const char *key, const char *val) {   // the control thread

@@ -349,6 +349,7 @@ public final class PackService extends Service {
                     j.stepState(s, "pending");
                     stepLog(j, "failed: " + fail);
                     j.fail(failure != null ? failure : new PrepareText.Failure(PrepareText.capital(fail) + ".", "", PrepareText.FIX_RETRY));
+                    if (PrepareText.FIX_UPDATE.equals(j.fix())) j.failApk(Job.installed(this));   // this install cannot do it; another one may
                     save(j, true);
                     break;
                 }

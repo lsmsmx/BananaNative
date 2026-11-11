@@ -174,6 +174,7 @@ A pipeline with `SINT` attachments has no variant yet (neither has Metal). The a
 | 0 | stage × 64 + n | the per-draw resources of each stage: n in the translator's order. Stages numbered as NVN does: vertex 0, tess control 1, tess evaluation 2, geometry 3, fragment 4. A compute pipeline uses range 0 |
 | 1 | 0 | `SAMPLED_IMAGE[2^20]`: the NVN texture pool by texture ID. Update-after-bind, partially bound |
 | 1 | 1 | `SAMPLER[4096]`: the NVN sampler pool by sampler ID |
+| 2 | 0 | `STORAGE_BUFFER`, 128 KiB, a set of its own (Qualcomm's driver never wrote it as set 1 binding 3), bound with set 1 when pool reads are reported: the bitmap of the texture IDs shaders read through the texture pool. Not in the library: the replay adds the code that writes it to every module it makes (`vka_spvpatch.c vka_spv_pool_fb`; [Textures read only through the pool](../docs/reference/rendering.md#textures-read-only-through-the-pool-were-never-made-android)) |
 
 No push constants: NVN2's pushed constants (`c[24]`, 256 bytes) are a uniform buffer like the driver segments.
 

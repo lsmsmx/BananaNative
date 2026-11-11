@@ -13,16 +13,17 @@ import java.util.List;
 
 /**
  * The Upscaler: what runs in place of a game's own neural upscaler, and how the window is scaled to the screen (Nintendo's NDSR, emulated and slow on phones: DM_VK_NDSR, DM_VK_NDSR_SHARP in dm/gfx/vk_android/vka_draw.c), per game:
- * a nearest-neighbour or bilinear stretch, FSR 1 (the default, with RCAS at AMD's default sharpness), or the game's network itself ("Native"). Set in Game settings and live in the in-game panel, sent to the
+ * a nearest-neighbour or bilinear stretch, FSR 1 (the default, with RCAS at AMD's default sharpness), Qualcomm's Snapdragon Game Super Resolution 1 (one pass, its own sharpening), or the game's network itself ("Native"). Set in Game settings and live in the in-game panel, sent to the
  * running game as lines of its live control file (DM_CTL) as the in-game panel's other live settings do
  */
 final class GameUpscaler {
     private GameUpscaler() {}
 
-    /** The choices in the order shown, and each one's DM_VK_NDSR value (3 nearest-neighbour blit, 1 bilinear blit, 2 FSR 1, 0 the game's network) */
-    static final String[] MODES = {"Nearest neighbor (fastest, blocky)", "Bilinear (fastest, softest)", "FSR 1 (sharp, fast)", "Native (sharpest, slowest)"};
-    static final int[] NDSR = {3, 1, 2, 0};
-    static final int MODE_DEFAULT = 2;   // FSR 1
+    /** The choices in the order shown, and each one's DM_VK_NDSR value (3 nearest-neighbour blit, 1 bilinear blit, 2 FSR 1, 0 the game's network, 4 Qualcomm's SGSR 1).
+     *  New choices go at the end: the stored choice is an index into this list */
+    static final String[] MODES = {"Nearest neighbor (fastest, blocky)", "Bilinear (fastest, softest)", "FSR 1 (sharp, fast; too bright on Qualcomm's driver in some games)", "Native (sharpest, slowest)", "SGSR 1 (sharp, fast, one pass)"};
+    static final int[] NDSR = {3, 1, 2, 0, 4};
+    static final int MODE_DEFAULT = 4;   // SGSR 1 (FSR 1 is too bright on Qualcomm's driver in Ocarina of Time: open, docs/reference/shaders.md)
     static final int MODE_FSR = 2;
     /** RCAS sharpness in stops (0 the strongest, each stop halves it); below 0: no RCAS */
     static final float[] SHARPS = {-1f, 1f, 0.5f, 0.25f, 0f};
@@ -70,7 +71,18 @@ final class GameUpscaler {
         } catch (IOException e) { Native.note("[RED] game upscaler: the setting could not be sent to the game (" + e.getMessage() + "); it applies at the next start"); }
     }
 
-    /** The in-game panel's rows: the upscaler, and FSR's sharpness while FSR 1 is the choice; each applied at once */
+    /**
+     * Whether the in-game panel shows the rows: only for a game whose neural upscaler network the host can replace (it says so once the network has run: Native.ndsrStatus),
+     * remembered per game (ndsr_seen) so that the rows are there from the next start's first screens on, before the network's first frame. A host that cannot say: always
+     */
+    static boolean shown(Context c, String titleId) {
+        int st = Native.ndsrStatus();
+        String k = Prefs.gameKey("ndsr_seen", titleId);
+        if (st > 0 && !Prefs.of(c).getBoolean(k, false)) Prefs.of(c).edit().putBoolean(k, true).apply();
+        return st != 0 || Prefs.of(c).getBoolean(k, false);
+    }
+
+    /** The in-game panel's rows: the upscaler, and FSR's sharpness while FSR 1 is the choice; each applied at once (the same per-game choice as Game settings › Upscaler) */
     static void rows(Context c, String titleId, LinearLayout box) {
         TextView head = new TextView(c);
         head.setText("Upscaler");

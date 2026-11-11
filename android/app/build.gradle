@@ -99,7 +99,10 @@ def windowOf = { String game -> tsvRows(game, 'android_window').with { rs -> rs.
 def decoupleOf = { String game -> tsvRows(game, 'fps_decouple').isEmpty() ? '' : '1' }
 // Whether the host can steer the game's dynamic resolution (game.tsv drs_ctl rows): "1", or empty. The launcher then offers its Dynamic resolution setting (Prefs.drsGame)
 def drsOf = { String game -> tsvRows(game, 'drs_ctl').isEmpty() ? '' : '1' }
-def nxProfiles = nxGames.collect { g -> [g, nameOf(g).replaceAll(/[\t\n\\"]/, ' '), shaderTotalOf(g), shaderInputsOf(g), buildsOf(g), reqsOf(g), statusOf(g), deltaOf(g), stampOf(g), resolutionOf(g), romfsChecksOf(g), gpuTsOf(g), windowOf(g), decoupleOf(g), drsOf(g)].join('\\t') }.join('\\n')
+// The profile's default frame limit (game.tsv fps_limit: frames a second, the host's limiter, hle_fpslock.c), or empty without one (0 = none). The launcher then offers a frame limit
+// as for a paced game, the profile's limit its default (Prefs.limited)
+def fpsLimitOf = { String game -> tsvRows(game, 'fps_limit').with { rs -> rs.isEmpty() || rs[0].size() < 2 || rs[0][1].trim() == '0' ? '' : rs[0][1].trim() } }
+def nxProfiles = nxGames.collect { g -> [g, nameOf(g).replaceAll(/[\t\n\\"]/, ' '), shaderTotalOf(g), shaderInputsOf(g), buildsOf(g), reqsOf(g), statusOf(g), deltaOf(g), stampOf(g), resolutionOf(g), romfsChecksOf(g), gpuTsOf(g), windowOf(g), decoupleOf(g), drsOf(g), fpsLimitOf(g)].join('\\t') }.join('\\n')
 def lockOf = { String key -> def f = new File(repo, 'dm/gfx/tools/dmsh_chain.lock'); f.isFile() ? (f.readLines().find { it.startsWith(key + '\t') }?.split('\t')?.getAt(1) ?: 'unknown') : 'unknown' }
 
 android {
@@ -215,7 +218,22 @@ if (nxPackEngine == 'native') {
     def nxPack = layout.buildDirectory.dir('nxpack')
     def need = ['lib/libpython3.14.so', 'lib/libnxpack.so', 'lib/libzbicdec.so', 'lib/libdmsh_xlate.so', 'lib/libSPIRV-Tools-shared.so', 'python/lib/python3.14/os.py']
     need.each { if (!new File(stage, it).isFile()) throw new GradleException("$stage has no $it: run android/ondevice/build.sh <work dir> (it makes <work dir>/stage)") }
+    // The stage's translator must be built from this tree: vk_android_build.py check_translator refuses any other on the phone, so an APK with a stale one fails
+    // every Prepare at the shaders step (2026-11-10: a stage made before a translator change). xlate_tree.py --check-lib reads the digests the library embeds
+    // (it is arm64 Android code: it does not run here); it runs at every build, as the stage can be rebuilt between two builds
+    def xlateCheck = tasks.register('nxPackXlateCheck') {
+        def lib = new File(stage, 'lib/libdmsh_xlate.so'), tool = new File(repo, 'dm/gfx/tools/xlate_tree.py')
+        doLast {
+            def p
+            try { p = new ProcessBuilder('python3', tool.path, '--check-lib', lib.path).redirectErrorStream(true).start() }
+            catch (IOException e) { throw new GradleException("python3 is needed to check $lib against this tree (dm/gfx/tools/xlate_tree.py --check-lib): $e.message") }
+            def out = p.inputStream.text.trim()
+            if (p.waitFor() != 0) throw new GradleException("The stage's translator was not built from this tree; the APK would fail every Prepare at the shaders step:\n$out")
+            logger.lifecycle(out)
+        }
+    }
     def jni = tasks.register('nxPackJni', Sync) {
+        dependsOn xlateCheck
         from(new File(stage, 'lib')) { include 'libpython3.14.so', 'libnxpack.so', 'libzbicdec.so', 'libdmsh_xlate.so', 'libSPIRV-Tools-shared.so' }
         into nxPack.map { it.dir('jni/arm64-v8a') }
     }

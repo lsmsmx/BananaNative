@@ -89,8 +89,8 @@ def windows_job():
 
 
 # The rewrite key, <module>.android.key: SHA-256 over name\0bytes of the REWRITER files, the module, the profile's patches.py (when there is one) and the part of the
-# profile's game.tsv the rewriter reads: its build rows (patch_nso.py reads them for a module whose build has no CUTS), normalized by build_rows and hashed under the
-# name ROWS. The rest of game.tsv is the host's (GPU timing, window size, ...): a change there must not make every pack's code stale.
+# profile's game.tsv the rewriter reads: its build rows (patch_nso.py reads them for a module whose build has no CUTS) and its fps_decouple rows (whether main's sead
+# frame-rate controller is gated: a profile without one keeps the key it had), normalized by build_rows and hashed under the name ROWS. The rest of game.tsv is the host's (GPU timing, window size, ...): a change there must not make every pack's code stale.
 # Packs made before (the v1 key) hash the whole game.tsv; one counts as current with this APK's game.tsv, or with the copy the pack keeps (<pack>/game.tsv,
 # written after the rewrite) when the copy's build rows are the profile's: the key proves the copy is the file it was made with, the rows that the rewrite read
 # the same. upgrade_keys rewrites such a key as the current one, before the pack's copy of game.tsv is replaced.
@@ -98,12 +98,13 @@ ROWS = 'game.tsv build rows'
 
 
 def build_rows(b):
-    """game.tsv's build rows as patch_nso.py reads them (rows split at tabs, each cell stripped, first cell `build`), one a line; bytes in, bytes out.
+    """game.tsv's build and fps_decouple rows as patch_nso.py reads them (rows split at tabs, each cell stripped, first cell `build` or `fps_decouple`), one a line;
+    bytes in, bytes out.
     A narrower strip and split than the rewriter's own: two tables that differ for it never come out the same here"""
     rows = []
     for row in b.split(b'\n'):
         c = [x.strip(b' \r\x0b\x0c') for x in row.split(b'\t')]
-        if c[0] == b'build': rows.append(b'\t'.join(c) + b'\n')
+        if c[0] in (b'build', b'fps_decouple'): rows.append(b'\t'.join(c) + b'\n')
     return b''.join(rows)
 
 

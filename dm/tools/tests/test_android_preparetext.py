@@ -1,7 +1,9 @@
 """Prepare's words for the player on the JVM (android/app/src/main PrepareText.java, Profile.missing): javac compiles them with a stub BuildConfig and
 android/app/src/jvmtest's PrepareTextJvmTest. Main texts carry no file path or tool output (those go to the card's Details); a failure offers Retry, Try anyway or
 nothing; the progress line never says "0 of 0"; a job of a game the APK does not include gets one sentence and no Retry. Also that the launcher keeps to it: the job
-card hides Retry and Play for such a job, and the service refuses to run it. Skipped without a JDK (the source checks run anyway)."""
+card hides Retry and Play for such a job, and the service refuses to run it. An APK whose translator does not match its own tools gets its own offer (FIX_UPDATE):
+the tool's refusal and PrepareText's match are the same text, and the card hides Retry for that install. Skipped without a JDK (the source checks run anyway)."""
+import re
 import shutil
 import subprocess
 import tempfile
@@ -41,10 +43,29 @@ class Wiring(unittest.TestCase):
 
     def test_card_offers_only_what_can_work(self):
         src = (ONDEVICE / 'Ondevice.java').read_text(encoding='utf-8')
-        self.assertIn('go.setVisibility(noFix ? View.GONE : View.VISIBLE)', src, 'no Retry that cannot succeed')
+        self.assertIn('go.setVisibility(noFix || broken ? View.GONE : View.VISIBLE)', src, 'no Retry that cannot succeed')
         self.assertIn('play.setVisibility(noFix ? View.GONE : View.VISIBLE)', src)
         self.assertIn('PrepareText.FIX_ANYWAY.equals(job.fix())', src, 'Try anyway only where the job can go on with a check relaxed')
         self.assertNotIn('" · update " + job.version()', src, 'no raw version number in the card\'s title line')
+
+    def test_translator_mismatch_is_the_tools_text(self):   # the trigger (2026-11-10): an APK with a stale translator library; its card said Tap Retry
+        java = (SRC / 'PrepareText.java').read_text(encoding='utf-8')
+        m = re.search(r'static final String XLATE_MISMATCH = "([^"]+)";', java)
+        self.assertIsNotNone(m, 'PrepareText.XLATE_MISMATCH')
+        tool = (REPO / 'dm/gfx/tools/vk_android_build.py').read_text(encoding='utf-8')
+        self.assertIn(f"sys.exit('\\n'.join('[RED] {m.group(1)}' + b for b in _bad))", tool, 'check_translator refuses with the text PrepareText matches')
+        self.assertIn('if (red.startsWith(XLATE_MISMATCH))', java)
+
+    def test_broken_app_card(self):   # FIX_UPDATE: no Retry while the install it failed under is there; Check for updates where the app has an updater
+        card = (ONDEVICE / 'Ondevice.java').read_text(encoding='utf-8')
+        self.assertIn('boolean broken = failed && !alive && job.brokenApk(Job.installed(a));', card)
+        self.assertIn('update.setVisibility(broken && Updater.available(a) ? View.VISIBLE : View.GONE);', card)
+        self.assertIn('Updater.checkNow(a)', card)
+        svc = (ONDEVICE / 'PackService.java').read_text(encoding='utf-8')
+        self.assertIn('if (PrepareText.FIX_UPDATE.equals(j.fix())) j.failApk(Job.installed(this));', svc)
+        job = (ONDEVICE / 'Job.java').read_text(encoding='utf-8')
+        self.assertIn('o.remove("fail_apk");', job, 'a new state forgets the install it failed under')
+        self.assertIn('o.optLong("fail_apk", -1) == installed', job)
 
     def test_try_anyway_relaxes_only_named_checks(self):
         src = (ONDEVICE / 'PackService.java').read_text(encoding='utf-8')

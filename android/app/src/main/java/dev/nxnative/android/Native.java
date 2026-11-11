@@ -106,7 +106,8 @@ final class Native {
     /** The frame rate cap while the game runs: 0 = the game's own, else 15, 20, 30 or 60, the launcher's choices (Prefs.FPS_CAPS; nxhost_fps_cap_set) */
     static native void fpsCapSet(int fps);
 
-    /** "<cap> <rates> <game fps>": the cap in effect, a bit per cap this game can hold (the host's bits: 15, 20, 30, 40, 45, 60), the game's frame rate now; "-1 0 0" without a cap in the host. rates 0: the game picks its own frame rate */
+    /** "<cap> <rates> <game fps>[ <limit held>]": the cap in effect, a bit per cap this game can hold (the host's bits: 15, 20, 30, 40, 45, 60), the game's frame rate now, and the rate
+     *  the frame limit holds (0 = none; a game that steps in whole vsyncs holds 60, 30 or 20: 45 and 40 run at 30); "-1 0 0" without a cap in the host. rates 0: the game picks its own frame rate */
     static native String fpsCapStatus();
 
     /** The readiness check's Vulkan facts ("key=value" lines, nxhost_vk_readiness) on the driver env names (DM_VK_DRIVER / DM_VK_HOOKDIR; the other keys are not set);
@@ -138,6 +139,13 @@ final class Native {
     static native int pinThreads();
     /** The frame limit while the game runs (games whose speed follows the measured rate: Prefs.paced); 0 = none */
     static native void fpsLimitSet(int fps);
+    /** Full game speed at low frame rates while the game runs (games whose profile has fps_decouple sead: Prefs.paced; hle_fpslock.c nxhost_fps_decouple_set) */
+    static native void decoupleSet(boolean on);
+    /** Game resolution while the game runs, for a game with graphics_scale rows (Profile.resolutionLive): the graphics scale (0-2, -1 following the operation mode) and the operation mode
+     *  (0 handheld, 1 console, -1 the profile's own); the host posts the console's change notifications and the game queries them again (hle_oe.c nxhost_graphics_mode_set). False when this host has no such call */
+    static native boolean graphicsModeSet(int scale, int opmode);
     /** Donkey Kong Bananza's dynamic resolution range while it runs, % of the window (probe.c nxhost_drs_set); 100, 100 = off (the native size) */
     static native void drsSet(int minPct, int maxPct);
+    /** Whether the running game has dispatched a neural upscaler network that the Upscaler can replace (vka_draw.c nxhost_ndsr_status): 1 yes, 0 not yet, -1 this host cannot say */
+    static native int ndsrStatus();
 }

@@ -290,6 +290,9 @@ final class Ui {
      * Returns the column to fill.
      */
     static LinearLayout page(Activity a, FrameLayout frame, int maxWidthDp) {
+        // Edge to edge on every Android: from Android 15 targetSdk 35 makes it so, but before it the window keeps its content clear of the bars itself and
+        // consumes the insets, so the listener below never ran and the column had no gutter and no width limit (cards from edge to edge on Android 13)
+        a.getWindow().setDecorFitsSystemWindows(false);
         View scrim = new View(a);
         scrim.setBackgroundColor((col(a, R.color.bn_bg) & 0x00FFFFFF) | 0xEE000000);
         ScrollView scroll = new ScrollView(a);

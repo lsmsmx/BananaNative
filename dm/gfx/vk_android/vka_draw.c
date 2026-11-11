@@ -1384,7 +1384,11 @@ static int sets_push(const vka_layout *lay, VkPipelineBindPoint bp, int any_pool
         vk.vkCmdBindDescriptorSets(g_cb, bp, lay->layout, 0, 1, &set, 0, NULL);
     }
     if (g_prof) g_ps[2] += cntvct() - t2_;
-    if (any_pool) { VkDescriptorSet ps = vka_bindless_set(); if (ps) vk.vkCmdBindDescriptorSets(g_cb, bp, lay->layout, 1, 1, &ps, 0, NULL); else VRED_ONCE("a shader reads the texture pool and there is no pool set"); }
+    if (any_pool) vka_tex_pfb_draw();   // (its pool reads are reported: this submission copies the bitmap out, vka_tex.c "Texture pool reads")
+    if (any_pool) {   // set 1 the pool, and in the same call set 2 the pool reads' bitmap when they are reported (vka_tex.c "Texture pool reads")
+        VkDescriptorSet ps[2] = {vka_bindless_set(), vka_pfb_set()};
+        if (ps[0]) vk.vkCmdBindDescriptorSets(g_cb, bp, lay->layout, 1, ps[1] ? 2 : 1, ps, 0, NULL); else VRED_ONCE("a shader reads the texture pool and there is no pool set");
+    }
     return 1;
 }
 // The last draw's writes, kept as what made them (DM_VK_SETS_MEMO, live, default 1). Building them (stage_writes) is 7.7 us a draw on the phone: 7.6 image descriptors of it,
@@ -1897,13 +1901,42 @@ static int mesh_cut(const vka_dstate *d, const p_set_rt *rt, int has_rt, uint64_
     }
     return 0;
 }
+// Indirect-count multi-draws (nvnCommandBufferMultiDraw*IndirectCount, hle_nvn.c: one record per draw, each naming the whole multi-draw). NVN's GPU reads the count when
+// it runs the draws, so it sees what the work before them wrote. The replay used to read the count on the CPU while recording, which is only right when the count's
+// producer finished before the replay reached the draws. With GPU waits honoured (vka_qsched.h) it does not: a queue parked at its wait goes on as soon as the producer on
+// the other queue is replayed, before the GPU has run it, so the CPU read last time's count while the GPU drew this time's records. Records past this time's count hold
+// whatever the memory held (Mario Kart World 1.8.0 on Turnip: the device was lost in its first race 15-22 s in, with waits on only). Now the multi-draw is made at its
+// first record with vkCmdDraw*IndirectCount (drawIndirectCount, Vulkan 1.2) and the later records are passed over (vka_exec.c). Where the device lacks it, the records or
+// the count lie outside one buffer range, or DM_VK_MDI_GPU=0 (live): the count read on the CPU at replay, as before
+int vka_mdi_gpu(int indexed, uint32_t n, uint32_t stride) {
+    if (!V.draw_count || !VKA_ENV("DM_VK_MDI_GPU", 1)) return 0;
+    if (!n || stride < (indexed ? 20u : 16u) || (stride & 3) || n > V.props.limits.maxDrawIndirectCount) return 0;
+    return indexed ? vk.vkCmdDrawIndexedIndirectCount != NULL : vk.vkCmdDrawIndirectCount != NULL;
+}
+// The multi-draw's records and its count, each in one buffer range: the GPU reads the count and at most n records from them
+static int mdi_ranges(uint64_t ind, uint64_t cnt, uint32_t n, uint32_t st, uint32_t rec, VkBuffer *b, VkDeviceSize *o, VkBuffer *cb, VkDeviceSize *co) {
+    return vka_addr(ind, (uint64_t)(n - 1) * st + rec, b, o, NULL) && !(*o & 3) && vka_addr(cnt, 4, cb, co, NULL) && !(*co & 3);
+}
+// They are not: the count as the CPU reads it now (as before), a draw per record below it
+static void mdi_cpu(int indexed, uint64_t ind, uint64_t cnt, uint32_t n, uint32_t st) {
+    uint32_t c = 0; if (!cpu_read(cnt, &c, 4)) return;
+    VRED_ONCE("indirect-count multi-draw whose records or count are not one buffer range each: its count read on the CPU at replay");
+    for (uint32_t i = 0; i < c && i < n; i++) {
+        VkBuffer b; VkDeviceSize o; if (!vka_addr(ind + (uint64_t)i * st, indexed ? 20 : 16, &b, &o, NULL) || (o & 3)) continue;
+        if (indexed) vk.vkCmdDrawIndexedIndirect(g_cb, b, o, 1, 20); else vk.vkCmdDrawIndirect(g_cb, b, o, 1, 16);
+    }
+}
 static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
     if (RUN.open && RUN.fast && di && !dw && g_inst_on && inst_fast(d, rt, has_rt, sc, has_sc, di)) return;   // DM_VK_INSTANCE: the run's next object, no walk
     if (!d->inited) vka_dstate_reset(d);
-    uint64_t mdi = dw ? dw->mdi_cnt : di->mdi_cnt; int mdi_i = dw ? dw->mdi_i : di->mdi_i;
-    if (mdi) { uint32_t cnt = 0; if (!cpu_read(mdi, &cnt, 4) || (uint32_t)mdi_i >= cnt) { vka_rtlog_skip(rt, has_rt, d, "not drawn: past its multi-draw's count as the CPU reads it"); return; }   // past the multi-draw's count (read now: a count the GPU writes in this submission is not seen)
-               VRED_ONCE("indirect-count multi-draws read their count on the CPU at replay"); }
+    uint64_t mdi = dw ? dw->mdi_cnt : di->mdi_cnt; int mdi_i = dw ? dw->mdi_i : di->mdi_i; uint32_t mdi_n = 0, mdi_st = 0;
+    if (mdi && vka_mdi_gpu(di != NULL, dw ? dw->mdi_n : di->mdi_n, dw ? dw->mdi_stride : di->mdi_stride)) {   // made whole at its first record, the count read by the GPU
+        if (mdi_i) return;   // (vka_exec.c passes the later records over)
+        mdi_n = dw ? dw->mdi_n : di->mdi_n; mdi_st = dw ? dw->mdi_stride : di->mdi_stride;
+        static _Atomic int logged; if (!atomic_exchange(&logged, 1)) VLOG("indirect-count multi-draws: each made whole at its first record, its count read by the GPU (vkCmdDraw*IndirectCount; DM_VK_MDI_GPU=0: read on the CPU at replay)");
+    } else if (mdi) { uint32_t cnt = 0; if (!cpu_read(mdi, &cnt, 4) || (uint32_t)mdi_i >= cnt) { vka_rtlog_skip(rt, has_rt, d, "not drawn: past its multi-draw's count as the CPU reads it"); return; }   // past the multi-draw's count (read now: a count the GPU writes in this submission is not seen)
+               VRED_ONCE("indirect-count multi-draws read their count on the CPU at replay (no drawIndirectCount, a stride it does not take, or DM_VK_MDI_GPU=0)"); }
     d->b.base_instance = (uint32_t)(dw ? dw->base_instance : di->base_instance);
     vka_shader *sh[VKA_NSTAGE] = {0}; unsigned bad = 0;
     PT(0);
@@ -2259,8 +2292,11 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         ib_bind(s.buf, s.off, VK_INDEX_TYPE_UINT32);
         vk.vkCmdDrawIndexed(g_cb, nout, inst, 0, di ? di->base_vertex : 0, binst);
     } else if (dw) {
-        if (ind) { VkBuffer b; VkDeviceSize o; if (!vka_addr(ind, 16, &b, &o, NULL) || (o & 3)) SKIP("indirect draw arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)ind);
-                   VRED_ONCE("indirect draws: outside vertex shaders, the driver segment's base instance (c0 + 0x644) reads the record's, not the GPU's"); vk.vkCmdDrawIndirect(g_cb, b, o, 1, 16); }
+        if (ind) { VkBuffer b, cb; VkDeviceSize o, co;
+                   VRED_ONCE("indirect draws: outside vertex shaders, the driver segment's base instance (c0 + 0x644) reads the record's, not the GPU's");
+                   if (mdi_n) { if (mdi_ranges(ind, mdi, mdi_n, mdi_st, 16, &b, &o, &cb, &co)) vk.vkCmdDrawIndirectCount(g_cb, b, o, cb, co, mdi_n, mdi_st); else mdi_cpu(0, ind, mdi, mdi_n, mdi_st); }
+                   else { if (!vka_addr(ind, 16, &b, &o, NULL) || (o & 3)) SKIP("indirect draw arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)ind);
+                          vk.vkCmdDrawIndirect(g_cb, b, o, 1, 16); } }
         else vk.vkCmdDraw(g_cb, (uint32_t)dw->count, inst, (uint32_t)dw->first, binst);
     } else {
         VkBuffer ib; VkDeviceSize io; VkIndexType it = di->itype == 0 ? VK_INDEX_TYPE_UINT8 : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
@@ -2281,8 +2317,10 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
             ijoin = 0; ib = i_ib; io = i_io; it = i_it;
         } else if (!vka_addr(di->ibuf, ind ? isz : isz * (uint64_t)(di->count > 0 ? di->count : 1), &ib, &io, NULL) || io % isz) SKIP("index buffer at %#llx is not in placed guest RAM: skipped", (unsigned long long)di->ibuf);
         ib_bind(ib, io, it);
-        if (ind) { VkBuffer b; VkDeviceSize o; if (!vka_addr(ind, 20, &b, &o, NULL) || (o & 3)) SKIP("indirect draw arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)ind);
-                   vk.vkCmdDrawIndexedIndirect(g_cb, b, o, 1, 20); }
+        if (ind) { VkBuffer b, cb; VkDeviceSize o, co;
+                   if (mdi_n) { if (mdi_ranges(ind, mdi, mdi_n, mdi_st, 20, &b, &o, &cb, &co)) vk.vkCmdDrawIndexedIndirectCount(g_cb, b, o, cb, co, mdi_n, mdi_st); else mdi_cpu(1, ind, mdi, mdi_n, mdi_st); }
+                   else { if (!vka_addr(ind, 20, &b, &o, NULL) || (o & 3)) SKIP("indirect draw arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)ind);
+                          vk.vkCmdDrawIndexedIndirect(g_cb, b, o, 1, 20); } }
         else if (istart) {   // the run's first draw: indirect, its instance count raised by the draws that join
             RUN.args[0] = (uint32_t)di->count; RUN.args[1] = 1; RUN.args[2] = 0; RUN.args[3] = (uint32_t)di->base_vertex; RUN.args[4] = 0;
             vk.vkCmdDrawIndexedIndirect(g_cb, i_aa.buf, i_aa.off, 1, 20); RUN.mark = vka_enc_total(); g_inst_runs++;
@@ -2337,12 +2375,16 @@ static VkPipeline img_retype(vka_shader *cs, const vka_layout *lay, VkPipeline p
     for (int i = 0; i < g_wk.n[5]; i++) if ((r[i].what == VKA_R_IMG || r[i].what == VKA_R_TEX) && r[i].binding < 64 && ((um | sm) >> r[i].binding & 1)) r[i].dim |= um >> r[i].binding & 1 ? DMSH_VK_DIM_UINT : DMSH_VK_DIM_SINT;
     return q;
 }
-// ---------- FSR 1 in place of a game's neural upscaler (DM_VK_NDSR=2) ----------
+// ---------- FSR 1 in place of a game's neural upscaler (DM_VK_NDSR) ----------
 // AMD's EASU (and RCAS, DM_VK_NDSR_SHARP) as compute passes from the upscaler's input texture to its output image (vka_ndsr_fsr.h, dm/gfx/vk_android/fsr/): edge-adaptive
-// instead of the stretch's bilinear blit, for a fraction of the emulated network's GPU time. With RCAS the EASU pass writes the replay's own intermediate image of the output's
-// size and RCAS writes the output. 0 = not done (no push descriptors, another output format than B10G11R11, no view): the caller blits
+// instead of the stretch's bilinear blit, for a fraction of the emulated network's GPU time. With RCAS the EASU pass writes the replay's own RGBA16F intermediate image of the
+// output's size and RCAS writes the output. The output (B10G11R11) is stored as floats where the format has storage use, else as its packed words through an R32_UINT view
+// (Qualcomm's driver: no B10G11R11 storage). sq: the input holds sqrt(colour) (agl's light upscaler): the passes run on it and the last one squares. kernel: 0 EASU (with RCAS),
+// 1 a bilinear sample, 2 the nearest texel. 0 = not done (no push descriptors, another output format, no view): the caller blits or lets the network run
 #include "vka_ndsr_fsr.h"
-static struct { int state; VkDescriptorSetLayout dsl; VkPipelineLayout lay; VkPipeline easu, rcas; VkSampler samp; VkImage mid; VkDeviceMemory mem; VkImageView mv; uint32_t mw, mh; } g_nf;
+enum { NF_EASU, NF_EASU_MID, NF_EASU_PACKED, NF_RCAS, NF_RCAS_PACKED, NF_N };
+static struct { int state; VkDescriptorSetLayout dsl; VkPipelineLayout lay; VkSampler samp; VkPipeline p[NF_N][2][3]; signed char bad[NF_N][2][3];
+                VkImage mid; VkDeviceMemory mem; VkImageView mv; uint32_t mw, mh; } g_nf;
 static void nf_mid_free(void *p) { VkImage *a = p; vk.vkDestroyImageView(V.dev, (VkImageView)(uintptr_t)a[1], NULL); vk.vkDestroyImage(V.dev, a[0], NULL); vk.vkFreeMemory(V.dev, (VkDeviceMemory)(uintptr_t)a[2], NULL); free(p); }
 static int nf_ready(void) {
     if (g_nf.state) return g_nf.state > 0;
@@ -2357,22 +2399,30 @@ static int nf_ready(void) {
     VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &g_nf.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pc};
     if (!r) r = vk.vkCreatePipelineLayout(V.dev, &li, NULL, &g_nf.lay);
     if (!r) r = vk.vkCreateSampler(V.dev, &si, NULL, &g_nf.samp);
-    const uint32_t *code[2] = {vka_ndsr_easu, vka_ndsr_rcas}; size_t size[2] = {sizeof vka_ndsr_easu, sizeof vka_ndsr_rcas}; VkPipeline *out[2] = {&g_nf.easu, &g_nf.rcas};
-    for (int k = 0; k < 2 && !r; k++) {
-        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size[k], .pCode = code[k]}; VkShaderModule m = VK_NULL_HANDLE;
-        r = vk.vkCreateShaderModule(V.dev, &mi, NULL, &m);
-        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"}, .layout = g_nf.lay};
-        if (!r) r = vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, out[k]);
-        if (m) vk.vkDestroyShaderModule(V.dev, m, NULL);
-    }
-    if (r) { VRED("NDSR FSR: pipelines %d: the stretch instead", r); return 0; }
+    if (r) { VRED("NDSR FSR: layouts %d: the stretch instead", r); return 0; }
     g_nf.state = 1; return 1;
 }
-static int nf_mid(uint32_t w, uint32_t h) {   // the intermediate image for RCAS (B10G11R11, storage and sampled, kept in GENERAL); the old one goes once the GPU is past it
+static VkPipeline nf_pipe(int which, int sq, int kernel) {   // made at first use, by module, input encoding and kernel (specialization constants 0 and 1)
+    VkPipeline *out = &g_nf.p[which][sq][kernel];
+    if (*out || g_nf.bad[which][sq][kernel]) return *out;
+    static const uint32_t *const code[NF_N] = {vka_ndsr_easu, vka_ndsr_easu_mid, vka_ndsr_easu_packed, vka_ndsr_rcas, vka_ndsr_rcas_packed};
+    static const size_t size[NF_N] = {sizeof vka_ndsr_easu, sizeof vka_ndsr_easu_mid, sizeof vka_ndsr_easu_packed, sizeof vka_ndsr_rcas, sizeof vka_ndsr_rcas_packed};
+    VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = size[which], .pCode = code[which]}; VkShaderModule m = VK_NULL_HANDLE;
+    VkResult r = vk.vkCreateShaderModule(V.dev, &mi, NULL, &m);
+    uint32_t sv[2] = {(uint32_t)sq, (uint32_t)kernel}; VkSpecializationMapEntry se[2] = {{0, 0, 4}, {1, 4, 4}};   // (RCAS has no constant 1: an entry for an absent ID is allowed)
+    VkSpecializationInfo spi = {2, se, sizeof sv, sv};
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                      .module = m, .pName = "main", .pSpecializationInfo = &spi}, .layout = g_nf.lay};
+    if (!r) r = vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, out);
+    if (m) vk.vkDestroyShaderModule(V.dev, m, NULL);
+    if (r) { *out = VK_NULL_HANDLE; g_nf.bad[which][sq][kernel] = 1; VRED("NDSR FSR: pipeline %d (input %s, kernel %d): %d", which, sq ? "sqrt" : "linear", kernel, r); }
+    return *out;
+}
+static int nf_mid(uint32_t w, uint32_t h) {   // the intermediate image for RCAS (RGBA16F, storage and sampled, kept in GENERAL); the old one goes once the GPU is past it
     if (g_nf.mid && g_nf.mw == w && g_nf.mh == h) return 1;
     if (g_nf.mid) { VkImage *a = malloc(3 * sizeof *a); if (a) { a[0] = g_nf.mid; a[1] = (VkImage)(uintptr_t)g_nf.mv; a[2] = (VkImage)(uintptr_t)g_nf.mem; vka_after(vka_fence_last(), nf_mid_free, a); } }
     g_nf.mid = VK_NULL_HANDLE; g_nf.mv = VK_NULL_HANDLE; g_nf.mem = VK_NULL_HANDLE; g_nf.mw = g_nf.mh = 0;
-    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
     VkResult r = vk.vkCreateImage(V.dev, &ci, NULL, &g_nf.mid);
     VkMemoryRequirements mr = {0}; if (!r) vk.vkGetImageMemoryRequirements(V.dev, g_nf.mid, &mr);
@@ -2380,7 +2430,7 @@ static int nf_mid(uint32_t w, uint32_t h) {   // the intermediate image for RCAS
     if (!r && ai.memoryTypeIndex == UINT32_MAX) r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     if (!r) r = vk.vkAllocateMemory(V.dev, &ai, NULL, &g_nf.mem);
     if (!r) r = vk.vkBindImageMemory(V.dev, g_nf.mid, g_nf.mem, 0);
-    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_nf.mid, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_nf.mid, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R16G16B16A16_SFLOAT,
                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (!r) r = vk.vkCreateImageView(V.dev, &vi, NULL, &g_nf.mv);
     if (r) { VRED_ONCE("NDSR FSR: intermediate image %ux%u: %d; sharpening off", w, h, r); return 0; }
@@ -2394,37 +2444,109 @@ static void nf_pass(VkPipeline pipe, VkImageView src, VkImageLayout ls, VkImageV
                                   {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &ii[1]}};
     vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_nf.lay, 0, 2, wr);
+    g_pd[1].n = 0;   // the dispatches' last push is no longer bound (another layout disturbs set 0): the next dispatch pushes again (push_same, DM_VK_PUSH_DEDUP)
     vk.vkCmdPushConstants(g_cb, g_nf.lay, VK_SHADER_STAGE_COMPUTE_BIT, 0, 72, pc);
     vk.vkCmdDispatch(g_cb, (w + 7) / 8, (h + 7) / 8, 1);
 }
-static int ndsr_fsr(int tin, int tout, vka_img *a, vka_img *b) {
-    if (!nf_ready() || b->f.vk != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return 0;
+static int ndsr_fsr(int tin, int tout, vka_img *a, vka_img *b, VkFormat fb, int sq, int kernel) {   // fb: the output texture's format (vka_tex_id_vkfmt)
+    if (!nf_ready() || fb != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !(a->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
     static int st_ok = -1;
-    if (st_ok < 0) { VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, b->f.vk, &fp); st_ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
-                     if (!st_ok) VRED("NDSR FSR: B10G11R11 is no storage image format here: the stretch instead"); }
-    if (!st_ok || !(b->usage & VK_IMAGE_USAGE_STORAGE_BIT) || !(a->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
+    if (st_ok < 0) { VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, fb, &fp); st_ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+                     VLOG("NDSR FSR: B10G11R11 %s", st_ok ? "has storage use here: stored as floats" : "has no storage use here: stored as packed words through an R32_UINT view"); }
     VkImageLayout la = VK_IMAGE_LAYOUT_GENERAL, lb = VK_IMAGE_LAYOUT_GENERAL;
-    VkImageView va = vka_tex_id_view_rec(tin, g_cb, 1, 0, &la), vb = vka_tex_id_view_rec(tout, g_cb, 1, 1, &lb);   // dim 1: 2D; sampled / storage
-    if (!va || !vb) return 0;
+    VkImageView va = vka_tex_id_view_rec(tin, g_cb, 1, 0, &la);   // dim 1: 2D; sampled
+    int packed = !st_ok;
+    VkImageView vb = packed ? vka_tex_id_view_bits(tout, g_cb, &lb) : vka_tex_id_view_rec(tout, g_cb, 1, 1, &lb);   // (a storage view: the image gains storage use if it had none)
+    if (!va || !vb) { VRED_ONCE("NDSR FSR: no %s view (texture IDs %d -> %d)", va ? "output" : "input", tin, tout); return 0; }
     float sharp = VKA_ENVF("DM_VK_NDSR_SHARP", 0.25);   // RCAS's sharpness in stops (0 = the most, AMD's default 0.25); below 0: no RCAS
-    int rcas = sharp >= 0 && nf_mid(b->w, b->h);
+    int rcas = kernel == 0 && sharp >= 0 && nf_mid(b->w, b->h);
+    VkPipeline p1 = nf_pipe(rcas ? NF_EASU_MID : packed ? NF_EASU_PACKED : NF_EASU, rcas ? 0 : sq, kernel), p2 = rcas ? nf_pipe(packed ? NF_RCAS_PACKED : NF_RCAS, sq, 0) : VK_NULL_HANDLE;
+    if (!p1 || (rcas && !p2)) return 0;
     float sx = (float)a->w / b->w, sy = (float)a->h / b->h, rw = 1.0f / a->w, rh = 1.0f / a->h;
     float easu[16] = {sx, sy, 0.5f * sx - 0.5f, 0.5f * sy - 0.5f, rw, rh, rw, -rh, -rw, 2 * rh, rw, 2 * rh, 0, 4 * rh, 0, 0};   // AMD's FsrEasuCon for the whole image
     uint32_t pc[18] = {0}; for (int i = 0; i < 16; i++) pc[i] = nf_bits(easu[i]); pc[16] = b->w; pc[17] = b->h;
     vka_barrier(g_cb);
-    nf_pass(g_nf.easu, va, la, rcas ? g_nf.mv : vb, rcas ? VK_IMAGE_LAYOUT_GENERAL : lb, pc, b->w, b->h);
+    nf_pass(p1, va, la, rcas ? g_nf.mv : vb, rcas ? VK_IMAGE_LAYOUT_GENERAL : lb, pc, b->w, b->h);
     if (rcas) {
         vka_barrier(g_cb);
         memset(pc, 0, 64); pc[0] = nf_bits(exp2f(-sharp));   // FsrRcasCon's con0.x (the packed half at word 1 is for the 16-bit path)
-        nf_pass(g_nf.rcas, g_nf.mv, VK_IMAGE_LAYOUT_GENERAL, vb, lb, pc, b->w, b->h);
+        nf_pass(p2, g_nf.mv, VK_IMAGE_LAYOUT_GENERAL, vb, lb, pc, b->w, b->h);
     }
     vka_barrier(g_cb);
-    static int noted; if (!noted++) VLOG("NDSR upscaler replaced by FSR 1 (EASU%s): %ux%u -> %ux%u (DM_VK_NDSR: 0 the game's network, 1 the stretch, 2 FSR 1, 3 nearest)", rcas ? " + RCAS" : "", a->w, a->h, b->w, b->h);
+    static uint32_t lw, lh, lo, lk; if (a->w != lw || a->h != lh || b->w != lo || (uint32_t)(kernel << 2 | sq << 1 | rcas) != lk) {   // logged again at every size or mode change
+        lw = a->w; lh = a->h; lo = b->w; lk = (uint32_t)(kernel << 2 | sq << 1 | rcas);
+        VLOG("NDSR upscaler replaced by %s: %ux%u -> %ux%u, input %s, output %s (DM_VK_NDSR: 0 the game's network, 1 the stretch, 2 FSR 1, 3 nearest)",
+             kernel == 1 ? "a bilinear sample" : kernel == 2 ? "the nearest texel" : rcas ? "FSR 1 (EASU + RCAS)" : "FSR 1 (EASU)", a->w, a->h, b->w, b->h, sq ? "sqrt(colour), squared at the end" : "linear",
+             packed ? "packed words (R32_UINT view)" : "floats"); }
+    return 1;
+}
+// agl's NDSR network by its interface (the upscaler networks of agl_ndsr.pck, agl_ndsr_vr.pck and agl_ndsr_vr_light.pck in every library seen: Donkey Kong Bananza 24,
+// Ocarina of Time 52, Mario Kart World 30, Splatoon Raiders 20): HMMA lowered in the module, one combined 2D texture (the input), one written 2D storage image (the output), one
+// read-only storage buffer (the weights) and the push bank (the rectangles); nothing else but the support buffer and driver segments. A purely spatial network: no history,
+// motion or depth, so a spatial upscaler can take its place
+// Whether a network that DM_VK_NDSR can replace has been dispatched in this run (its input and output fit, whatever the mode): the launcher's in-game panel shows its
+// Upscaler rows only then (Native.ndsrStatus, nxlaunch.c). 0 = not yet
+static _Atomic int g_ndsr_fits;
+__attribute__((visibility("default"))) int nxhost_ndsr_status(void) { return atomic_load_explicit(&g_ndsr_fits, memory_order_relaxed); }
+static int ndsr_iface(const vka_shader *s) {
+    const dmsh_vk_entry *e = s->e;
+    if (!e || !s->b || e->stage != DMSH_VK_STAGE_CS || !(e->flags & DMSH_VK_F_HMMA)) return 0;
+    int nt = 0, ni = 0, ns = 0, nb = 0;
+    for (unsigned i = 0; i < e->bind_count; i++) {
+        const dmsh_vk_bind *x = &s->b[i];
+        switch (x->kind) {
+        case DMSH_VK_KIND_TEX: if (x->desc != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !x->skind || x->dim != 1 || x->count > 1) return 0; nt++; break;
+        case DMSH_VK_KIND_IMG: if (x->desc != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !(x->flags & DMSH_VK_BF_RW) || (x->flags & DMSH_VK_BF_ATOMIC) || x->dim != 1 || x->count > 1) return 0; ni++; break;
+        case DMSH_VK_KIND_SBUF: if (x->flags & DMSH_VK_BF_RW) return 0; ns++; break;
+        case DMSH_VK_KIND_DRVCB: if (x->reg == DMSH_PUSH_BANK) nb++; break;
+        case DMSH_VK_KIND_SUPPORT: break;
+        default: return 0;
+        }
+    }
+    return nt == 1 && ni == 1 && ns == 1 && nb == 1;
+}
+// ---------- SGSR 1 in place of a game's neural upscaler (DM_VK_NDSR=4) ----------
+// Qualcomm's Snapdragon Game Super Resolution 1 (vka_ndsr_sgsr.h, dm/gfx/vk_android/sgsr/ndsr_sgsr.comp, BSD-3-Clause): a 12-tap Lanczos-like scale with edge-adaptive
+// sharpening in one compute pass, made for Adreno. The same contract as FSR's passes (ndsr_fsr): the layouts, sampler and pass of nf_ready / nf_pass, the stores of
+// fsr/ndsr_out.h (B10G11R11 as floats where it has storage use, else packed words through an R32_UINT view), sq squares at the end. 0 = not done: the caller runs FSR 1
+#include "vka_ndsr_sgsr.h"
+static struct { VkPipeline p[2][2]; signed char bad[2][2]; } g_sg;   // [packed][sq]
+static int ndsr_sgsr(int tin, int tout, vka_img *a, vka_img *b, VkFormat fb, int sq) {   // fb: the output texture's format (vka_tex_id_vkfmt)
+    if (!nf_ready() || fb != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !(a->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return 0;
+    static int st_ok = -1;
+    if (st_ok < 0) { VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, fb, &fp); st_ok = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0; }
+    int packed = !st_ok;
+    VkPipeline *pp = &g_sg.p[packed][sq];
+    if (!*pp && !g_sg.bad[packed][sq]) {   // made at first use, by store and input encoding (specialization constant 0)
+        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = packed ? sizeof vka_ndsr_sgsr_packed : sizeof vka_ndsr_sgsr,
+                                       .pCode = packed ? vka_ndsr_sgsr_packed : vka_ndsr_sgsr};
+        VkShaderModule m = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &mi, NULL, &m);
+        uint32_t sv = (uint32_t)sq; VkSpecializationMapEntry se = {0, 0, 4}; VkSpecializationInfo spi = {1, &se, sizeof sv, &sv};
+        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                                          .module = m, .pName = "main", .pSpecializationInfo = &spi}, .layout = g_nf.lay};
+        if (!r) r = vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, pp);
+        if (m) vk.vkDestroyShaderModule(V.dev, m, NULL);
+        if (r) { *pp = VK_NULL_HANDLE; g_sg.bad[packed][sq] = 1; VRED("NDSR SGSR: pipeline (%s, input %s): %d: FSR 1 instead", packed ? "packed" : "floats", sq ? "sqrt" : "linear", r); }
+    }
+    if (!*pp) return 0;
+    VkImageLayout la = VK_IMAGE_LAYOUT_GENERAL, lb = VK_IMAGE_LAYOUT_GENERAL;
+    VkImageView va = vka_tex_id_view_rec(tin, g_cb, 1, 0, &la);   // dim 1: 2D; sampled
+    VkImageView vb = packed ? vka_tex_id_view_bits(tout, g_cb, &lb) : vka_tex_id_view_rec(tout, g_cb, 1, 1, &lb);   // (a storage view: the image gains storage use if it had none)
+    if (!va || !vb) { VRED_ONCE("NDSR SGSR: no %s view (texture IDs %d -> %d)", va ? "output" : "input", tin, tout); return 0; }
+    float vp[4] = {1.0f / a->w, 1.0f / a->h, (float)a->w, (float)a->h};   // SGSR's ViewportInfo
+    uint32_t pc[18] = {0}; for (int i = 0; i < 4; i++) pc[i] = nf_bits(vp[i]); pc[4] = b->w; pc[5] = b->h;
+    vka_barrier(g_cb);
+    nf_pass(*pp, va, la, vb, lb, pc, b->w, b->h);
+    vka_barrier(g_cb);
+    static uint32_t lw, lh, lo, lk; if (a->w != lw || a->h != lh || b->w != lo || (uint32_t)(sq << 1 | packed) != lk) {   // logged again at every size or mode change
+        lw = a->w; lh = a->h; lo = b->w; lk = (uint32_t)(sq << 1 | packed);
+        VLOG("NDSR upscaler replaced by SGSR 1: %ux%u -> %ux%u, input %s, output %s (DM_VK_NDSR: 0 the game's network, 1 the stretch, 2 FSR 1, 3 nearest, 4 SGSR 1)",
+             a->w, a->h, b->w, b->h, sq ? "sqrt(colour), squared at the end" : "linear", packed ? "packed words (R32_UINT view)" : "floats"); }
     return 1;
 }
 // ---------- Dispatch order ----------
 // NVN orders a dispatch against the work after it only through the game's barriers (nvnCommandBufferBarrier: ORDER_PRIMITIVES, the invalidations), which the replay
-// records as full barriers (vka_exec.c OP_BARRIER). The replay used to record a full barrier after every dispatch as well: consecutive dispatches never overlapped, and
+// records as full barriers (vka_exec.c OP_BARRIER), or narrower between dispatches (vka_gbar.c). The replay used to record a full barrier after every dispatch as well: consecutive dispatches never overlapped, and
 // each paid a barrier of its own on top of the game's. Pokémon Pokopia's dispatches grow over a session (11 a frame at the start, about 1,000 after an hour, with 1.8 full
 // barriers each), and on an Adreno 750 with Turnip its GPU time a frame went from 5 ms to 22 ms with the draws the same (docs/reference/rendering.md "A full barrier after
 // every dispatch"). So the barrier after a dispatch is left pending and recorded only before other GPU work in the same command buffer (draws, clears, copies, inline
@@ -2473,6 +2595,104 @@ void vka_disp_census(uint64_t frame) {
     }
     memset(g_dc, 0, sizeof g_dc); g_dc_drop = 0; g_dc_frame = frame; g_disp_settled = g_disp_saved = vka_disp_cleared = 0;
 }
+// ---------- Dispatch objects (DM_VK_DISP_OBJ, diagnostic) ----------
+// Pokémon Pokopia's compute dispatches grow over a session (dm/games/0400A3A01EE4C000/README.md "Android"): one small chain a frame for every object of its effect system,
+// and the number of objects grows. Whether the game keeps objects it should have retired (waiting for something the host answers) or simply has more of them shows in their
+// lives: DM_VK_DISP_OBJ=<hex key>[,…] (or 1: every compute shader; restart) takes each dispatch of those shaders as one object's, known by the guest addresses of the
+// storage buffers it binds (and, as a second reading, of storage and uniform buffers: a uniform buffer from a ring changes every frame, one of the object's own does not),
+// and every DM_VK_DISP_OBJ_EVERY frames (default 600, live) logs per shader (`dispatch objects`) how many objects ran, how many appeared and how many stopped running since
+// the last line, their ages, and what the first 8 words of the object's first storage buffer held when its last dispatch was recorded (the CPU's view, which is what the
+// GPU left there by then): how many changed since the last line and how many are all zeros, and the oldest object's words. A second line (`dispatch objects: SyncWait`)
+// counts the game's nvnSyncWait answers and nvnQueueFinish calls in the same frames (hle_nvn.c nvn_sync_wait_n)
+enum { DO_N = 1 << 16, DO_K = 256 };
+typedef struct { uint64_t key, id, a0, first, last, nd, nd0; uint32_t w[8], wc[8]; uint8_t used, kind, seen; } dobj;
+static dobj *g_do; static uint64_t g_do_keys[64], g_do_frame, g_do_full; static int g_do_nk = -1, g_do_all;
+__attribute__((weak)) _Atomic uint64_t nvn_sync_wait_n[5];
+uint64_t vka_frame(void);
+static int dobj_on(uint64_t key) {
+    if (g_do_nk < 0) {
+        g_do_nk = 0; const char *q = getenv("DM_VK_DISP_OBJ");
+        if (q && !strcmp(q, "1")) g_do_all = 1;
+        else for (; q && *q && g_do_nk < 64;) { char *e; unsigned long long k = strtoull(q, &e, 16); if (e == q) break; g_do_keys[g_do_nk++] = k; q = *e == ',' ? e + 1 : e; }
+        if ((g_do_all || g_do_nk) && !(g_do = calloc(DO_N, sizeof *g_do))) { g_do_all = 0; g_do_nk = 0; }
+        if (g_do) VLOG("dispatch objects (DM_VK_DISP_OBJ): %s, a line every DM_VK_DISP_OBJ_EVERY frames", g_do_all ? "every compute shader" : "the shaders listed");
+    }
+    if (!g_do) return 0;
+    if (g_do_all) return 1;
+    for (int i = 0; i < g_do_nk; i++) if (g_do_keys[i] == key) return 1;
+    return 0;
+}
+static uint64_t do_mix(uint64_t h, uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); return h * 0xff51afd7ed558ccdull; }
+static dobj *dobj_slot(dobj *t, uint64_t key, uint64_t id, int kind) {
+    uint64_t h = do_mix(do_mix(key, id), (uint64_t)kind);
+    for (int k = 0; k < 256; k++) { dobj *o = &t[(h + (uint64_t)k) & (DO_N - 1)]; if (!o->used || (o->key == key && o->id == id && o->kind == kind)) return o; }
+    return NULL;
+}
+static void dobj_note(uint64_t key, const vka_res *r, int n) {
+    if (!dobj_on(key)) return;
+    uint64_t hs = 1, hu = 1, a0 = 0, f = vka_frame(); int b0 = 1 << 30;
+    for (int i = 0; i < n; i++) {
+        if (r[i].what != VKA_R_BUF) continue;
+        if (r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) { hs = do_mix(do_mix(hs, r[i].addr), r[i].size); if (r[i].binding < b0) { b0 = r[i].binding; a0 = r[i].addr; } }
+        else hu = do_mix(hu, r[i].addr);
+    }
+    for (int kind = 0; kind < 2; kind++) {
+        uint64_t id = kind ? do_mix(hs, hu) : hs;
+        dobj *o = dobj_slot(g_do, key, id, kind);
+        if (!o) { g_do_full++; continue; }
+        if (!o->used) { memset(o, 0, sizeof *o); o->used = 1; o->key = key; o->id = id; o->kind = (uint8_t)kind; o->a0 = a0; o->first = f; }
+        o->last = f; o->nd++;
+        if (!kind && a0 && !cpu_read(a0, o->w, sizeof o->w)) memset(o->w, 0, sizeof o->w);
+    }
+}
+void vka_dobj_census(uint64_t frame) {
+    if (!g_do || frame < g_do_frame + (uint64_t)VKA_ENV("DM_VK_DISP_OBJ_EVERY", 600)) return;
+    uint64_t ws = g_do_frame, nf = frame - ws;
+    static struct { uint64_t key, nd, live[2], born[2], gone[2], age[3], chg, zero; const dobj *old; } k[DO_K]; int nk = 0;
+    memset(k, 0, sizeof k);
+    for (int i = 0; i < DO_N; i++) {
+        dobj *o = &g_do[i]; if (!o->used) continue;
+        int j = 0; while (j < nk && k[j].key != o->key) j++;
+        if (j == nk) { if (nk == DO_K) continue; k[nk++].key = o->key; }
+        int kd = o->kind;
+        if (o->last <= ws) { k[j].gone[kd]++; continue; }   // ran in the window before, not in this one
+        k[j].live[kd]++; k[j].born[kd] += o->first > ws;
+        if (kd) continue;
+        k[j].nd += o->nd - o->nd0;
+        uint64_t age = frame - o->first; k[j].age[age < 3600 ? 0 : age < 36000 ? 1 : 2]++;
+        if (o->seen && memcmp(o->w, o->wc, sizeof o->w)) k[j].chg++;
+        int z = 1; for (int w = 0; w < 8; w++) z &= o->w[w] == 0; k[j].zero += z;
+        if (!k[j].old || o->first < k[j].old->first) k[j].old = o;
+    }
+    for (int a = 0; a < 6 && a < nk; a++) {   // the 6 shaders with the most dispatches in the window
+        int m = a; for (int b = a + 1; b < nk; b++) if (k[b].nd > k[m].nd) m = b;
+        if (m != a) { __typeof__(k[0]) t = k[a]; k[a] = k[m]; k[m] = t; }
+        if (!k[a].nd) break;
+        const dobj *o = k[a].old;
+        VLOG("dispatch objects of %016llx, frames %llu-%llu: %.1f dispatches a frame; by storage buffers %llu objects ran (%llu new, %llu stopped since the last line; %llu under 3,600 frames old, "
+             "%llu up to 36,000, %llu older; first words changed since the last line in %llu, all zero in %llu); by storage and uniform buffers %llu ran (%llu new, %llu stopped); "
+             "oldest: storage %#llx from frame %llu, %llu dispatches, words %08x %08x %08x %08x %08x %08x %08x %08x",
+             (unsigned long long)k[a].key, (unsigned long long)ws, (unsigned long long)frame, k[a].nd / (double)nf, (unsigned long long)k[a].live[0], (unsigned long long)k[a].born[0],
+             (unsigned long long)k[a].gone[0], (unsigned long long)k[a].age[0], (unsigned long long)k[a].age[1], (unsigned long long)k[a].age[2], (unsigned long long)k[a].chg,
+             (unsigned long long)k[a].zero, (unsigned long long)k[a].live[1], (unsigned long long)k[a].born[1], (unsigned long long)k[a].gone[1],
+             (unsigned long long)(o ? o->a0 : 0), (unsigned long long)(o ? o->first : 0), (unsigned long long)(o ? o->nd : 0),
+             o ? o->w[0] : 0, o ? o->w[1] : 0, o ? o->w[2] : 0, o ? o->w[3] : 0, o ? o->w[4] : 0, o ? o->w[5] : 0, o ? o->w[6] : 0, o ? o->w[7] : 0);
+    }
+    static uint64_t s0[5]; uint64_t s[5]; for (int i = 0; i < 5; i++) s[i] = atomic_load_explicit(&nvn_sync_wait_n[i], memory_order_relaxed);
+    VLOG("dispatch objects: SyncWait in frames %llu-%llu: %llu already signaled, %llu satisfied after a wait, %llu timed out on a fenced sync, %llu on a sync never fenced; "
+         "QueueFinish %llu; %llu objects not kept (table full)", (unsigned long long)ws, (unsigned long long)frame, (unsigned long long)(s[0] - s0[0]), (unsigned long long)(s[1] - s0[1]),
+         (unsigned long long)(s[2] - s0[2]), (unsigned long long)(s[3] - s0[3]), (unsigned long long)(s[4] - s0[4]), (unsigned long long)g_do_full);
+    memcpy(s0, s, sizeof s0); g_do_full = 0;
+    // Objects that did not run in this window are dropped; the rest move into a fresh table (open addressing keeps no holes), their words kept as this line's
+    dobj *t = calloc(DO_N, sizeof *t);
+    if (!t) { memset(g_do, 0, (size_t)DO_N * sizeof *g_do); g_do_frame = frame; return; }
+    for (int i = 0; i < DO_N; i++) {
+        dobj *o = &g_do[i]; if (!o->used || o->last <= ws) continue;
+        dobj *p = dobj_slot(t, o->key, o->id, o->kind); if (!p) continue;
+        *p = *o; p->seen = 1; p->nd0 = o->nd; memcpy(p->wc, o->w, sizeof p->wc);
+    }
+    free(g_do); g_do = t; g_do_frame = frame;
+}
 void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
     if (!d->inited) vka_dstate_reset(d);
@@ -2504,6 +2724,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     }
     c0_at c0 = {0};
     walk_all(d, sh);
+    if (g_do_nk || g_do_all) dobj_note(sh[5]->key, g_wk.r[5], g_wk.n[5]);   // DM_VK_DISP_OBJ (g_do_nk -1: not read yet)
     p = img_retype(sh[5], &lay, p);
     {   // DM_VK_BIND_LOG=<hex key>[,…]: the binding records of those compute shaders' dispatches (the first 12 in all) (what each binding is bound to), to follow a pass's inputs and outputs
         const char *bl = getenv("DM_VK_BIND_LOG"); static _Atomic int nb; int hit = 0;
@@ -2514,32 +2735,60 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
                 VLOG("bindings of %016llx: binding %u elem %u what %u desc %u dim %#x flags %#x tid %d sid %d addr %#llx size %#llx %s", (unsigned long long)sh[5]->key, x->binding, x->elem, x->what, x->desc,
                      x->dim, x->flags, x->tid, x->sid, (unsigned long long)x->addr, (unsigned long long)x->size, why); }
     }
-    // A game's NDSR upscaler (agl's neural super resolution, used by Donkey Kong Bananza: the scene's colour to the upscaler's target, both B10G11R11): its tensor
-    // (HMMA) arithmetic has no Adreno equivalent and runs emulated, 10-27 ms of GPU time a frame on an Adreno 740, more the larger its output. DM_VK_NDSR (live) picks
-    // what runs instead: 0 = the game's network, 1 = a linear blit of its input onto its output, 2 = FSR 1 (the default; the linear blit where it cannot run),
-    // 3 = a nearest-neighbour blit. Anything that does not fit runs the network
-    { static int fmt_ok = -1, noted; int mode = VKA_ENV("DM_VK_NDSR", 2), on = mode > 0;
-      // Every variant of the network: the exact 2x one (14a8aaf3e0a9edbd) and the others the game picks at other ratios (9e5597e2fcfc3c2f at 1.833: 27 ms of the GPU at
-      // 1080p, a hitch at every step of the dynamic resolution, 2026-11-05), known by their shape: 128-wide workgroups in x, 8-12 KB of shared memory, flags 0x84
-      const dmsh_vk_entry *ce = sh[5]->e;
+    // A game's NDSR upscaler (agl's neural super resolution: the scene's colour to the upscaler's target): its tensor (HMMA) arithmetic has no Adreno equivalent and runs
+    // emulated, 5-7.6 ms of the GPU a frame on an Adreno 840 with Qualcomm's driver and 29-36 with Turnip v32 (Ocarina of Time), more the larger its output. DM_VK_NDSR
+    // (live; the launcher's Upscaler setting) picks what runs instead: 0 = the game's network, 1 = a linear stretch of its input onto its output, 2 = FSR 1,
+    // 3 = the nearest texel, 4 = Qualcomm's SGSR 1 (ndsr_sgsr, the default). Anything that does not fit runs the network.
+    // Live: a change (the in-game panel's Upscaler, a DM_CTL "env" line) takes the network's next dispatch, both ways. Nothing here is made for one mode only: the network's
+    // own pipeline is made above (vka_cs_pipeline) whatever the mode, so 0 runs it at once; FSR's and SGSR's pipelines are made at their first use (nf_pipe, ndsr_sgsr);
+    // fmt_ok is the device's answer for the formats, the same in every mode. Each change is logged once ("NDSR upscaler: DM_VK_NDSR=..."), and a network that a choice can
+    // replace is reported to the launcher (nxhost_ndsr_status), which shows the panel's Upscaler rows only then
+    { static int fmt_ok = -1, noted, last = -1; int mode = VKA_ENV("DM_VK_NDSR", 4), on = mode > 0;
+      // Every variant of Donkey Kong Bananza's network: the exact 2x one (14a8aaf3e0a9edbd) and the others the game picks at other ratios (9e5597e2fcfc3c2f at 1.833: 27 ms of
+      // the GPU at 1080p, a hitch at every step of the dynamic resolution, 2026-11-05), known by their shape: 128-wide workgroups in x, 8-12 KB of shared memory, flags 0x84
       // (seen: 14a8aaf3e0a9edbd 2x, 9e5597e2fcfc3c2f, a9fed0568668bf97, 7629d857a0a93833 at 67 %, 3b716012fcd10575 at 60 %: 9.6-10.9 KB of shared memory)
-      int ndsr = sh[5]->key == 0x14a8aaf3e0a9edbdull || sh[5]->key == 0x9e5597e2fcfc3c2full || sh[5]->key == 0x7629d857a0a93833ull || sh[5]->key == 0x3b716012fcd10575ull
-                 || (ce->local[0] == 128 && ce->local[1] == 1 && ce->local[2] == 1 && ce->shared >= 8000 && ce->shared <= 12000 && (ce->flags & 0x84) == 0x84);
-      if (on && ndsr) {
+      const dmsh_vk_entry *ce = sh[5]->e;
+      int known = sh[5]->key == 0x14a8aaf3e0a9edbdull || sh[5]->key == 0x9e5597e2fcfc3c2full || sh[5]->key == 0x7629d857a0a93833ull || sh[5]->key == 0x3b716012fcd10575ull
+                  || (ce->local[0] == 128 && ce->local[1] == 1 && ce->local[2] == 1 && ce->shared >= 8000 && ce->shared <= 12000 && (ce->flags & 0x84) == 0x84);
+      // Other games' networks (Ocarina of Time's agl_ndsr_vr_light: fa3033d05c0a41d6, 7c511cc23ff85d14, 5.6 and 5.0 KB of shared memory) by their interface (ndsr_iface), when
+      // their input says what it holds: B10G11R11, the colour (agl_ndsr.pck); E5B9G9R9, sqrt(colour) (agl_ndsr_vr_light: its pre-pass a335c1db6270c355 packs sqrt into
+      // RGB9E5, and its network writes the colour). Another input (Splatoon Raiders' encoded colour) or output format: the network runs. DM_VK_NDSR_INPUT (live) = linear | sqrt
+      // overrides what the input is taken to hold, for every network replaced
+      int net = known || ndsr_iface(sh[5]);
+      if (net && mode != last) {   // a change of choice: logged once, the blit's line again
+        static const char *const name[] = {"the game's network", "a bilinear stretch", "FSR 1", "the nearest texel", "SGSR 1"};
+        VLOG("NDSR upscaler: DM_VK_NDSR=%d (%s) from network %016llx's next dispatch on%s", mode, mode >= 0 && mode <= 4 ? name[mode] : "the game's network (unknown value)",
+             (unsigned long long)sh[5]->key, last < 0 ? "" : " (a live change)");
+        last = mode; noted = 0;
+      }
+      if (net) {
         int tin = 0, tout = 0;
         for (int i = 0; i < g_wk.n[5]; i++) { const vka_res *r = &g_wk.r[5][i];
           if (r->desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && r->tid) tin = r->tid; else if (r->desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && r->tid) tout = r->tid; }
         vka_img *a = tin ? vka_tex_id_img(tin, g_cb) : NULL, *b = tout ? vka_tex_id_img(tout, g_cb) : NULL;
-        if (a && b && fmt_ok < 0) {
+        // The textures' own formats, not their images': an image is shared by the textures of one memory and shape and made in the first one's format (Ocarina of Time's
+        // RGB9E5 input lives in a B10G11R11 image, so judged by the image it read as the colour: washed out, over-bright)
+        VkFormat fa = tin ? vka_tex_id_vkfmt(tin) : VK_FORMAT_UNDEFINED, fb = tout ? vka_tex_id_vkfmt(tout) : VK_FORMAT_UNDEFINED;
+        int sq = -1; char iv[16];
+        if (a) sq = fa == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || known ? 0 : fa == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ? 1 : -1;
+        if (vka_env_str("DM_VK_NDSR_INPUT", iv, sizeof iv) > 0 && iv[0]) sq = !strcmp(iv, "sqrt") ? 1 : !strcmp(iv, "linear") ? 0 : sq;
+        int fits = a && b && sq >= 0 && a->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && a->samples <= 1 && b->samples <= 1
+                   && (known || fb == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+        if (fits) atomic_store_explicit(&g_ndsr_fits, 1, memory_order_relaxed);
+        if (!on) goto ndsr_net;   // DM_VK_NDSR=0: the network itself
+        if (a && b && !fits) { static uint64_t seen[16]; int k = 0; for (; k < 16 && seen[k] && seen[k] != sh[5]->key; k++) {}
+          if (k < 16 && !seen[k]) { seen[k] = sh[5]->key; VLOG("NDSR network %016llx not replaced (DM_VK_NDSR): input format %d, output format %d: the network runs", (unsigned long long)sh[5]->key, fa, fb); } }
+        if (fits && a && b && fmt_ok < 0) {
           VkFormatProperties fa, fb; vk.vkGetPhysicalDeviceFormatProperties(V.pd, a->f.vk, &fa); vk.vkGetPhysicalDeviceFormatProperties(V.pd, b->f.vk, &fb);
           fmt_ok = (fa.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) && (fa.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)
                 && (fb.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT);
-          if (!fmt_ok) VRED("NDSR blit: format %d -> %d cannot be blitted with a linear filter on this device: the network runs (DM_VK_NDSR)", a->f.vk, b->f.vk);
+          if (!fmt_ok) VRED("NDSR blit: format %d -> %d cannot be blitted with a linear filter on this device: FSR or the network (DM_VK_NDSR)", a->f.vk, b->f.vk);
         }
-        if (a && b && mode == 2 && a->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && a->samples <= 1 && b->samples <= 1 && ndsr_fsr(tin, tout, a, b)) {
-            g_dispatches++; return; }
-        if (a && b && fmt_ok > 0 && (a->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (b->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-            && a->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && a->samples <= 1 && b->samples <= 1) {
+        if (fits && mode == 4 && (ndsr_sgsr(tin, tout, a, b, fb, sq) || ndsr_fsr(tin, tout, a, b, fb, sq, 0))) { g_dispatches++; return; }   // SGSR 1, else FSR 1
+        // FSR 1, or for sqrt(colour) every mode (a blit cannot square), as compute passes; then the blit; else the network
+        if (fits && (mode == 2 || sq) && ndsr_fsr(tin, tout, a, b, fb, sq, mode == 2 ? 0 : mode == 3 ? 2 : 1)) { g_dispatches++; return; }
+        if (fits && !sq && fmt_ok > 0 && a->f.vk == fa && b->f.vk == fb &&   // (a blit copies the images' own formats: only where they are the textures')
+             (a->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) && (b->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
           VkImageLayout la = VK_IMAGE_LAYOUT_GENERAL, lb = VK_IMAGE_LAYOUT_GENERAL;
           vka_tex_id_view_rec(tin, g_cb, 1, 0, &la); vka_tex_id_view_rec(tout, g_cb, 1, 1, &lb);   // dim 1: 2D   // the layouts the images are kept in
           vka_barrier(g_cb);
@@ -2554,6 +2803,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
           return;
         }
       } }
+  ndsr_net:
     if (!bind_sets(d, sh, &lay, VK_PIPELINE_BIND_POINT_COMPUTE, &c0)) { g_skipped++; return; }
     if (dp->ind && c0.buf) {   // the group counts the GPU wrote, into c0's dispatch words before the dispatch reads them (nvn_mtl.m g_c0_dim_buf); NVN2 reads them at c0 + 4 too
         vka_disp_settle(g_cb);   // (a copy: after the dispatches before it, as before; "Dispatch order")

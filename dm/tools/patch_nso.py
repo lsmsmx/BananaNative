@@ -200,6 +200,33 @@ UE_REGION, UE_REGION_REG, UE_REGION_X1, ue_region_why = ue_region.find(bytes(IMG
 if UE_REGION is not None: print(f'{NAME}: {ue_region_why}')
 elif ue_region_why.startswith('[RED] '): print(f'[RED] {NAME}: {ue_region_why[6:]}: the engine asks for its whole default region')
 
+# ---- sead's frame-rate controller (main: nso_code.sead_find finds its sdiv of 60 by the interval by the controller's own code, without a build ID) ----
+# For a profile that opts in (game.tsv fps_decouple sead, read with the build rows: pack_android.py build_rows keys them), observation gate OBS_SEAD_RATE goes on that sdiv
+# (below), its registers in the gate number's upper bits: the host makes the rate the measured one there (hle_fpslock.c sead_rate), so the game keeps its speed at any frame
+# rate. Another game's main is searched too and the site logged, its code left as it is: whether a game steps its world by that rate is checked per game. A build's own OBS
+# row for the gate (its patches.py) is taken instead of the search, after the same checks of the place
+from nso_code import OBS_SEAD_RATE, sead_check, sead_find, sead_param
+SEAD_RATE = SEAD_REGS = None
+if NAME == 'main':
+    def profile_rows(key):
+        prof = os.path.basename(os.environ.get('DM_GAME', '').rstrip('/'))
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../games', prof, 'game.tsv'), encoding='utf-8') as f:
+                return [c[1:] for c in ([x.strip() for x in r.split('\t')] for r in f.read().splitlines()) if c[0] == key] if prof else []
+        except OSError: return []
+    sead_on = ['sead'] in profile_rows('fps_decouple')
+    own = [(o, oid) for o, oid, _, _ in PATCHES['OBS'].get(BUILD_ID, []) if oid & 0xff == OBS_SEAD_RATE]
+    for o, oid in own:
+        regs, why = sead_check(bytes(IMG), TEXT_END, o)
+        assert sead_on, f'{NAME} {BUILD_ID}: an OBS row for sead\'s frame-rate controller at {o:#x}, but the profile has no fps_decouple sead'
+        assert regs and sead_param(regs) == oid >> 8, f'{NAME} {BUILD_ID}: the OBS row for sead\'s frame-rate controller at {o:#x}: {why or "its registers are not the site\'s"}'
+        print(f'{NAME}: sead\'s frame-rate controller: 60 / interval at {o:#x} (the build\'s OBS row)')
+    if not own:
+        off, regs, sead_why = sead_find(bytes(IMG), TEXT_END)
+        if sead_why.startswith('[RED] '): print(f'[RED] {NAME}: {sead_why[6:]}: the game\'s speed keeps following its present interval' if sead_on else f'{NAME}: {sead_why[6:]}')
+        elif off is not None and sead_on: SEAD_RATE, SEAD_REGS = off, regs; print(f'{NAME}: {sead_why}')
+        elif off is not None: print(f'{NAME}: sead rate site found at main+{off:#x}; not used: the profile has no fps_decouple sead')
+
 md = Cs(CS_ARCH_ARM64, CS_MODE_ARM); md.detail = True
 patch = bytearray(); fix = []; gates = []; stats = {}
 patch_front, patch_back, PATCH_BASE = patch, bytearray(), PATCH_OFF   # the area emit() writes into and its offset: the front one unless TWO puts a site in the back one
@@ -1386,6 +1413,11 @@ if UE_REGION is not None:
     if UE_REGION_X1 is not None:   # the request's size set again after the store (TRIANGLE STRATEGY): mov x1, xS, so it takes what the gate gave S
         assert UE_REGION_X1 not in kinds and not any(lo <= UE_REGION_X1 < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'engine region size conflicts with a rewrite site {UE_REGION_X1:#x}'
         struct.pack_into('<I', IMG, UE_REGION_X1, 0xAA0003E1 | UE_REGION_REG << 16)
+# sead's frame-rate controller (above): the gate on its sdiv, the dividend, the divisor and the controller's registers in the gate number's upper bits
+if SEAD_RATE is not None:
+    assert SEAD_RATE not in kinds and not any(lo <= SEAD_RATE < hi for wseg in windows for lo, hi in [(wseg[0].address, wseg[-1].address + 4)]), f'frame-rate controller gate conflicts with a rewrite site {SEAD_RATE:#x}'
+    region_obs.append((SEAD_RATE, OBS_SEAD_RATE | sead_param(SEAD_REGS) << 8, f'{struct.unpack_from("<I", IMG, SEAD_RATE)[0]:08x}',
+                       f'sead\'s frame-rate controller: 60 / interval (w{SEAD_REGS[0]} / w{SEAD_REGS[1]}, the controller in x{SEAD_REGS[2]}); the host makes it the measured rate (hle_fpslock.c sead_rate)'))
 for off, oid, ow, why in region_obs: use_area(off); put_branch(off, site_obs(off, oid, int(ow, 16))); stat('obs')
 obs += region_obs
 

@@ -45,6 +45,8 @@ FIELDS = {
     'give': r'give-back ' + NUM + ' ms',
     'lkr': r"lock waited for: replay " + NUM,
     'lko': r"lock waited for: replay [\d.]+, others " + NUM,
+    'new_n': r'new images (\d+), ',
+    'new_ms': r'new images \d+, ' + NUM + ' ms',
 }
 TEXT = {
     'gw_what': re.compile(r'guest waits [\d.]+ \(longest [\d.]+: ([^)]*)\)'),
@@ -78,6 +80,8 @@ def cause(r):
         return 'pipelines'
     if r.get('up_ms', 0) and share(r['up_ms']):
         return 'texture uploads'
+    if r.get('new_n', 0) and share(r.get('new_ms', 0)):
+        return 'new images (first texture uses)'
     if span is not None and share(span - gpu):
         return 'GPU waiting for the recording'
     if share(gpu) and span is None and r.get('pso', 0):

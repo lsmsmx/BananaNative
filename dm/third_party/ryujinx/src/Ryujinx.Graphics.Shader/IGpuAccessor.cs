@@ -49,6 +49,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: the vertices per output primitive of a Switch 2 mesh program (its control section's +0x5f; shader_split.py mesh_facts "mesh_topology"):
+        /// 3 triangles, 1 points (StructuredIr/MeshShaderInfo.cs).
+        /// </summary>
+        int QueryMeshShaderTopology()
+        {
+            return 3;
+        }
+
+        /// <summary>
         /// nxnative: the SpecId of a bool specialization constant under which a Switch 2 mesh program rewrites its positions' depth to the GL convention
         /// (z' = z / 2 + w / 2, near = -w, NVN's default) before it hands them over; -1 for none.
         /// </summary>

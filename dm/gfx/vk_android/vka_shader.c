@@ -177,6 +177,75 @@ int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
     return 1;
 }
 
+// ---------- Texture pool reads: every module made reports the pool IDs it reads (vka_spv_pool_fb; vka_tex.c "Texture pool reads") ----------
+// The hook sits over vkCreateShaderModule, so every module of the library and every variant made from it at pipeline time (vertex inputs, outputs, textures retyped,
+// instanced, geometry claim and link, folded constants) carries the code; the replay's own modules read no pool and pass unchanged. A pixel module given
+// EarlyFragmentTests (its stores would otherwise move its depth test after shading) gets a twin without them for the pipelines whose tests must stay late: alpha to
+// coverage, or the alpha test on when its discard is the module's only one (vka_shader_pfb_pick, vka_pso.c). A module the rewrite refuses is used as it is: its pool
+// reads report nothing (counted, logged)
+static PFN_vkCreateShaderModule g_csm_next; static PFN_vkDestroyShaderModule g_dsm_next;
+typedef struct { VkShaderModule early, late; int kind; } pfb_twin;
+static pfb_twin *g_tw; static size_t g_ntw, g_twcap; static pthread_mutex_t g_twmu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_pfb_mods, g_pfb_sites, g_pfb_early, g_pfb_blind;
+static VkResult VKAPI_CALL csm_pfb(VkDevice d, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *m) {
+    unsigned fl = vka_tex_pfb_flags();
+    if (!fl || !ci || !ci->pCode || ci->codeSize < 20) return g_csm_next(d, ci, a, m);
+    size_t on = 0; int sites = 0, kind = 0; char err[200] = "";
+    uint32_t *o = vka_spv_pool_fb(ci->pCode, ci->codeSize / 4, DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, VKA_POOL_FB_SET, VKA_POOL_FB_BINDING, fl, DMSH_VK_SPEC_ALPHA_FUNC, &on, &sites, &kind, err, sizeof err);
+    if (!o) {
+        if (err[0]) { uint64_t n = atomic_fetch_add(&g_pfb_blind, 1); if (n < 8) VRED("texture pool reads: a module's pool reads report nothing (%s): a texture it alone reads through the pool is not made", err); }
+        return g_csm_next(d, ci, a, m);
+    }
+    VkShaderModuleCreateInfo c2 = *ci; c2.codeSize = on * 4; c2.pCode = o;
+    VkResult r = g_csm_next(d, &c2, a, m);
+    free(o);
+    if (r) return r;
+    uint64_t nm = atomic_fetch_add(&g_pfb_mods, 1) + 1; atomic_fetch_add(&g_pfb_sites, (uint64_t)sites);
+    if (kind) {   // the twin without EarlyFragmentTests
+        atomic_fetch_add(&g_pfb_early, 1);
+        size_t ln = 0; int ls = 0, lk = 0; uint32_t *l = vka_spv_pool_fb(ci->pCode, ci->codeSize / 4, DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, VKA_POOL_FB_SET, VKA_POOL_FB_BINDING, fl & ~(unsigned)VKA_PFB_EARLY,
+                                                            DMSH_VK_SPEC_ALPHA_FUNC, &ln, &ls, &lk, err, sizeof err);
+        VkShaderModule lm = VK_NULL_HANDLE;
+        if (l) { c2.codeSize = ln * 4; c2.pCode = l; if (g_csm_next(d, &c2, a, &lm)) lm = VK_NULL_HANDLE; free(l); }
+        pthread_mutex_lock(&g_twmu);
+        if (lm && g_ntw == g_twcap) { size_t nc = g_twcap ? 2 * g_twcap : 256; pfb_twin *n = realloc(g_tw, nc * sizeof *n); if (n) { g_tw = n; g_twcap = nc; } }
+        if (lm && g_ntw < g_twcap) { g_tw[g_ntw++] = (pfb_twin){*m, lm, kind}; lm = VK_NULL_HANDLE; }
+        pthread_mutex_unlock(&g_twmu);
+        if (lm || !l) {   // no twin: the module without the mode serves every pipeline (late tests: correct, slower)
+            if (lm) g_dsm_next(d, lm, a);
+            g_dsm_next(d, *m, a); *m = VK_NULL_HANDLE;
+            uint32_t *w2 = vka_spv_pool_fb(ci->pCode, ci->codeSize / 4, DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, VKA_POOL_FB_SET, VKA_POOL_FB_BINDING, fl & ~(unsigned)VKA_PFB_EARLY, DMSH_VK_SPEC_ALPHA_FUNC, &ln, &ls, &lk, err, sizeof err);
+            if (!w2) return g_csm_next(d, ci, a, m);
+            c2.codeSize = ln * 4; c2.pCode = w2; r = g_csm_next(d, &c2, a, m); free(w2);
+        }
+    }
+    if (nm == 1 || !(nm & (nm - 1)))
+        VLOG("texture pool reads: %llu modules report the pool IDs they read (%llu reads given the code, %llu pixel modules with early depth tests and a twin without, %llu refused; DM_VK_POOL_FB=0 off)",
+             (unsigned long long)nm, (unsigned long long)atomic_load(&g_pfb_sites), (unsigned long long)atomic_load(&g_pfb_early), (unsigned long long)atomic_load(&g_pfb_blind));
+    return r;
+}
+static void VKAPI_CALL dsm_pfb(VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) {
+    VkShaderModule late = VK_NULL_HANDLE;
+    if (m) { pthread_mutex_lock(&g_twmu);
+             for (size_t i = 0; i < g_ntw; i++) if (g_tw[i].early == m) { late = g_tw[i].late; g_tw[i] = g_tw[--g_ntw]; break; }
+             pthread_mutex_unlock(&g_twmu); }
+    if (late) g_dsm_next(d, late, a);
+    g_dsm_next(d, m, a);
+}
+void vka_shader_pfb_hook(void) {
+    if (!vk.vkCreateShaderModule || vk.vkCreateShaderModule == csm_pfb || !vk.vkDestroyShaderModule) return;
+    g_csm_next = vk.vkCreateShaderModule; vk.vkCreateShaderModule = csm_pfb;
+    g_dsm_next = vk.vkDestroyShaderModule; vk.vkDestroyShaderModule = dsm_pfb;
+}
+VkShaderModule vka_shader_pfb_pick(VkShaderModule m, int a2c, int alpha_func) {
+    if (!m) return m;
+    VkShaderModule r = m;
+    pthread_mutex_lock(&g_twmu);
+    for (size_t i = 0; i < g_ntw; i++) if (g_tw[i].early == m) { if (a2c || (g_tw[i].kind == 2 && alpha_func)) r = g_tw[i].late; break; }
+    pthread_mutex_unlock(&g_twmu);
+    return r;
+}
+
 // ---------- Shaders by key ----------
 typedef struct { uint64_t key; vka_shader *sh; const vka_shlib *lib; } shent;
 static shent *g_sh; static size_t g_shcap, g_shn;

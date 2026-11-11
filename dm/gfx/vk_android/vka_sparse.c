@@ -272,6 +272,7 @@ void vks_queue_locked(uint32_t *nw, VkSemaphore *ws, uint64_t *wv, VkPipelineSta
                                        .imageBindCount = ni, .pImageBinds = ii, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_stl};
                 r = vk.vkQueueBindSparse(V.q, 1, &bi, VK_NULL_HANDLE);
             }
+            if (r == VK_ERROR_DEVICE_LOST) vka_device_lost("a sparse bind batch");   // (it takes neither lock)
             if (r) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 8) VRED("sparse bind batch of %u tile and %u tail binds: %s %d (kept for the next submission; what is uploaded into those tiles until then is lost until the game writes them again)",
                                                                                   g_npi, g_npo, g_sig == pre ? "vkQueueBindSparse" : "the submission before it", r); }
             else {

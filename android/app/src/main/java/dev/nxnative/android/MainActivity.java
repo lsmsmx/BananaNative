@@ -158,6 +158,15 @@ public final class MainActivity extends Activity {
                 .setNegativeButton("Cancel", null).show());
         touch.value(touchLabel(TouchControls.mode(this)));
         play.addView(touch.view);
+        play.addView(new Ui.Setting(this, "🔘", "Show / hide button", null).toggle(this, TouchControls.toggleButton(this), (b, on) -> TouchControls.toggleButton(this, on))
+                .value("The small button at the top centre that hides the on-screen controls").view);
+        // How a controller opens the in-game panel (PadPanel); the panel opens by touch with a swipe in from the right edge or Back
+        Ui.Setting padPanel = new Ui.Setting(this, "🎛️", "Controller: in-game panel", null).chevron(this);
+        padPanel.view.setOnClickListener(v -> new AlertDialog.Builder(this).setTitle("Open the in-game panel with a controller")
+                .setSingleChoiceItems(PadPanel.OPEN_NAMES, Prefs.panelPad(this), (d, w) -> { Prefs.panelPad(this, w); padPanel.value(padPanelLabel(w)); d.dismiss(); })
+                .setNegativeButton("Cancel", null).show());
+        padPanel.value(padPanelLabel(Prefs.panelPad(this)));
+        play.addView(padPanel.view);
         resRow = new Ui.Setting(this, "🖼️", "Resolution", v -> gameRes()).chevron(this);
         play.addView(resRow.view);
         if (!Profile.anyResolution()) resRow.view.setVisibility(View.GONE);   // no game of this APK has a window_fn or graphics_scale lever: the default would do nothing
@@ -1301,6 +1310,9 @@ public final class MainActivity extends Activity {
 
     void error(String msg) { new AlertDialog.Builder(this).setMessage(msg).setPositiveButton("OK", null).show(); }
 
+    private static String padPanelLabel(int v) {
+        return PadPanel.OPEN_NAMES[v] + ". By touch: swipe in from the right edge, or Back";
+    }
     private static String touchLabel(int m) { return m == TouchControls.MODE_AUTO ? "Auto: hidden while a controller is connected" : TouchControls.MODE_NAMES[m]; }
     /** A default's choice in Settings (no "Default" entry: this is the default) */
     private void pick(String title, String[] items, int cur, java.util.function.IntConsumer set) {

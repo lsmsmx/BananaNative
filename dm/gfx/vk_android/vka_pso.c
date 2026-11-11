@@ -116,8 +116,9 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
     VkResult r = vk.vkCreateDescriptorSetLayout(V.dev, &li, NULL, &L->set0);
     free(lb);
     if (!r) {
-        VkDescriptorSetLayout sets[2] = {L->set0, vka_bindless_layout()};
-        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = sets[1] ? 2 : 1, .pSetLayouts = sets};
+        // set 1 the pool (bindless tables), set 2 the pool reads' bitmap when they are reported (vka_tex.c "Texture pool reads")
+        VkDescriptorSetLayout sets[3] = {L->set0, vka_bindless_layout(), vka_pfb_layout()};
+        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = !sets[1] ? 1 : sets[2] ? 3 : 2, .pSetLayouts = sets};
         r = vk.vkCreatePipelineLayout(V.dev, &pi, NULL, &L->layout);
     }
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("pipeline layout of %u bindings (%u descriptors): %d", k.n, ndesc, r); L->layout = VK_NULL_HANDLE; }
@@ -390,6 +391,9 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
             if (t) mod = t;
             else VRED_ONCE("%016llx: a stage module with its textures retyped was not made: its integer texture views are read as floats", (unsigned long long)s->key);
         }
+        // A pixel module that reports its pool reads was given early depth tests where they give the late ones' result; alpha to coverage, or its alpha test on, takes the
+        // twin without them (vka_shader.c "Texture pool reads")
+        if (fs) mod = vka_shader_pfb_pick(mod, k->a2c, k->alpha_func);
         uint32_t n = P->ns++;
         P->ss[n] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = (VkShaderStageFlagBits)stage_bit(s->e->stage), .module = mod, .pName = "main",
                                                     .pSpecializationInfo = frz ? NULL : gl ? &P->spec : fs && P->afunc && (s->e->flags & DMSH_VK_F_ALPHA_TEST) ? &P->aspec : NULL};
@@ -670,8 +674,8 @@ static unsigned pre_probe(const VkGraphicsPipelineCreateInfo *ci0, const pstate 
     if (pinned) { VkResult r = try_lib(c, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, g_pc, 0); NOTE("no subgroup size pins", r); }
     if (npre > 1) { c = *ci0; c.stageCount = 1; c.pStages = pre; c.pTessellationState = NULL; VkResult r = try_lib(c, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, g_pc, 0); NOTE("first stage only", r); }
     {   // The pipeline layout with independent sets (diagnostic: a pipeline of such a layout binds only with it, not adopted)
-        VkDescriptorSetLayout sets[2] = {P->set0, vka_bindless_layout()}; VkPipelineLayout il = VK_NULL_HANDLE;
-        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = sets[1] ? 2 : 1, .pSetLayouts = sets};
+        VkDescriptorSetLayout sets[3] = {P->set0, vka_bindless_layout(), vka_pfb_layout()}; VkPipelineLayout il = VK_NULL_HANDLE;
+        VkPipelineLayoutCreateInfo pi = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = !sets[1] ? 1 : sets[2] ? 3 : 2, .pSetLayouts = sets};
         if (P->set0 && !vk.vkCreatePipelineLayout(V.dev, &pi, NULL, &il)) { c = *ci0; c.layout = il; VkResult r = try_lib(c, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, g_pc, 0); NOTE("independent-sets layout", r); vk.vkDestroyPipelineLayout(V.dev, il, NULL); }
     }
     VkResult r_comb = VK_ERROR_UNKNOWN;
@@ -767,6 +771,10 @@ static opt_job *g_opt_head, **g_opt_tail = &g_opt_head; static pthread_mutex_t g
 static uint64_t g_opt_waiting;
 static void *opt_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-psopt"); vka_fp_host("vk-psopt");
+    // Under the game's threads, as the prewarm and asynchronous threads: nothing waits for an optimized pipeline (its linked one draws meanwhile). Before 2026-11-10 it kept
+    // the priority of the thread that queued its first job: nice 10 when that was an asynchronous thread, but the replay thread's -8 without DM_VK_PSO_ASYNC (the default),
+    // so every optimized compile (60-130 ms each on Turnip) competed with the recording and the game's threads for a core
+    setpriority(PRIO_PROCESS, 0, 10);
     for (;;) {
         pause_point();
         pthread_mutex_lock(&g_opt_mu);

@@ -57,6 +57,12 @@ def check_tools():
 if __name__ == '__main__':
     a = sys.argv[1:]
     if a == ['--update-lock']:
+        # The lock names the translator the repository ships: a lock written from a build elsewhere (XLATE=<other folder>) without that build
+        # in dmsh_xlate_bin left every Mac and Windows packer stopping at "does not match the lock file" (#115, 2026-11-10)
+        ship = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dmsh_xlate_bin')
+        if os.path.realpath(XLATE_DIR) != os.path.realpath(ship):
+            sys.exit(f'[RED] the lock names the translator in {ship}, but XLATE points at {XLATE_DIR}: copy that build into dmsh_xlate_bin '
+                     '(and commit it with the lock), then run --update-lock without XLATE')
         t = tools_now()
         if t['xlate_source'].startswith(NO_RUN): sys.exit('[RED] ' + no_run_message(t['xlate_source']))
         if t['xlate_source'] != xlate_source_sha(): sys.exit(f'[RED] the translator was not built from the in-repo source (embedded {t["xlate_source"]} / in repo {xlate_source_sha()}): rebuild dmsh_xlate first')

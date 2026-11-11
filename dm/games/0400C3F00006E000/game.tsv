@@ -50,6 +50,13 @@ sys_resource	0x4000000
 shader_groups	/Shader/=shader /Effect/=effect /UI/=layout
 shader_note	Mario Kart World shaders
 
+# ---- Frame rate ----
+# The framework (procFrame, main+0x69cbb0 in 1.8.0) runs a whole number of fixed 1/60 s steps each frame (the count at +0x214, which every update loops) and presents at that many
+# vsyncs; its mode at +0x210 picks the count (0 = 1, or 2 when its own work overran; 1 = 1; 2 = 2, its 30 fps form for three or four players; other values keep the count).
+# The frame rate cap writes the mode (60: the game's own, 30: 2, 20: 3 with the count 3), so the race keeps full speed at 30 and 20 fps (hle_fpslock.c steps_tick; README, Frame rate cap).
+# The framework is at [[main+0x37c8410]+8] (the race's step loop at main+0x23fd36c reads it there)
+fps_steps	d00e4f399e411d0613aa8d26b1c02fef	0x37c8410	0x8	0x210	0x214
+
 # ---- Graphics ----
 # Large block-compressed textures from the game's files kept without their finest level on the Vulkan replay (Android; README, Memory): ported from plumber-racer-2 (MIT,
 # copyright seedds), where it made a race fit an iPhone 18 Pro. Textures the game copies from stay whole (its terrain arrays are filled by copies: the road went purple without it)
@@ -58,6 +65,8 @@ tex_soft	on
 render_cond	on
 # The 3D scenes' size follows the operation mode and the Switch 2 graphics scale, not the window (README, Render resolution): the Android launcher's Game resolution
 # sets these instead of DM_WINDOW_SIZE. <choice> <DM_GRAPHICS_SCALE> <operation mode>: handheld scale 0 crops 1920x1080, handheld scale 2 1280x720 (phone rH0 / rH2);
-# Original has no row: the game's own (console, scale 1: 2048x1152)
+# Original has no row: the game's own (console, scale 1: 2048x1152). Phone 1440p is that same console scale 1 (2048x1152, the largest size the game draws). A choice with no row
+# takes the largest row that fits in it, or the smallest (Phone 540p / 480p: 1280x720; Profile.resolutionEnv)
+graphics_scale	2560x1440	1	console
 graphics_scale	1920x1080	0	handheld
 graphics_scale	1280x720	2	handheld

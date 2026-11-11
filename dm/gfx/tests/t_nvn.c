@@ -360,6 +360,15 @@ int main(void) {
         P(nvnCommandBufferEndRecording)(&c2);
         memcpy(&rh, m, sizeof rh); d = draw_idx_rec(m + 8, rh.size, &dt);
         EXPECT("indirect draw keeps its address", 0x20000, d->ind);
+        // An indirect-count multi-draw: one record per draw, each naming the whole multi-draw (its size and stride: the Vulkan replay makes it at its first record with the
+        // count read by the GPU), in the same 0x38 bytes a record took before
+        P(nvnCommandBufferAddCommandMemory)(&c2, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&c2);
+        P(nvnCommandBufferMultiDrawElementsIndirectCount)(&c2, NVN_DRAW_PRIMITIVE_TRIANGLES, NVN_INDEX_TYPE_UNSIGNED_SHORT, 0x10000, 0x20000, 0x30000, 3, 32);
+        P(nvnCommandBufferEndRecording)(&c2);
+        EXPECT("multi-draw of 3: three 0x38-byte records + END", 3 * 0x38 + 8, P(nvnCommandBufferGetCommandMemoryUsed)(&c2));
+        { int ok = 1; for (int i = 0; i < 3; i++) { memcpy(&rh, m + i * 0x38, sizeof rh); d = draw_idx_rec(m + i * 0x38 + 8, rh.size, &dt);
+              ok &= rh.op == OP_DRAW_IDX && d->ind == 0x20000 + 32u * (unsigned)i && d->mdi_cnt == 0x30000 && d->mdi_i == i && d->mdi_n == 3 && d->mdi_stride == 32; }
+          EXPECT("multi-draw records: record i at 0x20000 + 32 i, count address, index, size 3, stride 32", 1, ok); }
         // A single texture bind keeps its handle 16 bytes into the command, where a game that patches recorded commands writes a new one (Luigi's Mansion 3: base + GetCommandMemoryUsed + 0x10)
         P(nvnCommandBufferAddCommandMemory)(&c2, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&c2);
         size_t at = P(nvnCommandBufferGetCommandMemoryUsed)(&c2);

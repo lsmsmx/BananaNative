@@ -1076,12 +1076,16 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 // depth-stencil state still does. The host does no ZCull, so there is nothing to set (Donkey Kong Bananza: EQUAL, 0xff)
 NVN_NOPROTO(nvnCommandBufferSetStencilCullCriteria, void, NVNcommandBuffer *c, int func, int ref) { (void)c; (void)func; (void)ref; }
 static _Atomic uint64_t g_sync_ns;
+// SyncWait's answers by kind, and QueueFinish calls, for diagnostics (vka_draw.c, DM_VK_DISP_OBJ): [0] already signaled, [1] satisfied after a wait, [2] timed out on a fenced
+// sync, [3] a sync never fenced (timed out at once), [4] QueueFinish
+_Atomic uint64_t nvn_sync_wait_n[5];
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
-    if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    if (!o->fenced) { atomic_fetch_add_explicit(&nvn_sync_wait_n[3], 1, memory_order_relaxed); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
-    if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    if (w(o->fence, 0)) { atomic_fetch_add_explicit(&nvn_sync_wait_n[0], 1, memory_order_relaxed); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
+    atomic_fetch_add_explicit(&nvn_sync_wait_n[ok ? 1 : 2], 1, memory_order_relaxed);
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -1130,7 +1134,7 @@ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *in
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
 NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; atomic_fetch_add_explicit(&nvn_sync_wait_n[4], 1, memory_order_relaxed); mtl_finish(); }
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -2107,6 +2111,7 @@ static int thermal_capped(void) {
     pthread_mutex_unlock(&mu);
     return result;
 }
+__attribute__((weak)) int dm_fps_limit_step(void) { return 0; }   // hle_fpslock.c; graphics unit tests have no host
 static int fps_step_cap(void) {
     if (!dm_fps_state) return 0;
     uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
@@ -2114,7 +2119,10 @@ static int fps_step_cap(void) {
     // Movies and a 30 fps target still need thermal samples: heat must reset the
     // calm interval, and cooling during those caps counts towards recovery.
     int thermal = thermal_capped();
-    return dm_movie_playing() || t <= 30 || thermal ? 30 : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
+    if (dm_movie_playing()) return 30;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
+    // The frame limit held by the frame step (hle_fpslock.c dm_fps_limit_step: 60, 30 or 20; the state page says 30 for 20, the rate the stubs know)
+    int c = t <= 30 || thermal ? 30 : 60, l = dm_fps_limit_step();
+    return l && l < c ? l : c;
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
 // Engine-native frame limiters have no frame-step state page. Their requested
@@ -2124,7 +2132,7 @@ static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides 
 // presented at a cap it does not step by runs fast or slow.
 // The cap can change while the game runs (hle_fpslock.c dm_fps_target_set: the Android launcher's in-game panel, DM_CTL "fps <n>"): it is read again when its generation moves.
 // Presentation holds whole vsyncs only (60, 30, 20, 15); 40 and 45 are left to an engine limiter that paces itself, and the game's interval stays.
-// An engine floor (sead's dynamic interval controller, hle_fpslock.c MIN_VSYNCS_I32) is not a fixed rate: dm_fps_lock_engine leaves it out and the game's own interval, at or above the floor, stays
+// An engine floor (sead's dynamic interval controller, hle_fpslock.c MIN_VSYNCS_I32) is not a fixed rate: dm_fps_lock_engine leaves it out and the game's own interval, at or above the floor, stays; so does a framework step count (STEPS_I32, a profile's fps_steps), whose interval the game sets to its steps a frame
 __attribute__((weak)) int dm_fps_target(void) { const char *e = getenv("DM_FPS_TARGET"); return e ? atoi(e) : DM_GAME_FPS_TARGET; }   // hle_fpslock.c; graphics unit tests have no host
 __attribute__((weak)) int dm_fps_target_gen(void) { return 0; }
 __attribute__((weak)) int dm_fps_lock_floor(void) { return 0; }
@@ -2136,7 +2144,7 @@ static int fps_present_cap(void) {
         int t = dm_fps_target(), first = g_present_cap < 0; g_present_gen = gen;
         g_present_cap = t > 0 && t <= 60 && 60 % t == 0 ? t : 0;
         if (g_present_cap && !dm_fps_lock_engine()) {
-            if (dm_fps_lock_floor()) LOG("[nvn] present cap %d fps: the game's frame-rate controller holds it (a floor the host writes), so presentation follows the interval the game sets", g_present_cap);
+            if (dm_fps_lock_floor()) LOG("[nvn] present cap %d fps: the game's frame-rate controller holds it (a floor or a step count the host writes, hle_fpslock.c), so presentation follows the interval the game sets", g_present_cap);
             else LOG("[nvn] present cap %d fps not applied: this main has neither a frame step nor an engine frame limit the host writes that fixes the rate, so the game's own present interval stays", g_present_cap);
             g_present_cap = 0;
         } else if (!first) LOG("[nvn] present cap now %d%s", g_present_cap, g_present_cap ? " fps" : " (the game's own interval)");
@@ -2983,15 +2991,18 @@ NVN(nvnCommandBufferDrawArraysInstanced, void, NVNcommandBuffer *c, NVNdrawPrimi
 // Indirect, as DrawArraysIndirect: the record at ind is read by the GPU (nvn_mtl.m draw)
 // Indirect-count multi-draws (Monster Hunter Rise's GPU-driven scene: compute culling writes the draw records and a u32 count, then up to max draws are made from them; 1–49 per call,
 // stride 20, the records and counts in its sparse virtual pool). Metal has no draw count read by the GPU, so each multi-draw becomes max ordinary indirect draws that carry the count's address
-// and their index; the replay masks their records on the GPU, zeros past the count (nvn_mtl.m mdx_run). Both used to be empty, and the whole scene stayed undrawn
+// and their index; the replay masks their records on the GPU, zeros past the count (nvn_mtl.m mdx_run). Both used to be empty, and the whole scene stayed undrawn. Each record also carries
+// the multi-draw's size and stride: the Vulkan replay makes the whole multi-draw at its first record with the count read by the GPU (vkCmdDraw*IndirectCount, vka_draw.c)
 enum { MDI_MAX = 1024 };
 NVN(nvnCommandBufferMultiDrawElementsIndirectCount, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress ind, NVNbufferAddress cnt, int max, ptrdiff_t stride) {
     if (max > MDI_MAX) { ONCE_LOG("[RED] indirect-count multi-draw of up to %d draws: only the first %d are made", max, MDI_MAX); max = MDI_MAX; }
-    for (int i = 0; i < max; i++) rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind + (uint64_t)i * (uint64_t)stride, cnt, i});
+    uint16_t st = stride > 0 && stride <= 0xFFFF ? (uint16_t)stride : 0;   // (each record names the whole multi-draw: the Vulkan replay makes it at its first record, the count read by the GPU)
+    for (int i = 0; i < max; i++) rec_draw_idx(c, (p_draw_idx){pr, it, 0, 0, 0, 1, ib, ind + (uint64_t)i * (uint64_t)stride, cnt, i, (uint16_t)max, st});
 }
 NVN(nvnCommandBufferMultiDrawArraysIndirectCount, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNbufferAddress ind, NVNbufferAddress cnt, int max, ptrdiff_t stride) {
     if (max > MDI_MAX) { ONCE_LOG("[RED] indirect-count multi-draw of up to %d draws: only the first %d are made", max, MDI_MAX); max = MDI_MAX; }
-    for (int i = 0; i < max; i++) rec_draw(c, (p_draw){pr, 0, 0, 1, 0, ind + (uint64_t)i * (uint64_t)stride, cnt, i});
+    uint16_t st = stride > 0 && stride <= 0xFFFF ? (uint16_t)stride : 0;
+    for (int i = 0; i < max; i++) rec_draw(c, (p_draw){pr, 0, 0, 1, 0, ind + (uint64_t)i * (uint64_t)stride, cnt, i, (uint16_t)max, st});
 }
 // Whether the host can read n bytes at a guest address: outside a sparse virtual pool always; inside one only where pages are mapped (nvn_mtl.m reads multi-draw counts there)
 int nvn_host_readable(uint64_t a, uint64_t n) {

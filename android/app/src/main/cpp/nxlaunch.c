@@ -63,6 +63,8 @@ void nxhost_env_changed(void);
 #pragma weak nxhost_rumble_route
 #pragma weak nxhost_fps_limit_set
 void nxhost_fps_limit_set(int fps);   // hle_fpslock.c: the frame limiter, live from the in-game panel
+#pragma weak nxhost_fps_decouple_set
+void nxhost_fps_decouple_set(int on);   // hle_fpslock.c: sead's controller at the measured rate, live from the in-game panel
 #pragma weak nxhost_text_input_callback
 
 // ---- Log: the host's stdout and stderr go straight into the log file (nothing is lost when the process dies), and a thread copies new lines to logcat ----
@@ -364,7 +366,7 @@ JNIEXPORT jstring JNICALL Java_dev_nxnative_android_Native_frameGenStatus(JNIEnv
     return (*env)->NewStringUTF(env, out);
 }
 
-// The frame rate cap (nxhost_fps_cap_set / _status): "<cap> <rates> <game fps>" (input_android.h), "-1 0 0" when this host has no cap
+// The frame rate cap (nxhost_fps_cap_set / _status): "<cap> <rates> <game fps> <limit held>" (input_android.h), "-1 0 0" when this host has no cap
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_fpsCapSet(JNIEnv *env, jclass cls, jint fps) { (void)env; (void)cls; if (nxhost_fps_cap_set) nxhost_fps_cap_set(fps); }
 JNIEXPORT jstring JNICALL Java_dev_nxnative_android_Native_fpsCapStatus(JNIEnv *env, jclass cls) {
     (void)cls; char buf[64] = "-1 0 0";
@@ -490,7 +492,21 @@ JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_pinThreads(JNIEnv *env, 
     return placed;
 }
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_fpsLimitSet(JNIEnv *env, jclass cls, jint fps) { (void)env; (void)cls; if (nxhost_fps_limit_set) nxhost_fps_limit_set(fps); }
+// Full game speed at low frame rates, live from the in-game panel (Native.decoupleSet)
+JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_decoupleSet(JNIEnv *env, jclass cls, jboolean on) { (void)env; (void)cls; if (nxhost_fps_decouple_set) nxhost_fps_decouple_set(on ? 1 : 0); }
+// Game resolution of a game that sizes its scenes by the graphics scale, live from the in-game panel (Native.graphicsModeSet): the host changes the scale and operation mode
+// and posts the console's notifications (300, 30 / 31), which the game answers by querying them again
+#pragma weak nxhost_graphics_mode_set
+void nxhost_graphics_mode_set(int scale, int opmode);   // hle_oe.c: -1 = the game's own
+JNIEXPORT jboolean JNICALL Java_dev_nxnative_android_Native_graphicsModeSet(JNIEnv *env, jclass cls, jint scale, jint opmode) {
+    (void)env; (void)cls; if (!nxhost_graphics_mode_set) return JNI_FALSE;
+    nxhost_graphics_mode_set(scale, opmode); return JNI_TRUE;
+}
 // Dynamic resolution, live from the in-game panel (Native.drsSet)
 #pragma weak nxhost_drs_set
 void nxhost_drs_set(int min_pct, int max_pct);   // probe.c: Donkey Kong Bananza's dynamic resolution range, % of the window (0 = the game's own)
 JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_drsSet(JNIEnv *env, jclass cls, jint lo, jint hi) { (void)env; (void)cls; if (nxhost_drs_set) nxhost_drs_set(lo, hi); }
+// The in-game panel's Upscaler rows (SidePanel, GameUpscaler.shown): whether the running game dispatched a network DM_VK_NDSR can replace; -1 when this host cannot say
+#pragma weak nxhost_ndsr_status
+int nxhost_ndsr_status(void);   // vka_draw.c
+JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_ndsrStatus(JNIEnv *env, jclass cls) { (void)env; (void)cls; return nxhost_ndsr_status ? nxhost_ndsr_status() : -1; }

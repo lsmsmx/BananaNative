@@ -13,12 +13,14 @@ int dm_opmode(void) {
     return m;
 }
 // ---------- System notification queue (AppletMessage): front end state changes → fetched by the game every frame with TryPopNotificationMessage ----------
-// Message numbers the host sends: 15 focus change, 30 operation mode change, 31 performance mode change
-enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
+// Message numbers the host sends: 15 focus change, 30 operation mode change, 31 performance mode change, 300 graphics scale change (Switch 2 SDKs: the games' notification
+// handlers take 300 to oe::GetCurrentGraphicsScale, as 30 to GetOperationMode and 31 to GetPerformanceMode: Mario Kart World 1.8.0 main+0x29957b8, Ocarina of Time
+// main+0x3bc038c, Splatoon Raiders main+0x3e91528)
+enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31, MSG_GFXSCALE = 300 };
 #define MQ 32
 static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_mq_cond = PTHREAD_COND_INITIALIZER;   // cond: wakes the blocking PopNotificationMessage
 static uint32_t g_mq[MQ]; static int g_mqh, g_mqn;
-static _Atomic int g_ntf_opmode, g_ntf_perfmode;          // only pushed after the game turns it on with Set*NotificationEnabled
+static _Atomic int g_ntf_opmode, g_ntf_perfmode, g_ntf_gfxscale;          // only pushed after the game turns it on with Set*NotificationEnabled
 // Notification event (Hades main+0x3ed18c polls it every frame and pops one message each time it fires): the SDK's version returns the event oe::Initialize would have
 // created, and the host's oe::Initialize is a no-op, so TryWaitSystemEvent asserted on it. A host-owned auto-clear SystemEvent instead, which follows the queue as the am service's
 // does: signalled while a notification is queued, cleared when the last one is popped. Monster Hunter Rise's MessageSuperviseThread (main+0x6bc8fc4) waits on it with WaitAny,
@@ -37,11 +39,11 @@ static void mq_push_(uint32_t m);
 static void mq_push(uint32_t m) { mq_push_(m); mq_ev_sync(); }
 static void mq_push_(uint32_t m) {
     pthread_mutex_lock(&g_mq_lock);
-    // 15/30/31 are invalidation notifications meaning "query the current state", not events carrying historical values.
+    // 15/30/31/300 are invalidation notifications meaning "query the current state", not events carrying historical values.
     // While one of the same type has not been taken yet, the first queue position is kept: a consumer loop only reads the latest state, repeated notifications write back the same thing, and with the same size there is no further resize.
-    // Only these three state notifications are merged; future per-occurrence events (such as Resume/Exit) must not use this rule.
-    // Legitimate producers only send these three, so at most three items are pending, and any number of focus losses/restores no longer hits the 32-slot limit; after a pop, new changes are enqueued as usual.
-    if (m == MSG_FOCUS || m == MSG_OPMODE || m == MSG_PERFMODE)
+    // Only these four state notifications are merged; future per-occurrence events (such as Resume/Exit) must not use this rule.
+    // Legitimate producers only send these four, so at most four items are pending, and any number of focus losses/restores no longer hits the 32-slot limit; after a pop, new changes are enqueued as usual.
+    if (m == MSG_FOCUS || m == MSG_OPMODE || m == MSG_PERFMODE || m == MSG_GFXSCALE)
         for (int i = 0; i < g_mqn; i++)
             if (g_mq[(g_mqh + i) % MQ] == m) { pthread_mutex_unlock(&g_mq_lock); return; }
     if (g_mqn == MQ) die("oe notification queue overflow (is the game not popping?)");
@@ -49,13 +51,9 @@ static void mq_push_(uint32_t m) {
     pthread_cond_broadcast(&g_mq_cond);
     pthread_mutex_unlock(&g_mq_lock);
 }
-void dm_set_opmode(int m) {   // called by the front end (overheat downgrade etc.): change the state and push 30 / 31 according to the switches the game has turned on
-    int old = dm_opmode(); if (old == m) return;
-    g_opmode = m;
-    LOG("oe operation mode %d → %d", old, m);
-    if (g_ntf_opmode) mq_push(MSG_OPMODE);
-    if (g_ntf_perfmode) mq_push(MSG_PERFMODE);
-}
+static void oe_state_set(int m, int scale);   // with the graphics scale, below
+// Called by the front end (overheat downgrade etc.): change the state and push 30 / 31 (and 300 when the scale follows the mode) according to the switches the game has turned on
+void dm_set_opmode(int m) { oe_state_set(m, -2); }
 // FocusState: 1 InFocus, 2 OutOfFocus, 3 Background. The front end calls dm_focus_set (iOS lifecycle / Mac window losing focus)
 static _Atomic int g_focus = 1; static _Atomic uint64_t g_focus_in_ns;   // the front end's state; time of its most recent entry into InFocus
 // Focus handling mode the game set (-1: none). The SDK's oe::SetFocusHandlingMode (SDK 18 sdk+0x3c5770) turns it into am's SetFocusHandlingMode(notify, ?, suspend) and
@@ -156,21 +154,52 @@ HLE_FORCE("_ZN2nn2oe22SetCpuOverclockEnabledEb", "CPU overclock switch (through 
 // Mario Kart World sizes its 3D scenes by it (its display state takes it at main+0x8728f4 in 1.8.0): handheld scale 0 draws 1920x1080, console scale 1 2048x1152 of its 3840x2160
 // window, scale 2 smaller still, and its final composite stretches the scene to the window. DM_GRAPHICS_SCALE=0, 1 or 2 answers that scale in every mode (the launcher's lower
 // resolution on a phone GPU); GetGraphicsScalingParameters answers the matching 10 / 20 / 30, so the SDK's two queries agree
-static int g_gfx_scale = -1;   // -1 not read yet, 0-2 DM_GRAPHICS_SCALE, 3 following the operation mode
-static int gfx_scale(void) {
+// The setting is runtime state like the operation mode: the launcher's in-game panel changes it while the game runs (nxhost_graphics_mode_set, below)
+static _Atomic int g_gfx_scale = -1;   // -1 not read yet, 0-2 DM_GRAPHICS_SCALE (or the panel's), 3 following the operation mode
+static int gfx_setting(void) {
     int v = g_gfx_scale;
     if (v < 0) {
         const char *e = getenv("DM_GRAPHICS_SCALE");
         if (e && *e >= '0' && *e <= '2' && !e[1]) { v = *e - '0'; LOG("oe: graphics scale %d in every operation mode (DM_GRAPHICS_SCALE)", v); }
         else { if (e && *e) LOG("[RED] DM_GRAPHICS_SCALE=%s: must be 0, 1 or 2; the scale follows the operation mode", e); v = 3; }
-        g_gfx_scale = v;
+        int exp = -1; atomic_compare_exchange_strong(&g_gfx_scale, &exp, v); v = g_gfx_scale;
     }
-    return v < 3 ? v : opmode() == 1;
+    return v;
 }
-HLE_FORCE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", "graphics scale (Switch 2, through am): 0 handheld, 1 console (DM_GRAPHICS_SCALE: 0-2 in every mode)", int, h_oe_GfxScale, void) { return gfx_scale(); }
+static int gfx_scale_of(int setting, int mode) { return setting < 3 ? setting : mode == 1; }
+static int gfx_scale(void) { return gfx_scale_of(gfx_setting(), opmode()); }
+HLE_FORCE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", "graphics scale (Switch 2, through am): 0 handheld, 1 console (DM_GRAPHICS_SCALE or the in-game panel: 0-2 in every mode)", int, h_oe_GfxScale, void) { return gfx_scale(); }
 HLE_FORCE("_ZN2nn2oe28GetGraphicsScalingParametersEv", "graphics scaling parameters (Switch 2, through am): 10 / 20 / 30 for graphics scale 0 / 1 / 2", unsigned, h_oe_GfxScaleParams, void) { return 10u * (gfx_scale() + 1); }
-HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics scale change notification (Switch 2, through am); the scale changes only with the operation mode",
-          void, h_oe_GfxScaleNotify, unsigned on) { (void)on; }
+HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics scale change notification switch (Switch 2, through am): message 300",
+          void, h_oe_GfxScaleNotify, unsigned on) { g_ntf_gfxscale = on & 0xff; }
+// Default display resolution change events the game asked for (GetDefaultDisplayResolutionChangeEvent): signalled when an operation mode change changes the resolution
+#define DEFRES_EV 4
+static void *g_defres_ev[DEFRES_EV]; static _Atomic int g_defres_n;
+// Operation mode and graphics scale changes, as the console makes them (docking, the system's graphics settings): the whole new state first, then one notification per query
+// whose answer changed (30 and 31 for the mode, 300 for the scale), each only when the game turned it on, so a game that re-queries on the first one already sees all of it.
+// m -1 keeps the mode; scale -2 keeps the setting, 3 follows the mode, 0-2 holds that scale in every mode
+static pthread_mutex_t g_state_lock = PTHREAD_MUTEX_INITIALIZER;   // two producers (the panel, an overheat downgrade) do not interleave their read and store
+static void oe_state_set(int m, int scale) {
+    pthread_mutex_lock(&g_state_lock);
+    int om = opmode(), os = gfx_setting(), nm = m < 0 ? om : m, ns = scale == -2 ? os : scale < 0 || scale > 2 ? 3 : scale;
+    int scale_changed = gfx_scale_of(ns, nm) != gfx_scale_of(os, om);
+    g_opmode = nm; g_gfx_scale = ns;
+    pthread_mutex_unlock(&g_state_lock);
+    if (nm != om) LOG("oe operation mode %d → %d", om, nm);
+    if (ns != os) LOG("oe: graphics scale setting %d → %d (3: following the operation mode), the game's scale %d", os, ns, gfx_scale_of(ns, nm));
+    if (nm != om) {
+        if (g_ntf_opmode) mq_push(MSG_OPMODE);
+        if (g_ntf_perfmode && !DM_GAME_PERF_BOOST) mq_push(MSG_PERFMODE);   // the performance mode follows the operation mode (profile perf_mode boost: always Boost, it does not change)
+        int n = atomic_load(&g_defres_n); for (int i = 0; i < n; i++) hle_signal_system_event(g_defres_ev[i]);
+    }
+    if (scale_changed && g_ntf_gfxscale) mq_push(MSG_GFXSCALE);
+}
+// The launcher's in-game panel (Game resolution while the game runs, Native.graphicsModeSet): the graphics scale and operation mode of the choice's graphics_scale row
+// (Profile.resolutionLive). scale -1 follows the mode and m -1 is the profile's op_mode: both -1 is what a start without the lines gives (Original without a row)
+__attribute__((visibility("default"))) void nxhost_graphics_mode_set(int scale, int m) {
+    LOG("main: Game resolution from the launcher's in-game panel: graphics scale %d, operation mode %d (-1: the game's own)", scale, m);
+    oe_state_set(m < 0 ? DM_GAME_OPMODE : m, scale < 0 ? 3 : scale);
+}
 // The frame length the game aims at (Switch 2 SDKs): oe::SetGraphicsTargetFrameRate maps up to 59 fps to mode 1, up to 119 to mode 2 and above to mode 3, SetGraphicsTargetFrameRateAuto
 // to mode 0, and both call this, which locks the gs graphics server's context and sends it the mode. The host has no graphics server (nv::InitializeGraphics), so the context is null and
 // the lock crashed: Hyrule Warriors: Age of Imprisonment sets 60 / its present interval at boot (main+0x1e5d244). The host paces by the window's present interval, so the mode is only noted
@@ -181,8 +210,14 @@ HLE_FORCE("_ZN2nn2gs3sdk26SetGraphicsFrameLengthModeENS1_23GraphicsFrameLengthMo
 HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
     int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
 }
-HLE_FORCE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", "default display resolution change event: bound, never signaled (the operation mode notification carries the change)",
-          void, h_oe_DefResEv, void *ev) { hle_bind_system_event(ev, 0); }
+HLE_FORCE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", "default display resolution change event: signalled when the operation mode changes",
+          void, h_oe_DefResEv, void *ev) {
+    hle_bind_system_event(ev, 0);
+    int n = atomic_load(&g_defres_n);
+    for (int i = 0; i < n; i++) if (g_defres_ev[i] == ev) return;
+    if (n < DEFRES_EV) { g_defres_ev[n] = ev; atomic_store(&g_defres_n, n + 1); }
+    else LOG("[RED] oe: more than %d default display resolution change events; the later ones are not signalled", DEFRES_EV);
+}
 HLE_FORCE("_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_", "server maintenance overlay (through am); the host has no system overlay", void, h_oe_MaintOverlay, int64_t a, int64_t b) { (void)a; (void)b; }
 // apm performance configurations: Normal 0x00010000 (CPU 1020 / GPU 384 / EMC 1600 MHz, the handheld default), Boost 0x00010001 (GPU 768 MHz, the docked default)
 HLE_FORCE("_ZN2nn2oe27GetPerformanceConfigurationENS0_15PerformanceModeE", "query the CPU/GPU clock config (through apm); reports the default for the mode", int, h_oe_GetPerfCfg, int mode) { return mode == 1 ? 0x00010001 : 0x00010000; }
@@ -199,7 +234,8 @@ HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "set
     LOG("oe::SetPerformanceConfiguration mode=%d cfg=%#x (ignored)", mode, cfg);
 }
 
-// Scripted state changes (verify lifecycle / overheat downgrade without a window): DM_OE_SCRIPT="focus=3@10,focus=1@20,opmode=0@30" (second N); bg=1 / bg=0 run the whole background round trip (see script_bg)
+// Scripted state changes (verify lifecycle / overheat downgrade / a graphics scale change without a window): DM_OE_SCRIPT="focus=3@10,focus=1@20,opmode=0@30,gscale=2@40" (second N;
+// gscale=-1 follows the operation mode again); bg=1 / bg=0 run the whole background round trip (see script_bg)
 // Time counts from the game's first notification fetch. Coexists with front end calls.
 #include <unistd.h>
 // bg=1 / bg=0: the whole "to background / back to foreground" sequence, in the same order as the scene lifecycle in front_ios.m (resign active -> enter background; enter foreground -> become active), minus the audio session reset iOS does on returning.
@@ -217,8 +253,9 @@ static void *oe_script(void *arg) {
         if (due > now) usleep((useconds_t)((due - now) / 1000));
         if (!strcmp(key, "focus")) dm_focus_set(v);
         else if (!strcmp(key, "opmode")) dm_set_opmode(v);
+        else if (!strcmp(key, "gscale")) oe_state_set(-1, v < 0 ? 3 : v);   // 0-2, or -1: follow the operation mode again
         else if (!strcmp(key, "bg")) script_bg(v);
-        else die("DM_OE_SCRIPT unknown key '%s' (focus / opmode / bg)", key);
+        else die("DM_OE_SCRIPT unknown key '%s' (focus / opmode / gscale / bg)", key);
     }
     return NULL;
 }

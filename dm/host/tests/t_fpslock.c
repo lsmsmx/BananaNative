@@ -1,4 +1,7 @@
 // Exercise production build gates and frame-limit writes against sparse synthetic module memory; Unreal's rows come from the console variables the rewriter names in main's fixups.
+// A framework step count row of the tests' own (hle_fpslock.c fps_steps rows; the profile's are DM_GAME_FPS_STEPS): the framework at [[main+0x100000]+8], mode +0x210, count +0x214
+#define DM_FPS_STEPS_ROWS {{"5eb5eb5eb5eb5eb5eb5eb5eb5eb5eb5e", 0x100000, 0x210, 0x214, 1, {0x8}}}
+#define DM_FPS_NSTEPS_ROWS 1
 #include "../hle_fpslock.c"
 #include <assert.h>
 #include <math.h>
@@ -11,6 +14,9 @@ module_t *g_mod = test_modules;
 int g_nmod;
 static int writes;
 void dm_guest_write_prepare(void *p, size_t n) { (void)p; assert(n == 4 || n == 8); writes++; }
+static void (*g_sead_gate)(uint64_t *, int);
+void gate_obs_set(int id, void (*fn)(uint64_t *, int)) { if (id == OBS_SEAD_RATE) g_sead_gate = fn; }
+int gate_obs_present(int id) { (void)id; return 0; }
 
 // adrp / add of a module offset into register r, at word i of the text (module offsets: the text at 0)
 static void cvar(const char *name, uint64_t off) { strcpy(g_mod[0].ue_cvar[g_mod[0].n_ue_cvar].name, name); g_mod[0].ue_cvar[g_mod[0].n_ue_cvar++].off = off; }
@@ -154,12 +160,107 @@ static void check(int which) {
     munmap(base, len);
 }
 
+// sead's frame-rate controller gate (sead_rate): the rate the sdiv yields is the measured one, the steps add up to the time that passed, 10..60
+static struct timespec at(double s) { struct timespec t = { (time_t)s, (long)((s - (time_t)s) * 1e9) }; return t; }
+static double run(double fps, int frames, int *lo, int *hi) {   // frames at a steady fps through the gate (dividend w8, divisor w21, controller x20): game seconds stepped
+    uint64_t r[30] = {0}; double game = 0, t = 1000; *lo = 1000; *hi = 0;
+    memset(&g_sr, 0, sizeof g_sr);
+    for (int i = 0; i <= frames; i++, t += 1.0 / fps) {
+        r[8] = 60; r[21] = i % 3 + 1; r[20] = 0x1234000;   // the controller's own 60 and an interval of 1 to 3
+        atomic_fetch_add(&g_presents, 1);
+        sead_rate_at(r, 8 | 21 << 5 | 20 << 10, at(t));
+        int32_t q = (int32_t)r[8] / (int32_t)r[21];   // the sdiv
+        if (!i) { assert(q == 60 / (int)r[21]); continue; }   // the first frame keeps the game's own
+        assert(q * (int32_t)r[21] == (int32_t)r[8] && g_sr.ctl == 0x1234000);
+        game += 1.0 / q; if (q < *lo) *lo = q; if (q > *hi) *hi = q;
+    }
+    return game;
+}
+static void sead_rate_check(void) {
+    int lo, hi;
+    for (double fps = 10; fps <= 60; fps += 0.7) {   // 10 to 60 at awkward rates: the game's time follows real time within one frame's step
+        double game = run(fps, 600, &lo, &hi), wall = 600 / fps;
+        assert(fabs(game - wall) < 1.0 / 60 + 1e-9 && lo >= 10 && hi <= 60 && hi - lo <= 1);
+    }
+    double g = run(20, 400, &lo, &hi); assert(lo == 20 && hi == 20 && fabs(g - 20) < 1e-6);   // a 20 fps limit: 20 every frame
+    g = run(30, 300, &lo, &hi); assert(lo == 30 && hi == 30);
+    g = run(5, 50, &lo, &hi); assert(lo == 10 && hi == 10 && fabs(g - 5) < 1e-6);   // below the floor: 10, the game at half speed (as on the Switch), no catching up
+    g = run(120, 240, &lo, &hi); assert(lo == 60 && hi == 60);   // above the cap: 60
+    uint64_t r[30] = {0}; r[8] = 60; r[21] = 0; memset(&g_sr, 0, sizeof g_sr);   // no interval (0): the game's own division, untouched
+    sead_rate_at(r, 8 | 21 << 5 | 20 << 10, at(1)); atomic_fetch_add(&g_presents, 1); sead_rate_at(r, 8 | 21 << 5 | 20 << 10, at(1.05)); assert(r[8] == 60);
+    r[21] = 1; atomic_fetch_add(&g_presents, 2); sead_rate_at(r, 8 | 21 << 5 | 20 << 10, at(1.15)); assert(r[8] == 20);   // two presents in 0.1 s since the last call: 20 fps, not 10
+    assert(g_sead_gate == sead_rate);   // the callback the gate number reaches
+    // On and off: DM_FPS_DECOUPLE=0 at start, then the in-game panel live (nxhost_fps_decouple_set); off leaves the dividend at 60
+    const int P = 8 | 21 << 5 | 20 << 10;
+    setenv("DM_FPS_DECOUPLE", "0", 1); assert(!sead_rate_on()); memset(&g_sr, 0, sizeof g_sr);
+    r[20] = 0x1234000; r[8] = 60; r[21] = 2; atomic_fetch_add(&g_presents, 1); sead_rate_gate(r, P, at(2)); atomic_fetch_add(&g_presents, 1); sead_rate_gate(r, P, at(2.05)); assert(r[8] == 60);
+    nxhost_fps_decouple_set(1); assert(sead_rate_on());
+    atomic_fetch_add(&g_presents, 1); sead_rate_gate(r, P, at(2.10)); assert(r[8] == 60);   // the first frame on: a fresh measurement, the game's own
+    atomic_fetch_add(&g_presents, 1); sead_rate_gate(r, P, at(2.15)); assert(r[8] == 40);   // 20 fps at interval 2: 40 / 2
+    nxhost_fps_decouple_set(0); r[8] = 60; atomic_fetch_add(&g_presents, 1); sead_rate_gate(r, P, at(2.20)); assert(r[8] == 60 && !g_sr.last.tv_sec);
+    unsetenv("DM_FPS_DECOUPLE");
+}
+
+// The frame limit on a main with a frame step (Ocarina of Time's profile: fps_target 60, fps_limit 30): the limit becomes the step's cap in whole vsyncs (dm_fps_step_fold)
+static float step_page(const uint8_t *page) { float f; memcpy(&f, page, sizeof f); return f; }
+static void step_check(void) {
+    static uint8_t page[0x40]; dm_fps_state = page;
+    setenv("DM_FPS_TARGET", "60", 1); setenv("DM_FPS_LIMIT", "30", 1);
+    dm_fps_step_fold();
+    assert(step_page(page) == 30 && dm_fps_limit_step() == 30 && nxhost_fps_limit_get() == 30);   // 2 vsyncs a frame; the limiter does not wait as well
+    nxhost_fps_limit_set(45); assert(step_page(page) == 30 && dm_fps_limit_step() == 30 && nxhost_fps_limit_get() == 30);   // between whole-vsync rates: the one below
+    nxhost_fps_limit_set(40); assert(step_page(page) == 30 && dm_fps_limit_step() == 30);
+    nxhost_fps_limit_set(20); assert(step_page(page) == 30 && dm_fps_limit_step() == 20 && nxhost_fps_limit_get() == 20);   // the stubs see 30; the host holds 3 vsyncs
+    nxhost_fps_limit_set(15); assert(step_page(page) == 60 && dm_fps_limit_step() == 0 && nxhost_fps_limit_get() == 15);   // below 20: the limiter waits, the step keeps the cap
+    nxhost_fps_limit_set(0); assert(step_page(page) == 60 && dm_fps_limit_step() == 0 && nxhost_fps_limit_get() == 0);   // no limit: the cap
+    dm_fps_target_set(30, "test"); assert(step_page(page) == 30);
+    dm_fps_target_set(0, "test"); assert(step_page(page) == 0);   // the game's own logic
+    nxhost_fps_limit_set(30); assert(step_page(page) == 30 && dm_fps_limit_step() == 30);   // the limit alone drives the step
+    nxhost_fps_limit_set(60); assert(step_page(page) == 60 && dm_fps_limit_step() == 60);
+    dm_fps_state = NULL; nxhost_fps_limit_set(30); assert(dm_fps_limit_step() == 0 && nxhost_fps_limit_get() == 30);   // no frame step: the limiter alone
+}
+
+// A framework's fixed steps per frame (steps_tick): the cap is the steps a frame through its mode, the game's own mode comes back, the frame limit folds in, presentation follows the game
+static void steps_check(int which) {
+    size_t len = 0x200000; uint8_t *base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); assert(base != MAP_FAILED);
+    g_nmod = 1; strcpy(g_mod[0].name, "main"); g_mod[0].base = base; strcpy(g_mod[0].build_id, which == 2 ? "5eb5eb5eb5eb5eb5eb5eb5eb5eb5eb5f" : "5eb5eb5eb5eb5eb5eb5eb5eb5eb5eb5e");
+    static uint8_t holder[0x10], fw[0x300]; int32_t *mode = (int32_t *)(fw + 0x210), *count = (int32_t *)(fw + 0x214);
+    unsetenv("DM_FPS_LIMIT"); setenv("DM_FPS_TARGET", which == 1 ? "15" : "30", 1); writes = 0;
+    if (which == 2) { dm_fps_lock_tick(); assert(dm_fps_lock_rates() == 0 && !dm_fps_lock_floor() && dm_fps_limit_step() == 0); return; }   // another build: no row
+    dm_fps_lock_tick(); assert(writes == 0);   // the framework not made yet
+    *(uintptr_t *)(base + 0x100000) = (uintptr_t)holder; *(uintptr_t *)(holder + 8) = (uintptr_t)fw; *mode = 0; *count = 1;
+    assert(dm_fps_lock_rates() == (2 | 4 | 32) && !dm_fps_lock_engine() && dm_fps_lock_floor());   // 20, 30, 60 (no more than 3 steps); the game's own interval stays
+    if (which == 1) { dm_fps_lock_tick(); dm_fps_lock_tick(); assert(dm_fps_target() == 0 && *mode == 0 && writes == 0); return; }   // 15 at start: not held, the game's own
+    dm_fps_lock_tick(); assert(*mode == 2 && *count == 1 && writes == 1);   // 30: the game's own two-step mode (its pick writes the 2)
+    dm_fps_lock_tick(); assert(writes == 1);
+    *mode = 1; dm_fps_lock_tick(); assert(*mode == 2 && writes == 2);   // the game set its own (a scene's setup): the cap goes in again
+    dm_fps_target_set(20, "test"); dm_fps_lock_tick(); assert(*mode == STEPS_HOLD && *count == 3 && writes == 4);   // 20: 3 steps, held
+    dm_fps_lock_tick(); assert(writes == 4);
+    dm_fps_target_set(60, "test"); dm_fps_lock_tick(); assert(*mode == 1 && writes == 5);   // 60: the game's own mode, the one it set last
+    dm_fps_target_set(0, "test"); dm_fps_lock_tick(); assert(*mode == 1 && writes == 5);
+    // The game's own 30 fps mode (three or four players): nothing to write at 30, and it comes back after 20
+    *mode = 2; *count = 2; dm_fps_target_set(30, "test"); dm_fps_lock_tick(); assert(*mode == 2 && writes == 5);
+    dm_fps_target_set(20, "test"); dm_fps_lock_tick(); assert(*mode == STEPS_HOLD && *count == 3 && writes == 7);
+    dm_fps_target_set(30, "test"); dm_fps_lock_tick(); assert(*mode == 2 && writes == 8);   // 20 → 30: the host's mode stays the host's
+    dm_fps_target_set(0, "test"); dm_fps_lock_tick(); assert(*mode == 2 && writes == 9);
+    // The frame limit (DM_FPS_LIMIT, the panel's limit) is held the same way, in whole vsyncs, and the limiter does not wait as well
+    *mode = 0; *count = 1;
+    nxhost_fps_limit_set(30); assert(dm_fps_limit_step() == 30 && nxhost_fps_limit_get() == 30); dm_fps_lock_tick(); assert(*mode == 2 && writes == 10);
+    nxhost_fps_limit_set(45); assert(dm_fps_limit_step() == 30); dm_fps_lock_tick(); assert(*mode == 2 && writes == 10);
+    dm_fps_target_set(20, "test"); dm_fps_lock_tick(); assert(*mode == STEPS_HOLD && *count == 3);   // the lower of the cap and the limit
+    nxhost_fps_limit_set(0); dm_fps_target_set(0, "test"); dm_fps_lock_tick(); assert(*mode == 0 && dm_fps_limit_step() == 0);
+    munmap(base, len);
+}
+
 int main(void) {
+    for (int i = 0; i < 3; i++) { pid_t p = fork(); assert(p >= 0); if (!p) { steps_check(i); _exit(0); } int status; assert(waitpid(p, &status, 0) == p); assert(WIFEXITED(status) && WEXITSTATUS(status) == 0); }
+    sead_rate_check();
+    { pid_t p = fork(); assert(p >= 0); if (!p) { step_check(); _exit(0); } int status; assert(waitpid(p, &status, 0) == p); assert(WIFEXITED(status) && WEXITSTATUS(status) == 0); }
     // Each process starts the production one-time initialization with a fresh build and target.
     for (int i = 0; i < 20; i++) {
         pid_t p = fork(); assert(p >= 0);
         if (!p) { check(i); _exit(0); }
         int status; assert(waitpid(p, &status, 0) == p); assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
-    puts("Frame limits: integer/float FPS, milliseconds, vsync copies, floors behind pointers and under the controller's maximum, caps set while running, build gates and overrides passed");
+    puts("Frame limits: integer/float FPS, milliseconds, vsync copies, floors behind pointers and under the controller's maximum, caps set while running, build gates and overrides, sead's controller at the measured rate (on and off live), framework step counts passed");
 }

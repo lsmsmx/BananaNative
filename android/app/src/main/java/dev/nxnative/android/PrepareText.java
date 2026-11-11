@@ -8,13 +8,28 @@ import java.util.regex.Pattern;
  * The words of Prepare (the on-device job's card and Home's game cards) for the player: what happened and what to do, in one or two short sentences, with the
  * technical part (file paths, a tool's last [RED] line, exit codes, build IDs) kept apart for the card's Details, which the player can open and copy. Also what a
  * failure offers: Retry when running the step again can help, Try anyway when the job can go on with a check relaxed (with an honest warning), nothing when this app
- * cannot do it (another app build is needed). No Android classes: LauncherJvmTest runs it on the Mac.
+ * version does not include the game, and an update when this app build itself is broken (its files do not match each other). No Android classes: LauncherJvmTest
+ * runs it on the Mac.
  */
 final class PrepareText {
     private PrepareText() {}
 
-    /** What a failed job's card offers: run the step again, go on with the check relaxed (Job "try_anyway"), or nothing (this app cannot do it) */
-    static final String FIX_RETRY = "retry", FIX_ANYWAY = "anyway", FIX_NONE = "none";
+    /**
+     * What a failed job's card offers: run the step again, go on with the check relaxed (Job "try_anyway"), nothing (this app cannot do it), or another app build
+     * (this build is broken: no Retry; the release app offers Check for updates)
+     */
+    static final String FIX_RETRY = "retry", FIX_ANYWAY = "anyway", FIX_NONE = "none", FIX_UPDATE = "update";
+
+    /**
+     * The start of vk_android_build.py check_translator's refusal after "[RED] ": the APK's translator library is not the one its own tools expect (a library from
+     * another source tree, an embedded source that is not the lock's, a library without --tree-sha). Nothing on the phone can mend it; Gradle's nxPackXlateCheck
+     * stops such a build (android/ONDEVICE.md, In the APK). test_android_preparetext.py checks the tool still prints this text
+     */
+    static final String XLATE_MISMATCH = "translator does not match the lock file: ";
+
+    /** The card's text for an APK whose translator does not match its tools (XLATE_MISMATCH) */
+    static final String XLATE_MISMATCH_TEXT = "This app build's shader translator does not match its own tools, so retrying will not help. Install the latest release "
+            + "of the app, or report this with the log from Details.";
 
     /** A failure: text for the card (short, plain), detail for Details (may be long), fix: FIX_* */
     static final class Failure {
@@ -39,6 +54,8 @@ final class PrepareText {
         String red = lastRed == null ? "" : lastRed.replaceFirst("^\\[RED\\]\\s*", "").trim();
         String detail = step + ": exit code " + code + (red.isEmpty() ? "" : "\n" + red) + (log == null ? "" : "\nLog: " + log);
         String what = step + " stopped.";
+        if (red.startsWith(XLATE_MISMATCH))
+            return new Failure(what + " " + XLATE_MISMATCH_TEXT, detail, FIX_UPDATE);
         if (red.contains("MemoryError") || red.contains("out of memory") || code == 137)
             return new Failure(what + " The phone ran out of memory. Close other apps, then tap Retry.", detail, FIX_RETRY);
         if (red.contains("No space left") || red.contains("ENOSPC"))

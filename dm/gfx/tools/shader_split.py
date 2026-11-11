@@ -2721,8 +2721,10 @@ def ue_shaders(d, label):
 def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     """The translator's layout of an NVN2 task / mesh program (dmsh_xlate job "mesh", Ryujinx StructuredIr/MeshShaderInfo.cs; after azmasm/switch2mac nx2_split.py, MIT):
     "local" the workgroup (control +0x58 threads), "mesh" [max vertices (+0x60), max primitives (+0x62), task memory bytes (+0x5a), the per-vertex planes, then -1 and the
-    per-primitive values]. The planes come from the SPH's output map (byte 0x35 bits 4..7 position x y z w, from byte 0x36 the generic vectors, 4 bits each): code 0..3
-    position, 4 + 4 g + c generic g component c. The per-primitive values are the output map of the program's second header, at control +0x64 in the code area (0: none;
+    per-primitive values]. The planes come from the SPH's output map in attribute order (byte 0x35 bit 3 the point size, bits 4..7 position x y z w, from byte 0x36 the
+    generic vectors, 4 bits each): code 132 the point size, 0..3 position, 4 + 4 g + c generic g component c. "mesh_topology" the vertices per output primitive
+    (control +0x5f) when it is not 3 (triangles, the translator's default): 1 for points (Zelda: Ocarina of Time's five point meshes, one index byte per primitive;
+    lines are not seen and refused). The per-primitive values are the output map of the program's second header, at control +0x64 in the code area (0: none;
     a geometry-type header, which NVK reads as a passthrough geometry stage's for per-primitive attributes; after pahorema/kartnative docs/reference/shaders-sm86.md, MIT).
     The flat inputs (pixel SPH from byte 0x18, 2 bits per component, 1 = flat) of the pixel shaders its BAHS variation draws it with (var_pairs) that the mesh does not write
     per vertex must be those values: Mario Kart World 1.8.0's 19 mesh programs agree; a difference is a red line. A task program has [0, 0, task memory bytes].
@@ -2733,10 +2735,14 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     pairs = sorted(b for a, b, t in mesh_pairs if a == key)
     if not threads: return warn('control +0x58 thread count is 0')
     if st == 'ts': return {'local': [threads, 1, 1], 'shared': 0, 'mesh': [0, 0, payload], 'pair': pairs}
-    # the planes are counted from position and the generic vectors only: an output-map bit of another output (system values before position at 0x30..0x35 bits 0..3,
-    # colours / clip distances after the generics) would be a plane of its own and shift every one after it. None in Mario Kart World 1.8.0's 19 mesh programs
-    if any(code[0x30:0x35]) or code[0x35] & 0xf or any(code[0x46:0x50]): return warn('its SPH output map has outputs besides position and the generic vectors, whose planes are not known')
-    planes = [c for c in range(4) if code[0x35] >> (4 + c) & 1] + [4 + i for i in range(128) if code[0x36 + i // 8] >> (i % 8) & 1]
+    # the planes follow the output map in attribute order, one plane per output component: the point size (byte 0x35 bit 3, attribute 0x6c: Ocarina of Time's
+    # point meshes store it in plane 0, before position), position and the generic vectors. Any other output-map bit (the other system values before position at
+    # 0x30..0x35 bits 0..2, colours / clip distances after the generics) would be a plane whose meaning is not known and shift every one after it: none in Mario
+    # Kart World 1.8.0's 19 mesh programs or Ocarina of Time's 500
+    if any(code[0x30:0x35]) or code[0x35] & 0x7 or any(code[0x46:0x50]): return warn('its SPH output map has outputs besides the point size, position and the generic vectors, whose planes are not known')
+    topology = ctl[0x5f]
+    if topology not in (1, 3): return warn(f'control +0x5f output topology {topology} (vertices per primitive) is neither points (1) nor triangles (3)')
+    planes = [132] * (code[0x35] >> 3 & 1) + [c for c in range(4) if code[0x35] >> (4 + c) & 1] + [4 + i for i in range(128) if code[0x36 + i // 8] >> (i % 8) & 1]
     layout = [maxv, maxp, payload, *planes]
     flats, reads = set(), set()
     for ps in pairs:
@@ -2754,10 +2760,10 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     if flats and next(iter(flats)) != prim: print(f'[RED] mesh program {key}: per-primitive values {list(prim)} (second header) are not the flat inputs {list(next(iter(flats)))} of its pixel shaders {pairs}', flush=True)
     if prim: layout += [-1, *prim]
     # -2: generic vectors the pixel shaders read that the mesh writes neither per vertex nor per primitive, given as (0, 0, 0, 1) like a vertex shader's padded outputs
-    have = {(c - 4) // 4 for c in planes + list(prim) if c >= 4}
+    have = {(c - 4) // 4 for c in planes + list(prim) if 4 <= c < 132}
     pad = sorted(reads - have)
     if pad: layout += [-2, *pad]
-    return {'local': [threads, 1, 1], 'shared': 0, 'mesh': layout, 'pair': pairs}
+    return {'local': [threads, 1, 1], 'shared': 0, 'mesh': layout, **({'mesh_topology': topology} if topology != 3 else {}), 'pair': pairs}
 
 def var_pairs(found):
     """(vertex key, pixel key) within the same BNSH variation; (vertex key, pixel key, 'prog') within the same BAHS program variation (bahs_variations).

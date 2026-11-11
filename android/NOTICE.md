@@ -37,6 +37,11 @@ The launcher's gate on adb control commands (`AdbControl.java`, Settings › ADB
 [Anka Native](https://github.com/EddizEge/AnkaNative) 0.2.2 by EddizEge (MIT: "Copyright (c) 2026 seedds", "Copyright (c) 2026 EddizEge" and the MIT permission notice
 in [LICENSE](../LICENSE)). Thanks to them.
 
+The texture pool's read reports (`DM_VK_POOL_FB`: `vka_spv_pool_fb` in `dm/gfx/vk_android/vka_spvpatch.c`, "Texture pool reads" in `vka_tex.c`) follow the design of
+[Anka Native](https://github.com/EddizEge/AnkaNative) 0.2.2's texture-use feedback by EddizEge (MIT: "Copyright (c) 2026 seedds", "Copyright (c) 2026 EddizEge" and the MIT
+permission notice in [LICENSE](../LICENSE)): a bit per texture ID set before each read of the pool, the bitmap copied out and cleared at each submission's end. Written
+anew for this host, which rewrites the modules at pipeline time instead of in the shader library. Thanks to them.
+
 The on-device packer's Python home (`assets/pack/python.zip`) carries, besides the [CPython](https://www.python.org/) Android build (PSF License),
 [Capstone](https://www.capstone-engine.org/) 5.0.7 (BSD-3-Clause) and [python-lz4](https://github.com/python-lz4/python-lz4) 4.4.5 (BSD-3-Clause, with LZ4's BSD-2-Clause
 sources). Since 0.2.2 the APK also carries `lib/arm64-v8a/libzbicdec.so`, which decodes the ZBIC segments of system 22.0.0+ modules for the packer's
@@ -45,6 +50,28 @@ an independent reader of ZBIC's entropy tables and the ZBIC frame magic (MIT, Ba
 ZBIC implementation ([dm/third_party/zstd-zbic](../dm/third_party/zstd-zbic/README.md), zstd's licence in its `LICENSE`). Thanks to
 [Atmosphère](https://github.com/Atmosphere-NX/Atmosphere) and Yannik Marchand's [zbic](https://github.com/kinnay/zbic) for discovering and documenting the format.
 On a PC or Mac the packer may instead use the zbic package from PyPI (GPL-2.0), which the user installs (`android/environment.yml` lists it); it is not in the APK.
+
+The Upscaler choice **SGSR 1** (`DM_VK_NDSR=4`) runs Qualcomm's [Snapdragon Game Super Resolution 1](https://github.com/SnapdragonStudios/snapdragon-gsr),
+ported to a compute shader in [`dm/gfx/vk_android/sgsr/ndsr_sgsr.comp`](../dm/gfx/vk_android/sgsr/ndsr_sgsr.comp) and built into the host as SPIR-V
+(`dm/gfx/vk_android/vka_ndsr_sgsr.h`), under the BSD 3-Clause License:
+
+> Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+>
+> Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+>
+> 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+> 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation
+>    and/or other materials provided with the distribution.
+> 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software
+>    without specific prior written permission.
+>
+> THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+> IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+> LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+> GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+> LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The shader file itself carries Qualcomm's 2025 header of the file it was ported from (`sgsr1_shader_mobile_edge_direction.frag`, SPDX-License-Identifier: BSD-3-Clause). Thanks to them.
 
 `Lossless.dll` belongs to Lossless Scaling (proprietary, sold separately). It is never in this repository or in an APK: the user supplies their own copy, which the
 launcher finds on the phone or lets the user pick, and copies into the app's private files.

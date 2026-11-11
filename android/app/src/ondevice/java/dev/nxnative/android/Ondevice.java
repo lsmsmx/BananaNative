@@ -175,7 +175,7 @@ final class Ondevice {
         final LinearLayout view, card;
         final TextView head, title, status, detail, tile;
         final ProgressBar bar;
-        final Button go, goOn, anyway;
+        final Button go, goOn, anyway, update;
         final Ui.Details why;   // a failed job's technical part (the tool's error, the folders, the logs), closed by default
         final Ui.Action play;
         final View more;
@@ -243,6 +243,10 @@ final class Ondevice {
             anyway = Ui.button(a, "Try anyway…", Ui.Kind.SOFT, v -> tryAnyway());
             anyway.setVisibility(View.GONE);
             Ui.add(card, anyway, 8);
+            // a failed job that this app build cannot finish (PrepareText.FIX_UPDATE): the release app's updater, where it has one
+            update = Ui.button(a, "Check for updates", Ui.Kind.SOFT, v -> Updater.checkNow(a));
+            update.setVisibility(View.GONE);
+            Ui.add(card, update, 8);
             load();
             show();
         }
@@ -382,9 +386,11 @@ final class Ondevice {
             why.set(failed || notIncluded != null ? job.errorDetail() : "");
             boolean running = alive && ("running".equals(st) || "paused".equals(st) && !"user".equals(job.reason()) && !"timeout".equals(job.reason()));
             boolean noFix = notIncluded != null || failed && PrepareText.FIX_NONE.equals(job.fix());   // nothing in this app can make it work: no Retry that cannot succeed
+            boolean broken = failed && !alive && job.brokenApk(Job.installed(a));   // this app build cannot do it: no Retry until another install; an older pack may still play
             go.setText(running ? "Pause" : "done".equals(st) && !job.apkChanged() ? "Prepare again" : failed ? "Retry" : "pending".equals(st) ? "Start" : "Resume");
             go.setEnabled(!"done".equals(st) || job.apkChanged());
-            go.setVisibility(noFix ? View.GONE : View.VISIBLE);
+            go.setVisibility(noFix || broken ? View.GONE : View.VISIBLE);
+            update.setVisibility(broken && Updater.available(a) ? View.VISIBLE : View.GONE);
             goOn.setVisibility(alive && job.canGoOn() ? View.VISIBLE : View.GONE);
             anyway.setVisibility(!alive && failed && !noFix && PrepareText.FIX_ANYWAY.equals(job.fix()) && !job.tryAnyway() ? View.VISIBLE : View.GONE);
             keepScreen(running && Prefs.keepScreenPreparing(a));

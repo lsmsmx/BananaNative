@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x3a9, InstName.Atom, AAtomgCas, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
@@ -317,6 +318,26 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand res = EmitAtomicOp(context, StorageKind.GlobalMemory, (AtomOp)x.Bits(87, 91), (AtomSize)x.Bits(73, 76), lo, hi, Register(x.Rb, RegisterType.Gpr));
 
             ASet(context, x, res);
+        }
+
+        // ATOMG.CAS Rd, [Ra + offset], Rb (compare), Rc (new value), 0x3a9: Rd is the old value (unlike ATOMS.CAS's flag): Zelda: Ocarina of Time's foliage computes compare it with the
+        // comparand right after (13002657609092b4 at 0x8c00, 3b8ecb1aa4207240 at 0x8ae0: R30 = 0xff, R30 = CAS([R38.64], R30, R31), ISETP.NE P0, R30, 0xff). The address as 0x3a8's
+        // register form (bit 72 a pair, offset 40..64); Rc at 64..72, where the uniform form keeps its register. Only the 32-bit register form occurs (size 73..76 = 0, bit 91 clear).
+        // Rb is copied first, since Rd may be Rb (R30 above)
+        public static void AAtomgCas(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+
+            if (x.Bits(73, 76) != 0 || x.Bit(91))
+            {
+                throw AFail(context, "ATOMG.CAS other than 32-bit with a register address");
+            }
+
+            (Operand lo, Operand hi) = AGlobalAddress(context, x, 72, 64, 0);
+            Operand compare = context.Copy(x.Rb >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr));
+            Operand value = x.Rc >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rc, RegisterType.Gpr);
+
+            ASet(context, x, context.AtomicCompareAndSwap(StorageKind.GlobalMemory, lo, hi, compare, value));
         }
 
         // MEMBAR: the order of this thread's memory operations
@@ -830,6 +851,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     }
                 }
 
+                // The sample index (the register after the depth reference) goes where an explicit LOD would, before the offsets: the order the SPIR-V generator
+                // (GenerateTextureSample) and TexturePass.InsertConstOffsets read. Appended after the offsets, a multisample fetch with AOFFI read offset x as its sample
+                if (ms)
+                {
+                    sources.Add(b[ib++]);
+                    type |= SamplerType.Multisample;
+                }
+
                 if (offset && opcode != 0xb63)
                 {
                     for (int i = 0; i < coords; i++)
@@ -861,12 +890,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 {
                     sources.Add(lodValue);
                     flags |= TextureFlags.LodBias;
-                }
-
-                if (ms)
-                {
-                    sources.Add(b[ib++]);
-                    type |= SamplerType.Multisample;
                 }
 
                 if (opcode == 0xb63 && !depth)

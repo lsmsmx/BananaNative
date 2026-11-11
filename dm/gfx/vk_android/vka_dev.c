@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include "vka_fd_alias.h"
+#include "vka_tlsig.h"
 
 // One placed map of a 64 KiB host-visible allocation at an address reserved for it (vka_dev.c, unadvertised placed maps): 1 when the driver maps it exactly there and
 // the memory reads back what was written through it
@@ -40,6 +41,7 @@ static int vka_placed_probe(void) {
 vka_fns vk;
 vka_dev V = {.qmu = PTHREAD_MUTEX_INITIALIZER};
 static int g_state;   // 0 not tried, 1 up, -1 failed
+static int g_fault_on;   // VK_EXT_device_fault enabled (fault_report)
 static pthread_mutex_t g_init_mu = PTHREAD_MUTEX_INITIALIZER;
 
 
@@ -52,6 +54,7 @@ uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropert
 static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) { for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1; return 0; }
 
 static void *completion_main(void *arg);
+static void tl_host_init(void);   // "Host-signalled timelines" below
 // ---------- The host's floating-point environment (vka_fpenv.h) ----------
 int vka_fp_guest(void) {
     static _Atomic int v = -1;
@@ -164,6 +167,11 @@ static int init_once(void) {
     if (x_mesh) dext[ndext++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
     int x_ph = has_ext(de, nde, "VK_QCOM_queue_perf_hint");
     if (x_ph) dext[ndext++] = "VK_QCOM_queue_perf_hint";
+    // VK_EXT_device_fault: after a lost device, what the driver knows of the fault (the address a GPU access faulted on, the kind), printed with the hang (fault_report).
+    // DM_VK_DEVICE_FAULT=0 (restart) leaves it off
+    const char *fault_env = getenv("DM_VK_DEVICE_FAULT");
+    int x_fault = has_ext(de, nde, VK_EXT_DEVICE_FAULT_EXTENSION_NAME) && !(fault_env && !strcmp(fault_env, "0"));
+    if (x_fault) dext[ndext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     V.mem_budget = has_ext(de, nde, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);   // the image heap's budget, for the texture cache's limit (vka_tex.c img_limit_update)
     if (V.mem_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     free(de);
@@ -176,10 +184,11 @@ static int init_once(void) {
     VkPhysicalDeviceVertexAttributeDivisorFeatures fdiv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDeviceMeshShaderFeaturesEXT fmesh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     void *chain = placed ? &fmp : NULL;
 #define LINK(on, st) if (on) { (st).pNext = chain; chain = &(st); }
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
-    LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh)
+    LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh) LINK(x_fault, ffault)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
@@ -189,15 +198,17 @@ static int init_once(void) {
     f2.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE;
     f12.bufferDeviceAddressCaptureReplay = VK_FALSE; f12.bufferDeviceAddressMultiDevice = VK_FALSE;
     frob.robustBufferAccess2 = VK_FALSE; frob.robustImageAccess2 = VK_FALSE;   // only nullDescriptor: unbound slots read a null descriptor
+    ffault.deviceFaultVendorBinary = VK_FALSE; g_fault_on = x_fault && ffault.deviceFault;   // (the vendor's binary dump: not read)
     // Mesh shading: the task and mesh stages only (multiview, shading-rate and query support each need more of the device than the replay enables or uses)
     fmesh.multiviewMeshShader = VK_FALSE; fmesh.primitiveFragmentShadingRateMeshShader = VK_FALSE; fmesh.meshShaderQueries = VK_FALSE;
     if (x_mesh && !fmesh.meshShader) fmesh.taskShader = VK_FALSE;   // (task shading is of no use without mesh shading)
     V.push_desc = x_push; V.vin_dyn = x_vin && fvin.vertexInputDynamicState; V.null_desc = x_rob && frob.nullDescriptor; V.idx8 = x_i8 && fi8.indexTypeUint8;
     V.divisor = x_div && fdiv.vertexAttributeInstanceRateDivisor; V.logic_op = f2.features.logicOp; V.dual_src = f2.features.dualSrcBlend; V.geom = f2.features.geometryShader;
     V.tess = f2.features.tessellationShader; V.depth_clamp = f2.features.depthClamp; V.fill_lines = f2.features.fillModeNonSolid; V.depth_bias_clamp = f2.features.depthBiasClamp;
-    V.multi_vp = f2.features.multiViewport; V.a2c = 1; V.mesh = x_mesh && fmesh.meshShader; V.task = V.mesh && fmesh.taskShader;
+    V.multi_vp = f2.features.multiViewport; V.a2c = 1; V.vstores = f2.features.vertexPipelineStoresAndAtomics; V.fstores = f2.features.fragmentStoresAndAtomics; V.mesh = x_mesh && fmesh.meshShader; V.task = V.mesh && fmesh.taskShader;
     if (!f12.timelineSemaphore || !f13.dynamicRendering) { VRED("the device lacks timeline semaphores (%d) or dynamic rendering (%d)", f12.timelineSemaphore, f13.dynamicRendering); return 0; }
     V.imageless = f12.imagelessFramebuffer;   // (enabled with the rest of f12)
+    V.draw_count = f12.drawIndirectCount;
     V.bda = f12.bufferDeviceAddress; V.uab = f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingPartiallyBound && f12.runtimeDescriptorArray;
     V.placed = placed && fmp.memoryMapPlaced; V.placed_range = placed && fmp.memoryMapRangePlaced; V.unmap_reserve = placed && fmp.memoryUnmapReserve;
     float prio = 1.f;
@@ -209,6 +220,7 @@ static int init_once(void) {
     VKA_DEVICE_FNS(D)
 #undef D
     fp_wrap_compiles();
+    vka_shader_pfb_hook();   // (over the FPCR wrapper: the module it makes is the rewritten one)
     if (!vk.vkMapMemory2KHR) vk.vkMapMemory2KHR = (PFN_vkMapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkMapMemory2");   // core in 1.4
     if (!vk.vkUnmapMemory2KHR) vk.vkUnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkUnmapMemory2");
     if (!vk.vkMapMemory2KHR || !vk.vkUnmapMemory2KHR) V.placed = V.placed_range = 0;
@@ -267,8 +279,10 @@ static int init_once(void) {
     if (!vk.vkCmdPushDescriptorSetKHR) V.push_desc = 0, V.max_push = 0;
     if (!vk.vkCmdSetVertexInputEXT) V.vin_dyn = 0;
     vka_enc_install();
+    vka_gbar_install();   // on top of the encoder: sees every work command the replay records (vka_gbar.c)
     const VkPhysicalDeviceLimits *lim = &V.props.limits;
     V.ub_align = lim->minUniformBufferOffsetAlignment ? lim->minUniformBufferOffsetAlignment : 256; V.sb_align = lim->minStorageBufferOffsetAlignment ? lim->minStorageBufferOffsetAlignment : 256;
+    vka_tex_pfb_flags();   // texture pool reads decided (and their buffers made) here, before any module is made, so no module's hook makes them under a caller's lock
     V.ub_range = lim->maxUniformBufferRange; V.sb_range = lim->maxStorageBufferRange; V.max_vin_bindings = lim->maxVertexInputBindings;
 
     VkMemoryPropertyFlags HV = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -281,6 +295,7 @@ static int init_once(void) {
     VkSemaphoreTypeCreateInfo st = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
     if ((r = vk.vkCreateSemaphore(V.dev, &sci, NULL, &V.tl))) { VRED("timeline semaphore %d", r); return 0; }
+    tl_host_init();
     pthread_t th; if (pthread_create(&th, NULL, completion_main, NULL)) { VRED("cannot start the completion thread"); return 0; }
     pthread_detach(th);
     VLOG("device %s, Vulkan %u.%u.%u, driver %#x; placed maps %s (range %s, alignment %llu), buffer device address %s, update-after-bind %s, display timing %s; guest memory type %u (%#x), max allocation %llu MiB, at most %u allocations",
@@ -306,6 +321,109 @@ int vka_init(void) {
 }
 int vka_ok(void) { return __atomic_load_n(&g_state, __ATOMIC_ACQUIRE) > 0; }
 
+// ---------- Host-signalled timelines ----------
+// Some drivers turn a zero-timeout status query into a wait for the GPU: Turnip on KGSL before Mesa e984ef29 (2026-10-08, "tu/kgsl: Prevent indefinite wait times for
+// 0 timeout waits": KGSL's timestamp wait takes a 0 ms timeout as forever). Its timelines are Mesa's emulated ones (vk_sync_timeline), and each operation on one first
+// collects the finished points with such queries while it holds the timeline's lock: a vkQueueSubmit that signals the timeline waits there for the oldest point still on
+// the GPU that no CPU wait holds, a vkWaitSemaphores for the point before it takes it, a vkGetSemaphoreCounterValue for every point still on the GPU; and each of them
+// holds every other operation on that timeline back meanwhile. Turnip v32 (Mesa 26.3.0-devel) on the Adreno 840 phone: the replay's queue submits took 31-55 ms a frame,
+// about one GPU frame (Ocarina of Time's note). Probe (a GPU frame of 25 ms, a CPU frame of 15): 10.3 ms a vkQueueSubmit that signals a timeline, 0.06 ms with a fence per
+// submission and the value signalled by the host; on Mesa 27 Turnip and Qualcomm's driver 0.06 ms both ways, and the completion seen 0.3 ms after the GPU either way.
+// On such a driver the GPU signals no timeline: a submission that would signal value v (the replay's V.tl, the upload batches' timeline) gets a VkFence, and the signal
+// thread waits for those fences in queue order and signals v on the host (no point is then ever pending on the GPU; a wait for a value is a condition variable). A
+// submission that waits for a value not yet signalled is held by the driver until the host signals it (Vulkan's wait-before-signal), as the present's and frame
+// generation's copies may be. Chosen at device creation from what the driver does, not its name: one submission waits for an event the host sets 20 ms later, and a
+// vkGetFenceStatus that returns only after it marks the driver. DM_VK_TL_HOST (restart only): 1 on, 0 off; unset: as the probe says. The sparse timeline (vka_sparse.c)
+// is still signalled by the GPU
+static tls_ring g_tls; static pthread_mutex_t g_tlsmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_tlscv = PTHREAD_COND_INITIALIZER, g_tlsfcv = PTHREAD_COND_INITIALIZER;
+static VkFence g_tlsfree[TLS_N + 8]; static int g_ntlsfree;   // reset fences ready for use (every fence handed out is in the ring or about to be)
+static VkEvent g_tlpe;
+static void *tl_probe_set(void *a) { (void)a; struct timespec t = {0, 20000000}; nanosleep(&t, NULL); vk.vkSetEvent(V.dev, g_tlpe); return NULL; }
+// 1 = a zero-timeout vkGetFenceStatus waited for the GPU (ms: how long it took)
+static int tl_zero_query_waits(double *ms) {
+    *ms = 0;
+    if (!vk.vkCreateEvent || !vk.vkDestroyEvent || !vk.vkSetEvent || !vk.vkCmdWaitEvents || !vk.vkGetFenceStatus || !vk.vkDestroyCommandPool) return 0;
+    VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer cb = VK_NULL_HANDLE; VkFence f = VK_NULL_HANDLE; g_tlpe = VK_NULL_HANDLE; int res = 0;
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = V.qf};
+    VkEventCreateInfo ei = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO}; VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vk.vkCreateCommandPool(V.dev, &pi, NULL, &pool)) { pool = VK_NULL_HANDLE; goto out; }
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vk.vkAllocateCommandBuffers(V.dev, &ai, &cb) || vk.vkCreateEvent(V.dev, &ei, NULL, &g_tlpe)) goto out;
+    if (vk.vkCreateFence(V.dev, &fi, NULL, &f)) { f = VK_NULL_HANDLE; goto out; }
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (vk.vkBeginCommandBuffer(cb, &bi)) goto out;
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT};
+    vk.vkCmdWaitEvents(cb, 1, &g_tlpe, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 1, &mb, 0, NULL, 0, NULL);
+    if (vk.vkEndCommandBuffer(cb)) goto out;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    pthread_mutex_lock(&V.qmu); VkResult r = vk.vkQueueSubmit(V.q, 1, &si, f); pthread_mutex_unlock(&V.qmu);
+    if (r) goto out;
+    pthread_t th;
+    if (pthread_create(&th, NULL, tl_probe_set, NULL)) { vk.vkSetEvent(V.dev, g_tlpe); vk.vkWaitForFences(V.dev, 1, &f, VK_TRUE, 2000000000ull); goto out; }
+    uint64_t t0 = now_ns(); r = vk.vkGetFenceStatus(V.dev, f); *ms = (now_ns() - t0) / 1e6;
+    pthread_join(th, NULL);
+    if (vk.vkWaitForFences(V.dev, 1, &f, VK_TRUE, 2000000000ull)) { VRED("timeline probe: its submission did not finish in 2 s"); vk.vkQueueWaitIdle(V.q); }
+    res = r == VK_SUCCESS && *ms >= 10;
+out:
+    if (f) vk.vkDestroyFence(V.dev, f, NULL);
+    if (g_tlpe) vk.vkDestroyEvent(V.dev, g_tlpe, NULL);
+    if (pool) vk.vkDestroyCommandPool(V.dev, pool, NULL);
+    return res;
+}
+static void *tls_main(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk-tlsig"); vka_fp_host("vk-tlsig"); void vka_perf_thread(int nice); vka_perf_thread(-8);
+    for (;;) {
+        tls_ent e;
+        pthread_mutex_lock(&g_tlsmu); while (!tls_pop(&g_tls, &e)) pthread_cond_wait(&g_tlscv, &g_tlsmu); pthread_mutex_unlock(&g_tlsmu);
+        VkFence f = (VkFence)e.fence; VkResult r;
+        while ((r = vk.vkWaitForFences(V.dev, 1, &f, VK_TRUE, 500000000ull)) == VK_TIMEOUT && !vka_hung()) {}   // (a GPU that stops is found by the completion thread)
+        if (r) { if (r != VK_TIMEOUT) VRED_ONCE("timeline signal thread: vkWaitForFences %d: the value is not signalled", r); continue; }   // (the fence is not reused)
+        pthread_mutex_lock(&g_tlsmu); int go = tls_take(&g_tls, e.sem, e.v); pthread_mutex_unlock(&g_tlsmu);
+        if (go) { VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = (VkSemaphore)e.sem, .value = e.v};
+                  VkResult sr = vk.vkSignalSemaphore(V.dev, &si); if (sr) VRED_ONCE("timeline signal thread: vkSignalSemaphore of %llu: %d", (unsigned long long)e.v, sr); }
+        vk.vkResetFences(V.dev, 1, &f);
+        pthread_mutex_lock(&g_tlsmu); if (g_ntlsfree < (int)(sizeof g_tlsfree / sizeof *g_tlsfree)) g_tlsfree[g_ntlsfree++] = f; else vk.vkDestroyFence(V.dev, f, NULL);
+        pthread_cond_broadcast(&g_tlsfcv); pthread_mutex_unlock(&g_tlsmu);
+    }
+    return NULL;
+}
+static void tl_host_init(void) {
+    const char *e = getenv("DM_VK_TL_HOST"); double ms = 0;
+    int probed = !(e && *e), waits = probed ? tl_zero_query_waits(&ms) : 0;
+    V.tl_host = probed ? waits : atoi(e) != 0;
+    pthread_t th;
+    if (V.tl_host && pthread_create(&th, NULL, tls_main, NULL)) { VRED("cannot start the timeline signal thread: the GPU signals the timelines"); V.tl_host = 0; }
+    else if (V.tl_host) pthread_detach(th);
+    if (probed) VLOG("timelines: a zero-timeout fence query %s (%.1f ms): %s", waits ? "waited for the GPU" : "returned at once", ms,
+                     V.tl_host ? "submissions get fences and the host signals their timeline values (DM_VK_TL_HOST=0: the GPU signals them)" : "the GPU signals the timelines");
+    else VLOG("timelines: %s (DM_VK_TL_HOST=%s)", V.tl_host ? "submissions get fences and the host signals their timeline values" : "the GPU signals them", e);
+}
+// A fence for a submission whose timeline value the host signals (NULL: none could be made; the GPU signals it then). Taken before the queue lock: it waits while
+// the ring is full
+static VkFence tls_fence(void) {
+    pthread_mutex_lock(&g_tlsmu);
+    while (tls_full(&g_tls)) pthread_cond_wait(&g_tlsfcv, &g_tlsmu);
+    VkFence f = g_ntlsfree ? g_tlsfree[--g_ntlsfree] : VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_tlsmu);
+    if (!f) { VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; if (vk.vkCreateFence(V.dev, &fi, NULL, &f)) { VRED_ONCE("timeline signal fence not made: the GPU signals that value"); f = VK_NULL_HANDLE; } }
+    return f;
+}
+// After the submission with fence f (under V.qmu, so the ring is in queue order): r its result
+static void tls_queued(VkSemaphore s, uint64_t v, VkFence f, VkResult r) {
+    pthread_mutex_lock(&g_tlsmu);
+    if (!r && tls_push(&g_tls, (void *)s, v, (void *)f)) pthread_cond_signal(&g_tlscv);
+    else if (g_ntlsfree < (int)(sizeof g_tlsfree / sizeof *g_tlsfree)) g_tlsfree[g_ntlsfree++] = f;   // (not submitted: still unsignalled. The ring has room: tls_fence waited for it)
+    pthread_mutex_unlock(&g_tlsmu);
+}
+// The host's own signal of v (a submission that failed): with host-signalled timelines it is noted, so the signal thread skips values at or below it, and skipped if a
+// higher value was signalled already (a timeline's values must increase)
+VkResult vka_host_signal(VkSemaphore s, uint64_t v) {
+    if (vka_hung()) return VK_ERROR_DEVICE_LOST;   // (Turnip's vkSignalSemaphore on a lost device faults: vka_device_lost)
+    if (V.tl_host) { pthread_mutex_lock(&g_tlsmu); int go = tls_take(&g_tls, (void *)s, v); pthread_mutex_unlock(&g_tlsmu); if (!go) return VK_SUCCESS; }
+    VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = s, .value = v};
+    return vk.vkSignalSemaphore(V.dev, &si);
+}
+
 static VkResult submit_x(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal, VkFence fence);
 // Every vka_submit's time waiting for the queue's lock and in the driver's vkQueueSubmit, and the calls (cumulative; the pace cost line, vka_perf.c)
 static _Atomic uint64_t g_qs_lock_ns, g_qs_call_ns, g_qs_n;
@@ -318,10 +436,14 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
     return submit_x(cb, signal, nwait, wait, wait_vals, stages, bin_signal, VK_NULL_HANDLE);
 }
 // A submission with a fence of its own (vka_exec.c: a commit no timeline value signals yet, whose command buffer slot is reused once that fence is reached)
-VkResult vka_submit_fence(VkCommandBuffer cb, uint64_t signal, VkFence fence) { return submit_x(cb, signal, 0, NULL, NULL, NULL, VK_NULL_HANDLE, fence); }
+VkResult vka_submit_fence(VkCommandBuffer cb, uint64_t signal, VkFence fence, uint64_t gate) {
+    VkSemaphore gs = gate ? vka_gate_sem() : VK_NULL_HANDLE; VkPipelineStageFlags st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    return submit_x(cb, signal, gs ? 1 : 0, &gs, &gate, &st, VK_NULL_HANDLE, fence);
+}
 static VkResult submit_x(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal, VkFence fence) {
     VkSemaphore sig[2]; uint64_t sv[2]; uint32_t ns = 0;
-    if (signal) { sig[ns] = V.tl; sv[ns++] = signal; }
+    VkFence hf = signal && V.tl_host ? tls_fence() : VK_NULL_HANDLE;   // host-signalled timelines: the fence after which the host signals `signal`
+    if (signal && !hf) { sig[ns] = V.tl; sv[ns++] = signal; }
     if (bin_signal) { sig[ns] = bin_signal; sv[ns++] = 0; }
     // The waits, and one more for the sparse binds queued before it (vks_queue_locked)
     VkSemaphore ws[9]; uint64_t wv[9]; VkPipelineStageFlags wst[9];
@@ -334,10 +456,13 @@ static VkResult submit_x(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, co
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = nwait, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = ns, .pSignalSemaphoreValues = sv};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = nwait, .pWaitSemaphores = ws, .pWaitDstStageMask = wst,
                        .commandBufferCount = cb ? 1 : 0, .pCommandBuffers = &cb, .signalSemaphoreCount = ns, .pSignalSemaphores = sig};
-    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, fence);
+    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, hf && !fence ? hf : fence);
+    if (!r && hf && fence) { VkSubmitInfo e = {VK_STRUCTURE_TYPE_SUBMIT_INFO}; r = vk.vkQueueSubmit(V.q, 1, &e, hf); }   // the caller's fence and then the host signal's (an empty submission after it)
+    if (hf) tls_queued(V.tl, signal, hf, r);
     g_qs_lock_ns += t1 - t0; g_qs_call_ns += now_ns() - t1; g_qs_n++;
     if (!r && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&V.qmu);
+    if (r == VK_ERROR_DEVICE_LOST) vka_device_lost("a submission");
     return r;
 }
 // The queue idle, bounded by the hang time: the timeline up to the last value handed to it (the present's copies wait for no more), then vkQueueWaitIdle for the rest
@@ -384,13 +509,14 @@ uint64_t vka_done(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }
 int vka_wait_done(uint64_t fence, uint64_t timeout_ns) {
     if (vka_done() >= fence) return 1;
     if (!timeout_ns) return 0;
-    vka_worker_cpu_wait(fence);   // a queue the replay parked at a GPU wait (vka_qsched.h) goes on now if it holds this fence back
+    int cw = vka_worker_cpu_wait(fence);   // a queue the replay parked at a GPU wait (vka_qsched.h), or a gate, holding this fence back goes on once the worker is stuck
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600000000000ull ? 3600000000000ull : timeout_ns);
     dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
     pthread_mutex_lock(&g_fmu);
     while (g_done < fence) if (pthread_cond_timedwait(&g_fcv, &g_fmu, &dl)) break;
     int ok = g_done >= fence; pthread_mutex_unlock(&g_fmu);
+    vka_worker_cpu_wait_end(cw);
     return ok;
 }
 void vka_after(uint64_t fence, void (*fn)(void *), void *arg) {
@@ -399,6 +525,120 @@ void vka_after(uint64_t fence, void (*fn)(void *), void *arg) {
     after_rec *a = malloc(sizeof *a); *a = (after_rec){g_after, fence, fn, arg}; g_after = a;
     pthread_mutex_unlock(&g_fmu);
 }
+// ---------- Gates ----------
+// A GPU wait for an event the CPU sets (vka_qsched.h "Waits for the CPU"): the replay records the waiting work at once and its next vkQueueSubmit waits for a value of the
+// gate semaphore (a timeline the host signals: wait-before-signal), so the recording overlaps the GPU's earlier work as it did before waits were honoured, and the GPU
+// still runs the work only once the word holds. Gates open in the order they were made (one in-order queue: a later gate's work is behind an earlier one's). A gate opens
+// when its word holds, looked at when the CPU signals an event (nvnEventSignal, on that thread) and every millisecond here (a store through mapped memory); when a
+// CPU thread waits for a fence at or after its submission (the GPU would wait for that thread: SyncWait, Finish, a pool's release, an acquire); and after its time
+// (DM_VK_EVENT_PARK_MS, counted from when the GPU has done the work handed to the queue before the gate) with a [RED] line, which bans the word: its later waits
+// park on the replay instead.
+// The CPU's writes before its signal (Ocarina of Time clears its lighting sums and writes the frame's light colours, then signals the event its frame's first
+// submission waits on) come after that submission went to the queue. A queue submission makes the host's earlier writes visible to the device; a host signal of a
+// semaphore does not (vkSignalSemaphore: its second synchronization scope is empty, no access scope), and host-coherent memory only spares the flush. So each gate also
+// has an event: set on the host when the gate opens, just before the semaphore, and waited for at the top of the gated work (vka_exec.c vka_rp_gate) with the host's
+// writes in its first access scope (vkCmdWaitEvents, HOST stage, HOST_WRITE), which makes them visible to what the GPU runs after the gate. By then the event is set:
+// the GPU passed the semaphore. The event is destroyed once the gated submission is done. DM_VK_GATE_EVENT=0 (restart): no event, as before
+enum { NGATE = 64, NGBAN = 32 };
+typedef struct { volatile uint32_t *w; uint32_t mode, value; uint64_t g, fence, t0, park, pre, t_idle, t_cpu; VkEvent ev; } gate_t;   // pre: the last value handed to the queue before it; t_idle: when the GPU had done it
+static gate_t g_gate[NGATE]; static uint64_t g_gate_in, g_gate_out, g_gate_val;
+static VkSemaphore g_gate_sem; static int g_gate_up;   // (g_gate_up: -1 no semaphore)
+static const volatile uint32_t *g_gban[NGBAN]; static int g_ngban;
+static pthread_mutex_t g_gmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_gcv = PTHREAD_COND_INITIALIZER;
+static _Atomic uint64_t g_gate_nw, g_gate_nc, g_gate_nt, g_gate_ns;
+static int gate_pred(uint32_t cur, uint32_t mode, uint32_t target) { return mode == 0 ? cur == target : (uint32_t)(cur - target) < 0x80000000u; }
+VkSemaphore vka_gate_sem(void) { return g_gate_up > 0 ? g_gate_sem : VK_NULL_HANDLE; }
+static void gate_ban_locked(const volatile uint32_t *w) {
+    for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) return;
+    if (g_ngban < NGBAN) g_gban[g_ngban++] = w;
+}
+int vka_gate_banned(const volatile uint32_t *w) {
+    pthread_mutex_lock(&g_gmu); int b = 0; for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) b = 1; pthread_mutex_unlock(&g_gmu); return b;
+}
+static void gate_open_locked(int why) {   // the oldest gate opens (why: 0 its word, 1 a CPU wait, 2 its time)
+    gate_t *x = &g_gate[g_gate_out % NGATE];
+    if (x->ev && !vka_hung()) { VkResult re = vk.vkSetEvent(V.dev, x->ev); if (re) VRED_ONCE("gate event set %llu: %d", (unsigned long long)x->g, re); }   // (before the semaphore: the GPU reaches the event's wait only after it)
+    VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_gate_sem, .value = x->g};
+    VkResult r = vka_hung() ? VK_SUCCESS : vk.vkSignalSemaphore(V.dev, &si);
+    if (r) VRED_ONCE("gate semaphore signal %llu: %d", (unsigned long long)x->g, r);
+    uint64_t t = now_ns(); g_gate_ns += t > x->t0 ? t - x->t0 : 0;
+    if (why == 0) g_gate_nw++; else if (why == 1) g_gate_nc++; else g_gate_nt++;
+    if (why == 2) gate_ban_locked(x->w);   // (a CPU wait opens it for that frame only)
+    g_gate_out++;
+}
+static void gate_poll_locked(void) {
+    while (g_gate_out < g_gate_in) {
+        gate_t *x = &g_gate[g_gate_out % NGATE];
+        if (gate_pred(*x->w, x->mode, x->value)) { gate_open_locked(0); continue; }
+        // Its time runs only once the GPU has done the work before it: the CPU's signal may itself wait for that work (Ocarina of Time signals after its SyncWait
+        // on the previous frame, which took 260-290 ms in heavy frames on Turnip v32: a clock from the gate's start banned its word there)
+        if (!x->t_idle && vka_done() >= x->pre) x->t_idle = now_ns();
+        // A CPU thread blocks on a fence at or after the gated submission while the GPU has nothing before the gate: the GPU would wait for that thread (counted from
+        // when both hold, 2 ms, so a signal from another thread that is on its way still opens it first)
+        if (x->t_idle && vka_worker_cpu_blocked() >= x->fence) {
+            if (!x->t_cpu) x->t_cpu = now_ns();
+            else if (now_ns() - x->t_cpu >= 2000000) { gate_open_locked(1); continue; }
+        } else x->t_cpu = 0;
+        if (x->park && x->t_idle && now_ns() - x->t_idle > x->park) {
+            VRED("a GPU wait for the CPU (event %p: wants %s %u, holds %u; submission %llu) waited %.0f ms with the GPU idle (%.0f ms in all): opened, and its event parks the replay from now on",
+                 (const void *)x->w, x->mode ? ">=" : "==", x->value, *x->w, (unsigned long long)x->fence, (now_ns() - x->t_idle) / 1e6, (now_ns() - x->t0) / 1e6);
+            gate_open_locked(2); continue;
+        }
+        break;
+    }
+}
+static void *gate_main(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk-gate"); vka_fp_host("vk-gate");
+    pthread_mutex_lock(&g_gmu);
+    for (;;) {
+        while (g_gate_out == g_gate_in) pthread_cond_wait(&g_gcv, &g_gmu);
+        gate_poll_locked();
+        if (g_gate_out == g_gate_in) continue;
+        struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 1000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&g_gcv, &g_gmu, &dl);
+    }
+    return NULL;
+}
+static void gate_ev_free(void *p) { VkEvent e = (VkEvent)(uintptr_t)p; vk.vkDestroyEvent(V.dev, e, NULL); }
+uint64_t vka_gate_add(volatile uint32_t *w, uint32_t mode, uint32_t value, uint64_t fence, uint64_t park_ns, VkEvent *ev) {
+    if (ev) *ev = VK_NULL_HANDLE;
+    static int ev_on = -1; if (ev_on < 0) { const char *e = getenv("DM_VK_GATE_EVENT"); ev_on = (!e || atoi(e)) && vk.vkCreateEvent && vk.vkSetEvent && vk.vkCmdWaitEvents && vk.vkDestroyEvent; }
+    pthread_mutex_lock(&g_gmu);
+    if (!g_gate_up) {
+        VkSemaphoreTypeCreateInfo st = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
+        pthread_t th; g_gate_up = -1;
+        if (vk.vkCreateSemaphore(V.dev, &sci, NULL, &g_gate_sem)) VRED("gate semaphore not made: GPU waits for the CPU park the replay");
+        else if (pthread_create(&th, NULL, gate_main, NULL)) { VRED("cannot start the gate thread: GPU waits for the CPU park the replay"); vk.vkDestroySemaphore(V.dev, g_gate_sem, NULL); }
+        else { pthread_detach(th); g_gate_up = 1; }
+    }
+    uint64_t g = 0;
+    for (int i = 0; i < g_ngban; i++) if (g_gban[i] == w) goto out;
+    if (g_gate_up > 0 && g_gate_in - g_gate_out < NGATE) {
+        g = ++g_gate_val;
+        VkEvent e = VK_NULL_HANDLE;
+        if (ev_on && ev && fence > vka_done()) {   // (a fence already done would destroy it at once)
+            VkEventCreateInfo ei = {VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+            if (vk.vkCreateEvent(V.dev, &ei, NULL, &e)) { e = VK_NULL_HANDLE; VRED_ONCE("gate event not made: the host's writes before a gate opens are not ordered for the GPU"); }
+            else { *ev = e; vka_after(fence, gate_ev_free, (void *)(uintptr_t)e); }   // (the gated submission's fence: past its wait)
+        }
+        g_gate[g_gate_in++ % NGATE] = (gate_t){w, mode, value, g, fence, now_ns(), park_ns, vka_fence_queued(), 0, 0, e};
+        pthread_cond_broadcast(&g_gcv);
+    }
+out:
+    pthread_mutex_unlock(&g_gmu);
+    return g;
+}
+void vka_gate_poll(void) {
+    if (g_gate_up <= 0) return;
+    pthread_mutex_lock(&g_gmu); if (g_gate_out < g_gate_in) { uint64_t f = vka_fp_host(NULL); gate_poll_locked(); vka_fp_back(f); } pthread_mutex_unlock(&g_gmu);
+}
+void vka_gate_cpu_wait(uint64_t fence) {   // (the gate thread looks: gate_poll_locked)
+    (void)fence; if (g_gate_up <= 0) return;
+    pthread_mutex_lock(&g_gmu); pthread_cond_broadcast(&g_gcv); pthread_mutex_unlock(&g_gmu);
+}
+void vka_gate_stats(uint64_t *n_word, uint64_t *n_cpu, uint64_t *n_time, uint64_t *wait_ns) { *n_word = g_gate_nw; *n_cpu = g_gate_nc; *n_time = g_gate_nt; *wait_ns = g_gate_ns; }
+
 // ---------- GPU hangs ----------
 // A fence that makes no progress for DM_VK_HANG_S seconds (default 6) is a hang: the GPU, or the driver's queue, will not get there. Then nothing more is submitted (mtl_sub_begin
 // records no command buffer, vka_submit refuses, the present drops its frames), every fence reads as done with its CPU-side effects run, pool memory the GPU may still read is
@@ -410,6 +650,41 @@ uint64_t vka_hang_ns(void) {
     double s = VKA_ENVF("DM_VK_HANG_S", 6.0); if (!(s > 0.5)) s = 6.0;
     return (uint64_t)(s * 1e9);
 }
+// A call that returned VK_ERROR_DEVICE_LOST (a submission, a present, a bind batch): the GPU hang is declared at once, so nothing more goes to the driver. The completion
+// thread finds it only at its next wait; meanwhile the failed commit's host signal of its timeline value went to the driver, and Turnip's vkSignalSemaphore on a lost
+// device faulted (SIGSEGV at address 8 inside the driver, called from vka_host_signal: Mario Kart World on Turnip V39, 2026-11-10)
+static void hang_declare(uint64_t want, uint64_t at, double s, const char *what);
+// What the driver reports of a lost device's fault (VK_EXT_device_fault, when the device has it): its description, the faulting addresses with their kind, and the
+// vendor's fault codes. Called once, after the hang lines
+static void fault_report(void) {
+    if (!g_fault_on) { VLOG("GPU hang: the driver reports no fault details (VK_EXT_device_fault %s)", getenv("DM_VK_DEVICE_FAULT") ? "off: DM_VK_DEVICE_FAULT=0" : "not on this device"); return; }
+    PFN_vkGetDeviceFaultInfoEXT get = (PFN_vkGetDeviceFaultInfoEXT)vk.vkGetDeviceProcAddr(V.dev, "vkGetDeviceFaultInfoEXT");
+    if (!get) { VRED("GPU hang: vkGetDeviceFaultInfoEXT not found"); return; }
+    VkDeviceFaultCountsEXT n = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult r = get(V.dev, &n, NULL);
+    if (r && r != VK_INCOMPLETE) { VRED("GPU hang: vkGetDeviceFaultInfoEXT (counts) %d", r); return; }
+    if (n.addressInfoCount > 32) n.addressInfoCount = 32;
+    if (n.vendorInfoCount > 32) n.vendorInfoCount = 32;
+    n.vendorBinarySize = 0;
+    VkDeviceFaultAddressInfoEXT ai[32]; VkDeviceFaultVendorInfoEXT vi[32];
+    VkDeviceFaultInfoEXT fi = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = n.addressInfoCount ? ai : NULL, .pVendorInfos = n.vendorInfoCount ? vi : NULL};
+    r = get(V.dev, &n, &fi);
+    if (r && r != VK_INCOMPLETE) { VRED("GPU hang: vkGetDeviceFaultInfoEXT %d", r); return; }
+    static const char *const kind[] = {"none", "read of an invalid address", "write to an invalid address", "execution at an invalid address", "instruction pointer unknown",
+                                       "instruction pointer invalid", "instruction pointer of the fault"};
+    VRED("GPU hang: the driver's fault report: \"%s\" (%u addresses, %u vendor codes)", fi.description, n.addressInfoCount, n.vendorInfoCount);
+    for (uint32_t i = 0; i < n.addressInfoCount; i++)
+        VRED("GPU hang: fault address %#llx (within %#llx): %s", (unsigned long long)ai[i].reportedAddress, (unsigned long long)ai[i].addressPrecision,
+             (unsigned)ai[i].addressType < 7 ? kind[ai[i].addressType] : "?");
+    for (uint32_t i = 0; i < n.vendorInfoCount; i++)
+        VRED("GPU hang: vendor fault \"%s\": code %#llx, data %#llx", vi[i].description, (unsigned long long)vi[i].vendorFaultCode, (unsigned long long)vi[i].vendorFaultData);
+}
+void vka_device_lost(const char *what) {
+    if (vka_hung()) return;
+    char w[96]; snprintf(w, sizeof w, "%s returned -4 (the device is lost)", what);
+    uint64_t d = vka_done(); hang_declare(d + 1, d, 0, w);
+}
+static _Atomic int g_fault_reported;
 static void *hang_exit_main(void *arg) { (void)arg; pthread_setname_np(pthread_self(), "vk-hang"); dm_host_shutdown("GPU hang"); return NULL; }
 void vka_exec_hang_report(uint64_t fence);   // vka_exec.c: what the stuck submission held
 static void hang_declare(uint64_t want, uint64_t at, double s, const char *what) {
@@ -417,6 +692,7 @@ static void hang_declare(uint64_t want, uint64_t at, double s, const char *what)
     VRED("GPU hang: %s; fence %llu not reached in %.1f s (the timeline at %llu, %llu handed to the queue, %llu reserved): nothing more is submitted, every fence reads as done",
          what, (unsigned long long)want, s, (unsigned long long)at, (unsigned long long)vka_fence_queued(), (unsigned long long)vka_fence_last());
     vka_exec_hang_report(at + 1);
+    if (strstr(what, "-4") && !atomic_exchange(&g_fault_reported, 1)) fault_report();   // (a lost device: the driver may know where the GPU faulted)
     if (!VKA_ENV("DM_VK_HANG_EXIT", 1)) { VRED("GPU hang: DM_VK_HANG_EXIT=0, the game runs on without the GPU"); return; }
     VRED("GPU hang: the host exits (DM_VK_HANG_EXIT=0 runs on without the GPU)");
     pthread_t th; if (!pthread_create(&th, NULL, hang_exit_main, NULL)) pthread_detach(th);
@@ -447,8 +723,11 @@ static void *completion_main(void *arg) {
         uint64_t sub = g_submitted, done = g_done, want = VKA_ENV("DM_VK_DONE_LAST", 0) ? sub : done + 1; pthread_mutex_unlock(&g_fmu);
         uint64_t v = 0;
         if (!vka_hung()) {
+            // The counter is read only for DM_VK_DONE_LAST: a wait that returned has reached want, and on a driver whose zero-timeout queries wait for the GPU ("Host-signalled
+            // timelines") the read waited for every submission handed to the queue, holding the timeline's lock, so the replay's next submission waited for them too
             VkResult r = vka_tl_wait(V.tl, want, 500000000ull);
-            vk.vkGetSemaphoreCounterValue(V.dev, V.tl, &v);
+            if (want == sub && VKA_ENV("DM_VK_DONE_LAST", 0)) vk.vkGetSemaphoreCounterValue(V.dev, V.tl, &v);
+            else v = r ? done : want;
             uint64_t t = now_ns();
             if (r == VK_TIMEOUT && v <= done) {   // no progress in this wait
                 if (!stall_t0 || stall_at != done) { stall_t0 = t - 500000000ull; stall_at = done; stall_logged = 0; }
@@ -639,18 +918,21 @@ void vka_up_flush(void) {
     VkResult r = vk.vkEndCommandBuffer(cb);
     uint64_t v = ++g_uval;
     VkSemaphore ws[1]; uint64_t wv[1]; VkPipelineStageFlags wst[1]; uint32_t nw = 0;   // the sparse binds queued before it (vks_queue_locked)
-    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &v};
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_utl};
+    VkFence hf = V.tl_host && !r ? tls_fence() : VK_NULL_HANDLE;   // host-signalled timelines: the host signals v after this fence
+    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .signalSemaphoreValueCount = hf ? 0 : 1, .pSignalSemaphoreValues = &v};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = hf ? 0 : 1, .pSignalSemaphores = &g_utl};
     pthread_mutex_lock(&V.qmu);
     if (!r) {
         vks_queue_locked(&nw, ws, wv, wst);
         ti.waitSemaphoreValueCount = nw; ti.pWaitSemaphoreValues = wv; si.waitSemaphoreCount = nw; si.pWaitSemaphores = ws; si.pWaitDstStageMask = wst;
-        r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE);
+        r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, hf);
     }
+    if (hf) tls_queued(g_utl, v, hf, r);
     pthread_mutex_unlock(&V.qmu);
+    if (r == VK_ERROR_DEVICE_LOST) vka_device_lost("an upload batch's submission");
     // Nothing on the GPU will signal it: the host does, so later batches and the slot are not held; only once the batch before it is done (a host signal must be below
     // every value still pending on the queue)
-    if (r && !vka_hung() && (v == 1 || up_wait(v - 1))) { VkSemaphoreSignalInfo ss = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_utl, .value = v}; vk.vkSignalSemaphore(V.dev, &ss); }
+    if (r && !vka_hung() && (v == 1 || up_wait(v - 1))) vka_host_signal(g_utl, v);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("upload batch %llu: %d (its images keep what they held)", (unsigned long long)v, r); }
     g_ub[k].val = v; g_n_ubatch++;
     retire(1, v);

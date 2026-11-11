@@ -41,6 +41,8 @@ render_cond	on
 gpu_timestamps	segment
 # The 3D scenes' size follows the operation mode and the Switch 2 graphics scale (the game imports oe::GetCurrentGraphicsScale, no window getter): the Android launcher's Game
 # resolution sets these. On an AYN Thor (Adreno 740, Turnip) the ink-map scene's main pass is 2560x1440 at the console's scale, 1920x1080 at handheld scale 0 and 1280x720 at
-# handheld scale 2 (GPU busy 63-104, 38-58 and 21-24 ms); Original has no row: the game's own
+# handheld scale 2 (GPU busy 63-104, 38-58 and 21-24 ms); Original has no row: the game's own. Phone 1440p is the console's scale 1 (2560x1440). A choice with no row
+# takes the largest row that fits in it, or the smallest (Phone 540p / 480p: 1280x720; Profile.resolutionEnv)
+graphics_scale	2560x1440	1	console
 graphics_scale	1920x1080	0	handheld
 graphics_scale	1280x720	2	handheld

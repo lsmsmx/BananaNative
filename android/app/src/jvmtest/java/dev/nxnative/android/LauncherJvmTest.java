@@ -96,8 +96,25 @@ public final class LauncherJvmTest {
         Profile sc = Profile.parse("0400C3F00006E000\tM\t0\tx\t\t\t\t\t\tscale:1920x1080=0/handheld,1280x720=2/handheld").get(0);
         check(sc.hasResolution() && sc.resolutionEnv("1920x1080").equals(List.of("DM_GRAPHICS_SCALE=0", "DM_OPMODE=0"))
                 && sc.resolutionEnv("1280x720").equals(List.of("DM_GRAPHICS_SCALE=2", "DM_OPMODE=0")), "graphics_scale rows: " + sc.resolutionEnv("1280x720"));
-        check(sc.resolutionEnv("original").isEmpty() && sc.resolutionEnv("2560x1440").isEmpty(), "a choice without a row: the game's own");
+        check(sc.resolutionEnv("original").isEmpty(), "Original without a row: the game's own");
+        check(sc.resolutionEnv("2560x1440").equals(List.of("DM_GRAPHICS_SCALE=0", "DM_OPMODE=0")), "a size without a row: the largest row that fits (1080p): " + sc.resolutionEnv("2560x1440"));
+        check(sc.resolutionEnv("960x540").equals(List.of("DM_GRAPHICS_SCALE=2", "DM_OPMODE=0")) && sc.resolutionEnv("848x480").equals(List.of("DM_GRAPHICS_SCALE=2", "DM_OPMODE=0")),
+                "a size below every row: the smallest row (720p): " + sc.resolutionEnv("848x480"));
+        Profile sc4 = Profile.parse("0400486024DEC000\tO\t0\tx\t\t\t\t\t\tscale:original=1/console,2560x1440=1/console,1920x1080=0/handheld,1280x720=2/handheld").get(0);
+        check(sc4.resolutionEnv("2560x1440").equals(List.of("DM_GRAPHICS_SCALE=1", "DM_OPMODE=1")) && sc4.resolutionEnv("original").equals(List.of("DM_GRAPHICS_SCALE=1", "DM_OPMODE=1"))
+                && sc4.resolutionEnv("960x540").equals(List.of("DM_GRAPHICS_SCALE=2", "DM_OPMODE=0")), "four rows: " + sc4.resolutionEnv("960x540"));
         check(Profile.parse("0400C3F00006E000\tM\t0\tx\t\t\t\t\t\tscale:original=1/console").get(0).resolutionEnv("original").equals(List.of("DM_GRAPHICS_SCALE=1", "DM_OPMODE=1")), "console");
+        // While the game runs (the in-game panel, Native.graphicsModeSet): the same row as {scale, mode}; Original without a row {-1, -1}, the game's own; none for window games
+        check(sc.resolutionLive() && java.util.Arrays.equals(sc.resolutionLive("1280x720"), new int[] {2, 0}) && java.util.Arrays.equals(sc.resolutionLive("2560x1440"), new int[] {0, 0})
+                && java.util.Arrays.equals(sc.resolutionLive("848x480"), new int[] {2, 0}) && java.util.Arrays.equals(sc.resolutionLive("original"), new int[] {-1, -1}),
+                "live graphics_scale rows: " + java.util.Arrays.toString(sc.resolutionLive("original")));
+        check(java.util.Arrays.equals(sc4.resolutionLive("original"), new int[] {1, 1}) && java.util.Arrays.equals(sc4.resolutionLive("1920x1080"), new int[] {0, 0}), "live, four rows");
+        check(!win.resolutionLive() && win.resolutionLive("1280x720") == null && !l.get(0).resolutionLive(), "window_fn / res_levels and none: not live (the next start)");
+        // The default frame limit (build.gradle fpsLimitOf, the 16th column): game.tsv fps_limit, 0 without the column, an empty one or a bad value
+        Profile lim = Profile.parse("0400486024DEC000\tO\t0\tx\t\t\t\t\t\t\t\t\t\t\t\t30").get(0);
+        check(lim.fpsLimit == 30 && !lim.decoupled && !lim.drs, "fps_limit column: " + lim.fpsLimit);
+        check(l.get(0).fpsLimit == 0 && Profile.parse("0400486024DEC000\tO\t0\tx\t\t\t\t\t\t\t\t\t\t1\t\t").get(0).fpsLimit == 0
+                && Profile.parse("0400486024DEC000\tO\t0\tx\t\t\t\t\t\t\t\t\t\t\t\tx").get(0).fpsLimit == 0, "no fps_limit: 0");
         check(Profile.versionName(0).equals("the base game") && Profile.versionName(458752).equals("update 458752"), "versionName");
         check(Profile.of("040074A01BF12000") != null && Profile.of("0100000000010000") == null, "Profile.of over BuildConfig.NX_PROFILES");
         check(Profile.missing("0100000000010000", "Mario").startsWith("This app version does not include Mario (0100000000010000).") && Profile.missing("040074A01BF12000", null) == null, "Profile.missing");

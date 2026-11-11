@@ -115,6 +115,7 @@ class Formula(Tree):
 
     def test_build_rows(self):
         self.assertEqual(pack_android.build_rows(b'# c\nbuild \t v1\t1.0.0 \tmain=aa\r\nname\tX\nbuilds\tno\n'), b'build\tv1\t1.0.0\tmain=aa\n')
+        self.assertEqual(pack_android.build_rows(b'build\tv1\t1.0.0\tmain=aa\nfps_decouple\tsead \nfps_limit\t30\n'), b'build\tv1\t1.0.0\tmain=aa\nfps_decouple\tsead\n')   # the opt-in the rewriter reads
         self.assertEqual(pack_android.build_rows(PROFILE.encode()), pack_android.build_rows(PROFILE.replace('segment', 'none').encode() + b'graphics_scale\t1\n'))
 
     def test_current_key_ignores_other_rows(self):

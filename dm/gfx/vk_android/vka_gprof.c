@@ -5,13 +5,18 @@
 // ended it (file:line), the draws in it and the pass's attachments. Gaps between submissions and parts (the GPU waiting for recording) are left out.
 // Each step also names what ran in it (vka_gp_note from vka_draw / vka_dispatch): vertex, mesh and compute counts and the most used shaders (geometry key / pixel key,
 // with their draws or workgroups); a "by compute shader" line sums the dispatch steps' time by compute shader key (every dispatch ends in a full barrier: its own step).
-// It costs a stall per profiled frame (timestamps), nothing when off (one cached switch read per submission)
+// It costs a stall per profiled frame (timestamps), nothing when off (one cached switch read per submission).
+// DM_VK_GPUPROF_SPLIT=n (live, 0 = off): in the profiled frame only, a render pass is ended after every n draws (vka_exec.c chunk_check) and the next draw opens it again over
+// the same targets (loadOp LOAD, as DM_VK_CHUNK_PASS does), so each step holds n draws (one with n = 1) and the frame's draws get a GPU time each. A pass cannot be timed
+// inside on a tiler (its draws run bin by bin), so this is the per-draw split. Each split adds the pass's load and store (and on a tiler a binning pass) to its step: the
+// report takes the cheapest step of each pass shape as that overhead (the floor) and gives each draw key its time above it ("gpu prof split:" lines, by vertex / pixel
+// key pair and by pixel key). The profiled frame then costs far more than the others (thousands of passes); its relative split is what counts
 #if defined(__ANDROID__)
 #include "vka.h"
 #include <stdlib.h>
 #include <string.h>
 
-enum { NQ = 2048, DESC = 96 };
+enum { NQ = 8192, DESC = 96 };   // NQ: room for DM_VK_GPUPROF_SPLIT=1 over a frame of ~4,000 draws
 enum { NK = 4 };
 typedef struct { char k; uint64_t key, pkey; uint32_t n; uint64_t work; } gp_key;   // k: 'v' vertex draw, 'm' mesh draw, 'c' dispatch
 typedef struct { uint32_t nv, nm, nc, nk; gp_key key[NK]; } gp_what;
@@ -24,6 +29,8 @@ static uint64_t g_frame, g_last_frame, g_fence; static VkCommandBuffer g_cb;
 static char g_pass[DESC]; static int g_pass_new;   // the last pass opened (vka_gp_pass), taken by the next mark
 static uint64_t g_sub_frame; static int g_sub_frame_set;
 int vka_gp_active;                      // marks are taken (read by vka_barrier)
+static int g_split;                     // DM_VK_GPUPROF_SPLIT of the profiled frame
+int vka_gp_split(void) { return vka_gp_active ? g_split : 0; }
 static gp_what g_w;                     // what the open step recorded so far
 void vka_gp_note(char k, uint64_t key, uint64_t pkey, uint64_t work) {
     if (!vka_gp_active) return;
@@ -69,7 +76,11 @@ void vka_gp_mark(VkCommandBuffer cb, const char *file, int line) { if (cb == g_c
 void vka_gp_pass(const char *desc) { if (vka_gp_active) { snprintf(g_pass, DESC, "%s", desc); g_pass_new = 1; } }
 void vka_gp_part(VkCommandBuffer cb) { if (!vka_gp_active) return; g_cb = cb; mark(cb, 2, "part", 0); }
 
-typedef struct { int i; double ms; } step;
+typedef struct step_ { int i; double ms; } step;
+// DM_VK_GPUPROF_SPLIT: the draw steps' time by draw key, above each pass shape's floor (its cheapest step with draws: the split's own load / store)
+typedef struct { char k; uint64_t key, pkey; uint32_t n; uint64_t work; double ms, over; } sp_key;
+static int sp_by_over(const void *a, const void *b) { double d = ((const sp_key *)b)->over - ((const sp_key *)a)->over; return d > 0 ? 1 : d < 0 ? -1 : 0; }
+static void split_report(const struct step_ *s, int ns);
 static int by_ms(const void *a, const void *b) { double d = ((const step *)b)->ms - ((const step *)a)->ms; return d > 0 ? 1 : d < 0 ? -1 : 0; }
 static void report(void) {
     static uint64_t t[NQ];
@@ -91,6 +102,7 @@ static void report(void) {
             char ws[200]; what_str(&b->w, ws, sizeof ws);
             VLOG("gpu prof: step #%d %.3f ms: %s:%d, %llu draws, %llu ops%s%s%s", s[k].i, s[k].ms, b->file, b->line, (unsigned long long)(b->draws - a->draws),
                  (unsigned long long)(b->ops - a->ops), b->desc[0] ? "; pass " : "", b->desc, ws); }
+    if (g_split) split_report(s, ns);   // the steps still in GPU order
     qsort(s, (size_t)ns, sizeof *s, by_ms);
     for (int k = 0; k < ns && k < 16; k++) {
         const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i];
@@ -130,9 +142,56 @@ void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
         int every = VKA_ENV("DM_VK_GPUPROF", 0);
         if (every <= 0 || frame == g_frame || (g_last_frame && frame < g_last_frame + (uint64_t)every) || !init()) return;
         g_state = 1; g_frame = g_last_frame = frame; g_n = 0; vka_gp_active = 1; g_pass_new = 0; memset(&g_w, 0, sizeof g_w);
+        g_split = VKA_ENV("DM_VK_GPUPROF_SPLIT", 0); if (g_split < 0) g_split = 0;
         g_reset(cb, g_qp, 0, NQ);
     }
     if (g_state == 1) { g_cb = cb; mark(cb, 1, "submission", 0); }
 }
 void vka_gp_commit(VkCommandBuffer cb, uint64_t fence) { if (g_state == 1 && cb == g_cb) { mark(cb, 3, "commit", 0); g_fence = fence; } }
+static void split_report(const step *s, int ns) {
+    enum { NSH = 128, NSK = 1024 };
+    static char shape[NSH][DESC]; static double floor_ms[NSH], shape_ms[NSH]; static int shape_n[NSH], shape_d[NSH]; int nsh = 0;
+    static int sh_of[NQ];
+    const char *cur = "";   // the pass shape a step belongs to: the last pass desc seen (a split pass opens again with the same desc)
+    for (int k = 0; k < ns; k++) {
+        const gp_mark *b = &g_m[s[k].i]; sh_of[k] = -1;
+        if (b->desc[0]) cur = b->desc;
+        if (!(b->w.nv + b->w.nm) || !cur[0]) continue;
+        int j = 0; while (j < nsh && strcmp(shape[j], cur)) j++;
+        if (j == nsh) { if (nsh == NSH) continue; snprintf(shape[nsh], DESC, "%s", cur); floor_ms[nsh] = 1e9; shape_ms[nsh] = 0; shape_n[nsh] = shape_d[nsh] = 0; nsh++; }
+        sh_of[k] = j; shape_n[j]++; shape_d[j] += (int)(b->w.nv + b->w.nm); shape_ms[j] += s[k].ms; if (s[k].ms < floor_ms[j]) floor_ms[j] = s[k].ms;
+    }
+    static sp_key kk[NSK]; int nk = 0; double tot = 0, over = 0;
+    for (int k = 0; k < ns; k++) {
+        if (sh_of[k] < 0) continue;
+        const gp_what *w = &g_m[s[k].i].w; uint32_t nd = w->nv + w->nm, kn = 0;
+        for (uint32_t a = 0; a < w->nk; a++) kn += w->key[a].n;
+        if (!kn) continue;
+        double ov = s[k].ms - floor_ms[sh_of[k]]; if (ov < 0) ov = 0;
+        tot += s[k].ms; over += ov; (void)nd;
+        for (uint32_t a = 0; a < w->nk; a++) {   // a step of several keys: its time shared by their draws
+            const gp_key *g = &w->key[a]; double f = (double)g->n / kn; int j = 0;
+            while (j < nk && !(kk[j].k == g->k && kk[j].key == g->key && kk[j].pkey == g->pkey)) j++;
+            if (j == nk) { if (nk == NSK) continue; kk[nk++] = (sp_key){g->k, g->key, g->pkey, 0, 0, 0, 0}; }
+            kk[j].n += g->n; kk[j].work += g->work; kk[j].ms += s[k].ms * f; kk[j].over += ov * f;
+        }
+    }
+    VLOG("gpu prof split: frame %llu, %d draws a step at most: draw steps %.2f ms, %.2f ms above the floors; %d pass shapes:", (unsigned long long)g_frame, g_split, tot, over, nsh);
+    for (int j = 0; j < nsh; j++)
+        VLOG("gpu prof split:  shape %s: %d steps, %d draws, %.2f ms, floor %.3f ms a step, %.2f ms above it", shape[j], shape_n[j], shape_d[j], shape_ms[j], floor_ms[j],
+             shape_ms[j] - floor_ms[j] * shape_n[j]);
+    qsort(kk, (size_t)nk, sizeof *kk, sp_by_over);
+    for (int j = 0; j < nk && j < 40; j++)
+        VLOG("gpu prof split:  %c %016llx/%016llx x%u (%llu %s): %.3f ms, %.3f above the floor (%.1f %%)", kk[j].k, (unsigned long long)kk[j].key, (unsigned long long)kk[j].pkey,
+             kk[j].n, (unsigned long long)kk[j].work, kk[j].k == 'v' ? "vertices" : "workgroups", kk[j].ms, kk[j].over, over > 0 ? 100 * kk[j].over / over : 0);
+    // by pixel key alone
+    static sp_key pk[NSK]; int np = 0;
+    for (int j = 0; j < nk; j++) { int i = 0; while (i < np && pk[i].pkey != kk[j].pkey) i++;
+        if (i == np) pk[np++] = (sp_key){'p', 0, kk[j].pkey, 0, 0, 0, 0};
+        pk[i].n += kk[j].n; pk[i].ms += kk[j].ms; pk[i].over += kk[j].over; }
+    qsort(pk, (size_t)np, sizeof *pk, sp_by_over);
+    char line[1400]; size_t ln = 0; line[0] = 0;
+    for (int j = 0; j < np && j < 24 && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %016llx x%u %.2f/%.2fms;", (unsigned long long)pk[j].pkey, pk[j].n, pk[j].over, pk[j].ms);
+    VLOG("gpu prof split: by pixel shader (above the floor / all):%s", line);
+}
 #endif

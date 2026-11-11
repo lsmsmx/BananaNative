@@ -71,6 +71,14 @@ static cv_pool *g_active_pools[64];
 static _Atomic uint32_t g_pool_gen;   // moved when a video pool joins or leaves the active set (dm_codec_pool_gen): the replay asks whether an image's storage is one
                                       // of theirs once per generation, not once per image per submission (vka_tex_prepare)
 static pthread_mutex_t g_active_pools_mu = PTHREAD_MUTEX_INITIALIZER;
+// Read without the lock by the Vulkan replay's texture cache, which asked dm_codec_is_video_mem for every live image at each submission and at each texture lookup (a lock
+// and 64 slots each: about 5 ms a frame with 2,600 images and 9 submissions, Mario Kart World on the Adreno 840): how many pools are registered (0: no memory is a video
+// pool, answered at once), a count raised at each registration or release (dm_codec_video_epoch: an image checked at this count need not be checked again until it moves)
+// and one raised at each picture written into a pool (dm_codec_video_writes: no video texture changed while it stands still)
+static _Atomic int g_vpool_n;
+static _Atomic uint64_t g_vpool_epoch = 1, g_vpool_writes;
+uint64_t dm_codec_video_epoch(void) { return atomic_load_explicit(&g_vpool_epoch, memory_order_acquire); }
+uint64_t dm_codec_video_writes(void) { return atomic_load_explicit(&g_vpool_writes, memory_order_acquire); }
 
 static cv_dec *cv_of(void *t) { cv_dec *d = t ? *(cv_dec **)t : NULL; return d && d->magic == CV_MAGIC ? d : NULL; }
 static cv_pool *pool_of(const void *t) { cv_pool *p = t ? *(cv_pool *const *)t : NULL; return p && p->magic == CV_MAGIC ? p : NULL; }
@@ -119,6 +127,7 @@ static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
         free(tmp);
     }
     atomic_fetch_add_explicit(&p->gen, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_vpool_writes, 1, memory_order_release);
 }
 // Pictures and end of stream into the released buffers, in order (decoder lock held). The event says a packet can come: it rises when one was taken (took) or room came back, not at every release.
 // Mario Tennis Fever's player counts each signal as one packet it may send: raised at every release, its count grew while a seek held back the samples (a skipped cutscene),
@@ -191,9 +200,9 @@ static Result cv_pool_init(void *t, void *mem, uint64_t size, const cv_pref *p, 
     *(cv_pool **)t = o;
     pthread_mutex_lock(&g_active_pools_mu);
     for (int i = 0; i < 64; i++) {
-        if (!g_active_pools[i]) { g_active_pools[i] = o; break; }
+        if (!g_active_pools[i]) { g_active_pools[i] = o; atomic_fetch_add_explicit(&g_vpool_n, 1, memory_order_release); break; }
     }
-    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_vpool_epoch, 1, memory_order_release);
     pthread_mutex_unlock(&g_active_pools_mu);
     LOG("[codec] pool registered: mem=%p size=%#llx w=%u h=%u count=%u", mem, (unsigned long long)size, p->w, p->h, o->count);
     static int once; if (!once++) LOG("[codec] image pool %ux%u format %u, tiling or mode %u, %u picture(s): the host keeps the decoded pictures", p->w, p->h, p->fmt, p->mode, o->count);
@@ -207,9 +216,9 @@ HLE_FORCE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTy
     cv_pool *p = pool_of(t); if (!p) return;
     pthread_mutex_lock(&g_active_pools_mu);
     for (int i = 0; i < 64; i++) {
-        if (g_active_pools[i] == p) { g_active_pools[i] = NULL; break; }
+        if (g_active_pools[i] == p) { g_active_pools[i] = NULL; atomic_fetch_sub_explicit(&g_vpool_n, 1, memory_order_release); break; }
     }
-    atomic_fetch_add_explicit(&g_pool_gen, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_vpool_epoch, 1, memory_order_release);
     pthread_mutex_unlock(&g_active_pools_mu);
     pthread_mutex_lock(&g_cv_mu);   // a decoder still holding a buffer of this pool keeps it, with no pool to write its picture into
     for (int k = 0; k < 16; k++) if (g_cv[k]) { pthread_mutex_lock(&g_cv[k]->mu); for (int i = 0; i < CV_BUFS; i++) if (g_cv[k]->buf[i].pool == p) g_cv[k]->buf[i].pool = NULL; pthread_mutex_unlock(&g_cv[k]->mu); }
@@ -273,7 +282,7 @@ int dm_native_image(uint32_t handle, uint8_t **mem, uint64_t *size, uint32_t *w,
 uint32_t dm_codec_pool_gen(void) { return atomic_load_explicit(&g_pool_gen, memory_order_acquire); }
 int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) {
     (void)size;
-    if (!mem) return 0;
+    if (!mem || !atomic_load_explicit(&g_vpool_n, memory_order_acquire)) return 0;
     pthread_mutex_lock(&g_active_pools_mu);
     for (int i = 0; i < 64; i++) {
         cv_pool *p = g_active_pools[i];
@@ -287,6 +296,7 @@ int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) {
     return 0;
 }
 uint64_t dm_codec_video_gen(const void *mem) {
+    if (!atomic_load_explicit(&g_vpool_n, memory_order_acquire)) return 0;   // (no pool: 0, as the scan below says)
     pthread_mutex_lock(&g_active_pools_mu);
     if (mem) {
         for (int i = 0; i < 64; i++) {

@@ -24,6 +24,12 @@ Three projects from Ryujinx 1.3.2: `Ryujinx.Graphics.Shader`, `Ryujinx.Common` a
 
 - `Ryujinx.Graphics.Shader/Translation/Transforms/DrawParametersReplace.cs` (PR #83 by cr1stian): only c0 + 0x644 (the base instance) is replaced by the `BaseInstance` builtin, on hosts that ask for it (`QueryHasConstantBufferDrawParameters`, the Android jobs); the base vertex and the draw index stay in c0.
 
+- `Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs`, `GetDepthRegister`: a pixel shader's depth output is read from register 4 x (render targets with any component enabled) + 1, the register after the next one past the colour outputs as `EmitterContext.PrepareForReturn` lays them out (four a target). Upstream counted enabled components, wrong for partial colour masks (agl's depth passes, `OmapTargets` 0x100 / 0x30 / 0x10f / 0x3f); the finding of Swap2-Native (MIT), written anew here ([docs/reference/shaders.md](../../../docs/reference/shaders.md#a-pixel-shader-with-partial-colour-masks-wrote-the-wrong-depth)).
+
+- `Ryujinx.Graphics.Shader/Instructions/InstEmitAmpereMem.cs`: ATOMG.CAS (0x3a9, `AAtomgCas`), the old value as its result; a multisample texture instruction's sample index goes before the texel offsets, where the SPIR-V generator reads it ([ATOMG.CAS and multisample fetches with offsets](../../../docs/reference/shaders.md#atomgcas-and-multisample-fetches-with-offsets)).
+
+- `StructuredIr/MeshShaderInfo.cs`, `CodeGen/Spirv/SpirvMeshEntry.cs`, `IGpuAccessor.cs` (`QueryMeshShaderTopology`) and `Spv.Generator/spirv.cs` (the `PrimitivePointIndicesEXT`, `PrimitiveLineIndicesEXT` and `CullPrimitiveEXT` builtins): mesh programs that output points, with their point size ([Point mesh programs had no mesh layout](../../../docs/reference/shaders.md#point-mesh-programs-had-no-mesh-layout)). Both after findings of Swap2-Native (MIT), written anew.
+
 nx2android (https://github.com/shirai91/nx2android, by Tung Pham) is MIT-licensed, as nxnative it is based on (its `README.md`, `nxnative/LICENSE`).
 
 The shader translation tool in `dm/gfx/tools/dmsh_xlate` references them to translate the original Switch shaders to SPIR-V.

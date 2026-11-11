@@ -1,11 +1,13 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 // FSR 1 EASU in place of a game's neural upscaler dispatch (vka_draw.c, DM_VK_NDSR=2): the game's input texture scaled to its output image (or, with RCAS on,
-// to the replay's intermediate image), one output pixel per invocation. Both are the game's B10G11R11 float images
+// to the replay's intermediate image), one output pixel per invocation. The store and its variants: ndsr_out.h. KERNEL (specialization constant 1): 0 EASU,
+// 1 a bilinear sample, 2 the nearest texel (DM_VK_NDSR 1 and 3 for an input a blit cannot take as it is)
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D tex;
-layout(set = 0, binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
 layout(push_constant) uniform P { uvec4 con0, con1, con2, con3; uvec2 size; } pc;
+layout(constant_id = 1) const int KERNEL = 0;
+#include "ndsr_out.h"
 #define A_GPU 1
 #define A_GLSL 1
 #include "ffx_a.h"
@@ -18,6 +20,10 @@ void main() {
     uvec2 p = gl_GlobalInvocationID.xy;
     if (any(greaterThanEqual(p, pc.size))) return;
     AF3 c;
-    FsrEasuF(c, p, pc.con0, pc.con1, pc.con2, pc.con3);
-    imageStore(dst, ivec2(p), vec4(c, 1.0));
+    if (KERNEL == 0) FsrEasuF(c, p, pc.con0, pc.con1, pc.con2, pc.con3);
+    else {   // con0.xy: input size / output size (FsrEasuCon)
+        vec2 q = (vec2(p) + 0.5) * uintBitsToFloat(pc.con0.xy);
+        c = KERNEL == 1 ? textureLod(tex, q / vec2(textureSize(tex, 0)), 0.0).rgb : texelFetch(tex, clamp(ivec2(q), ivec2(0), textureSize(tex, 0) - 1), 0).rgb;
+    }
+    ndsr_store(ivec2(p), c);
 }

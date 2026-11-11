@@ -31,6 +31,9 @@ MODEL_TASK, MODEL_MESH = 5364, 5365
 MODE_LOCAL_SIZE, MODE_OUTPUT_VERTICES, MODE_OUTPUT_PRIMITIVES, MODE_OUTPUT_TRIANGLES = 17, 26, 5270, 5298
 DEC_SPEC_ID, DEC_BUILTIN, DEC_LOCATION, DEC_PER_PRIMITIVE = 1, 11, 30, 5271
 BUILTIN_PRIMITIVE_TRIANGLE_INDICES = 5296
+BUILTIN_POINT_SIZE, BUILTIN_PRIMITIVE_POINT_INDICES, BUILTIN_CULL_PRIMITIVE = 1, 5294, 5299
+MODE_OUTPUT_POINTS = 27
+OP_MEMBER_DECORATE = 72
 SC_TASK_PAYLOAD = 5402
 
 
@@ -120,6 +123,40 @@ class Mesh(unittest.TestCase):
         (_, ops), _ = self.translate(program(stage(STAGE_LOAD, HEADER, rd=1), stage(STAGE_STORE, PLANES, rb=1), stage(STAGE_STORE, COUNTS, rb=RZ, imm=3)),
                                      stage='ms', local=[32, 1, 1], mesh=[32, 16, 128, 0, 1, 2, 3])
         self.assertFalse([v for v in ops[OP_VARIABLE] if v[2] == SC_TASK_PAYLOAD])
+
+    # A point mesh, as Ocarina of Time's foliage depth meshes (28f82c129deea140): the point size in plane 0 (code 132, before position), position, one index byte per
+    # point at 4 + t (mesh_topology 1)
+    POINTS = program(stage(STAGE_LOAD, HEADER, rd=1), *[stage(STAGE_STORE, PLANES, rb=1, imm=0x80 * p) for p in range(5)],
+                     stage(STAGE_STORE, INDICES, rb=RZ, imm=4), stage(STAGE_STORE, COUNTS, rb=1, imm=3))
+
+    def test_point_mesh(self):
+        (_, ops), res = self.translate(self.POINTS, stage='ms', local=[32, 1, 1], mesh=[32, 32, 128, 132, 0, 1, 2, 3], mesh_topology=1)
+        ep = ops[OP_ENTRY_POINT][0]
+        modes = {m[1]: m[2:] for m in ops[OP_EXECUTION_MODE] if m[0] == ep[1]}
+        self.assertIn(MODE_OUTPUT_POINTS, modes)
+        self.assertNotIn(MODE_OUTPUT_TRIANGLES, modes)
+        builtins = [dc[2] for dc in ops[OP_DECORATE] if dc[1] == DEC_BUILTIN]
+        self.assertIn(BUILTIN_PRIMITIVE_POINT_INDICES, builtins)
+        self.assertIn(BUILTIN_CULL_PRIMITIVE, builtins)   # points past the program's count are culled (a point cannot be degenerate)
+        self.assertNotIn(BUILTIN_PRIMITIVE_TRIANGLE_INDICES, builtins)
+        self.assertIn(BUILTIN_POINT_SIZE, [md[3] for md in ops[OP_MEMBER_DECORATE] if md[2] == DEC_BUILTIN])
+        self.assertEqual(res['mesh']['vertex_locations'], [])   # the point size is no generic location
+
+    def test_position_invariant_under_relaxed_precision(self):   # as the vertex stages' gl_Position: a prepass and an EQUAL pass must agree on it
+        DEC_INVARIANT = 18
+        for reduced in (True, False):
+            (_, ops), _ = self.translate(self.MESH, stage='ms', local=[32, 1, 1], mesh=self.MESH_LAYOUT, reduced=reduced)
+            self.assertEqual(any(md[1:3] == [0, DEC_INVARIANT] for md in ops.get(OP_MEMBER_DECORATE, [])), reduced)
+
+    def test_triangle_mesh_has_no_point_size(self):
+        (_, ops), _ = self.translate(self.MESH, stage='ms', local=[32, 1, 1], mesh=self.MESH_LAYOUT)
+        self.assertNotIn(BUILTIN_POINT_SIZE, [md[3] for md in ops.get(OP_MEMBER_DECORATE, []) if md[2] == DEC_BUILTIN])
+
+    def test_refused_points_without_point_size(self):
+        self.refused(self.POINTS, 'point mesh program without a point size plane', stage='ms', local=[32, 1, 1], mesh=[32, 32, 128, 0, 1, 2, 3], mesh_topology=1)
+
+    def test_refused_lines(self):
+        self.refused(self.POINTS, '2 vertices per primitive', stage='ms', local=[32, 1, 1], mesh=[32, 32, 128, 132, 0, 1, 2, 3], mesh_topology=2)
 
     def test_refused_mode(self):
         self.refused(program(stage(STAGE_STORE, 0x9800, rb=0)), 'stage memory mode 0x9800', stage='ms', local=[32, 1, 1], mesh=[32, 16, 128, 0, 1, 2, 3])

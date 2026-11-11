@@ -34,6 +34,8 @@ A Switch 2 game: update v65536 over the base game, SDK 21.4.4 built for the Swit
 
 ## Android
 
+Game resolution (launcher, 2026-11-10): the profile's `graphics_scale` rows map Phone 1440p to console scale 1 (2560x1440, the size the AYN Thor measured in console mode), Phone 1080p to handheld scale 0 (1920x1080) and Phone 720p to handheld scale 2 (1280x720); Original sets nothing (the game's own, console). Phone 540p and 480p take the smallest row, 1280x720 (the launcher gives a size without a row the largest row that fits in it, else the smallest; `Profile.resolutionEnv`). Open: a phone run of each choice. Live from the in-game panel (2026-11-10, by disassembly): the game turns on the graphics scale change notification in `nnMain` (`main+0xfd8c84`), and its notification handler (the framework Ocarina of Time has) takes message 300 to `oe::GetCurrentGraphicsScale` (`main+0x3e91528`), so the panel's Resolution row changes the size while the game runs ([Graphics scale changes while the game runs](../../../docs/reference/services.md#graphics-scale-changes-while-the-game-runs-message-300); phone check open).
+
 Not yet run on Android. The profile, its tables and this note come from upstream nxnative (bd979ced); what the Android path needs of upstream's fixes:
 
 | Upstream entry | Upstream commit | On Android |
@@ -78,6 +80,8 @@ The work folder's `run/drive.sh <name> <secs> "<sec> <control line>"…` boots i
 
 ## Found on this game
 
+- [Graphics scale changes while the game runs (message 300)](../../../docs/reference/services.md#graphics-scale-changes-while-the-game-runs-message-300): its notification handler re-reads the scale on message 300 ([Android](#android)); phone check open.
+- [A game whose speed follows its present interval runs slow when frames come late](../../../docs/reference/frame-rate.md#a-game-whose-speed-follows-its-present-interval-runs-slow-when-frames-come-late): the rewriter finds sead's frame-rate controller here (`main+0x3df0e28`, `sdiv w2, w8, w20`, the controller in x0) and leaves it as it is: the profile has no `fps_decouple sead`. Open: whether the game steps by that rate (needs a phone check, which this game does not get).
 - [Prepare stays at 1 % while it rewrites the code](../../../docs/reference/packing.md#prepare-stays-at-1--while-it-rewrites-the-code): resolved, the rewriter's progress lines; its `main` (41 MB, one worker) measured the phases' shares.
 - [Naming the shaders of a GPU fault](https://github.com/seedds/nxnative/blob/main/docs/reference/rendering.md#naming-the-shaders-of-a-gpu-fault): added for the address fault above, which names no pass.
 - [Compatible views for a mismatched declared texture type](../../../docs/reference/rendering.md#compatible-views-for-a-mismatched-declared-texture-type): resolved, a cube in a cube array slot. `d0ce73e71074df85_b` (NigoProc, layer index a literal 0) read texture ID 428 as `texture type mismatch … declares slot 0 as Metal type 6, … is type 5`, 180 binds at frame 0 and none after. With the view the count is 0. The opening looks the same, though the two runs are not frame-aligned, so no pixel comparison was possible.

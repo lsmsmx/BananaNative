@@ -16,8 +16,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
     //   task (TaskEXT): before the body the task memory's word 1 (mesh workgroups to launch) is 0; after it OpEmitMeshTasksEXT(word 1, 1, 1, payload) ends every
     //     invocation (switch2mac also cleared word 0, which a mesh workgroup reads as its own index: InstEmitAmpereMesh.cs)
     //   mesh (MeshEXT): OpSetMeshOutputsEXT(max vertices, max primitives) first (no output is written before it), then the plane copy's defaults set (below), the
-    //     body (its plane stores go to the plane copy, MeshPlaneStore below), then every triangle's indices from the primitive area: the program's indices (each
-    //     clamped below max vertices) for t below the primitive count (byte 3), (0, 0, 0), a degenerate triangle, from there to max primitives; then each invocation
+    //     body (its plane stores go to the plane copy, MeshPlaneStore below), then every primitive's indices from the primitive area: the program's indices (each
+    //     clamped below max vertices) for t below the primitive count (byte 3); from there to max primitives a triangle is (0, 0, 0), degenerate, and a point (which
+    //     cannot be degenerate) is index 0 with CullPrimitiveEXT set (MeshShaderInfo.PrimitiveVertices: 3 triangles, 1 points); then each invocation
     //     copies its own vertices and primitives (lid, lid + threads, ...) from the plane copy to the outputs, one vec4 per output, with a GL depth constant
     //     (MeshShaderInfo.GlDepthSpecId) z' = z / 2 + w / 2 of every vertex when it is true, as vk_android_spv.gl_depth does a vertex shader's
     // The plane copy: one workgroup u32 array per side, word v x planes + n for vertex v's plane n (MeshShaderInfo.Planes order; the per-primitive values the same),
@@ -27,8 +28,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
     // of memory on it once the lane was not constant (docs/reference/shaders.md, "Mesh plane stores into outputs exhaust Qualcomm's compiler"). The copy takes
     // 4 x (max vertices x planes + max primitives x values) bytes of workgroup memory; a program for which it and its own shared memory and payload exceed
     // MeshSharedBudget keeps the direct stores (MeshPlaneStore's old form, with the z / w copy for the GL depth rewrite)
-    // Outputs: the position in a per-vertex block array (BuiltIn Position), one vec4 array per per-vertex generic location at Location g (as this translator's vertex
-    // shaders number theirs), one vec4 array per per-primitive location at Location g decorated PerPrimitiveEXT, PrimitiveTriangleIndicesEXT uvec3[max primitives].
+    // Outputs: the position in a per-vertex block array (BuiltIn Position, Invariant under relaxed precision, then BuiltIn PointSize when the planes have the point size), one vec4 array per per-vertex generic location at Location g (as this translator's vertex
+    // shaders number theirs), one vec4 array per per-primitive location at Location g decorated PerPrimitiveEXT, PrimitiveTriangleIndicesEXT uvec3[max primitives]
+    // (points: PrimitivePointIndicesEXT uint[max primitives] and CullPrimitiveEXT bool[max primitives], OutputPoints).
     // SPIR-V 1.4: the entry point lists every global variable.
     // Dropped from switch2mac's Metal path: the per-vertex outputs at every location 0-5 whether written or not (Metal refused a mesh pipeline missing a fragment
     // input; here only the layout's padded locations are added), the 1024 mesh workgroup bound of a Metal object function (here 65535, Vulkan's
@@ -81,14 +83,26 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             SpvInstruction pWg = context.TypePointer(StorageClass.Workgroup, tU32);
             SpvInstruction pOutF32 = context.TypePointer(StorageClass.Output, tF32), pOutVec4 = context.TypePointer(StorageClass.Output, tVec4);
 
-            SpvInstruction posVar = null, idxVar = null;
+            SpvInstruction posVar = null, idxVar = null, cullVar = null;
+            bool points = mesh.Points;
+            bool pointSize = mesh.IsMesh && mesh.Planes.Contains(MeshShaderInfo.PointSizePlane);
             Dictionary<int, SpvInstruction> generics = new(), primGenerics = new();
 
             if (mesh.IsMesh)
             {
-                SpvInstruction perVertex = context.TypeStruct(true, tVec4);
+                SpvInstruction perVertex = pointSize ? context.TypeStruct(true, tVec4, tF32) : context.TypeStruct(true, tVec4);
                 context.Decorate(perVertex, Decoration.Block);
                 context.MemberDecorate(perVertex, 0, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.Position);
+                // Invariant under relaxed precision, as the vertex stages' gl_Position (Declarations.cs): a mesh program and another that computes the same position
+                // (a depth prepass, then a pass that tests EQUAL against it) must get the same value, which relaxed precision does not promise otherwise
+                if (context.HostCapabilities.ReducedPrecision)
+                {
+                    context.MemberDecorate(perVertex, 0, Decoration.Invariant);
+                }
+                if (pointSize)
+                {
+                    context.MemberDecorate(perVertex, 1, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.PointSize);
+                }
                 posVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(perVertex, U((uint)mesh.MaxVertices))), StorageClass.Output);
                 context.Name(posVar, "mesh_position");
                 context.AddGlobalVariable(posVar);
@@ -115,10 +129,19 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     io.Add(v);
                 }
 
-                idxVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(tUVec3, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
-                context.Decorate(idxVar, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.PrimitiveTriangleIndicesEXT);
+                idxVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(points ? tU32 : tUVec3, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
+                context.Decorate(idxVar, Decoration.BuiltIn, (SpvLiteralInteger)(points ? BuiltIn.PrimitivePointIndicesEXT : BuiltIn.PrimitiveTriangleIndicesEXT));
                 context.AddGlobalVariable(idxVar);
                 io.Add(idxVar);
+
+                if (points)
+                {
+                    cullVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(tBool, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
+                    context.Decorate(cullVar, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.CullPrimitiveEXT);
+                    context.Decorate(cullVar, Decoration.PerPrimitiveEXT);
+                    context.AddGlobalVariable(cullVar);
+                    io.Add(cullVar);
+                }
             }
 
             SpvInstruction glDepth = null;
@@ -302,6 +325,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
                 ForEach(lid, mesh.MaxPrimitives, t =>
                 {
+                    if (points)
+                    {
+                        SpvInstruction used = context.ULessThan(tBool, t, primCount);
+                        SpvInstruction at = context.IAdd(tU32, t, U(4));
+                        context.Store(context.AccessChain(context.TypePointer(StorageClass.Output, tU32), idxVar, t), context.Select(tU32, used, Index(at), U(0)));
+                        context.Store(context.AccessChain(context.TypePointer(StorageClass.Output, tBool), cullVar, t), context.LogicalNot(tBool, used));
+                        return;
+                    }
+
                     SpvInstruction a = context.IAdd(tU32, context.IMul(tU32, t, U(3)), U(4));
                     SpvInstruction tri = context.CompositeConstruct(tUVec3, Index(a), Index(context.IAdd(tU32, a, U(1))), Index(context.IAdd(tU32, a, U(2))));
                     tri = context.Select(tUVec3, context.ULessThan(tBool, t, primCount), tri, context.ConstantComposite(tUVec3, U(0), U(0), U(0)));
@@ -357,6 +389,11 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                         }
 
                         context.Store(context.AccessChain(pOutVec4, posVar, v, U(0)), pos);
+                        if (pointSize)
+                        {
+                            context.Store(context.AccessChain(pOutF32, posVar, v, U(1)), Component(vertexCopy, mesh.Planes, b, MeshShaderInfo.PointSizePlane));
+                        }
+
                         foreach ((int g, SpvInstruction output) in generics)
                         {
                             context.Store(context.AccessChain(pOutVec4, output, v), Vec4(vertexCopy, mesh.Planes, b, 4 + 4 * g));
@@ -438,7 +475,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 {
                     Guarded(isVertex, () => Scatter(word, mesh.VertexChunkWords, mesh.MaxVertices, mesh.Planes, (v, plane) =>
                     {
-                        context.Store(plane < 4
+                        context.Store(plane == MeshShaderInfo.PointSizePlane
+                            ? context.AccessChain(pOutF32, posVar, v, U(1))
+                            : plane < 4
                             ? context.AccessChain(pOutF32, posVar, v, U(0), U((uint)plane))
                             : context.AccessChain(pOutF32, generics[(plane - 4) >> 2], v, U((uint)(plane & 3))), f);
 
@@ -480,7 +519,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             {
                 context.AddExecutionMode(wrapper, ExecutionMode.OutputVertices, (SpvLiteralInteger)mesh.MaxVertices);
                 context.AddExecutionMode(wrapper, ExecutionMode.OutputPrimitivesEXT, (SpvLiteralInteger)mesh.MaxPrimitives);
-                context.AddExecutionMode(wrapper, ExecutionMode.OutputTrianglesEXT);
+                context.AddExecutionMode(wrapper, points ? ExecutionMode.OutputPoints : ExecutionMode.OutputTrianglesEXT);
             }
         }
     }

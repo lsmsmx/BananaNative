@@ -201,6 +201,7 @@ final class Job {
             o.remove("go_on");
             o.remove("error_detail");
             o.remove("fix");
+            o.remove("fail_apk");
         } catch (JSONException e) {
             throw new IllegalStateException(e);
         }
@@ -213,6 +214,30 @@ final class Job {
             o.put("error_detail", f.detail).put("fix", f.fix);
         } catch (JSONException e) {
             throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * The install of this app a FIX_UPDATE failure happened under (PackService: the package's lastUpdateTime). The card offers no Retry while the same install is
+     * there; after another (a fixed build may keep every chain version apkChanged compares) it offers Retry again
+     */
+    synchronized void failApk(long installed) {
+        try {
+            o.put("fail_apk", installed);
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Whether this job failed because this very app build is broken (PrepareText.FIX_UPDATE) and the app has not been installed again since */
+    synchronized boolean brokenApk(long installed) { return "failed".equals(state()) && PrepareText.FIX_UPDATE.equals(fix()) && o.optLong("fail_apk", -1) == installed; }
+
+    /** The app's install time (lastUpdateTime: a new one at every install, even of the same version), -1 when it cannot be read */
+    static long installed(android.content.Context c) {
+        try {
+            return c.getPackageManager().getPackageInfo(c.getPackageName(), 0).lastUpdateTime;
+        } catch (Exception e) {
+            return -1;
         }
     }
 

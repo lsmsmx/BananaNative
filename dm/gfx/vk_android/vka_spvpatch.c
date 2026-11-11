@@ -1009,3 +1009,191 @@ out:
     free(loc); free(ty); free(ptee); free(cval); free(isc); free(var);
     return rc;
 }
+
+// vka_spv_pool_fb: texture-use feedback for the texture pool. A shader whose texture handle the translator could not trace to a slot reads the NVN texture pool, the
+// update-after-bind sampled-image array at set 1 binding 0 (dmsh_abi_vk.h DMSH_VK_POOL_TEX_BINDING), at the handle's texture ID: agl / gsys lit materials read their
+// lightmaps that way, from a handle in a material record in a storage buffer. The host cannot see those IDs (no draw binds them), so it could only make an image for every
+// registered texture (DM_VK_EAGER_TEX=1: Ocarina of Time's 6,000 images, issue #97) or for none (the lightmaps read 0: black walls). With this rewrite the GPU says which:
+// before each access chain into the pool it loads word id >> 5 of a storage buffer (set `fb_set` binding `fb_binding`, a Block of uint words) and, when bit id & 31 is
+// clear, sets it with an atomic OR; vka_tex.c reads the bits back after each submission and makes the images of the IDs read. The same index read again in the same block
+// gets no second test. In a loop header block (whose first instructions must stay the header's) the atomic OR is done without the test. The idea and the bitmap's layout
+// follow Anka Native's texture-use feedback (MIT, copyright 2026 seedds and 2026 EddizEge: vk_android_spv.py tex_feedback), which rewrites the library's modules at build time; here
+// the replay rewrites them at pipeline time, so no library changes. A pixel shader with a store loses its early depth test (its stores must not happen for fragments the
+// test would kill): VKA_PFB_EARLY adds EarlyFragmentTests where that gives the same result, which the module decides here (no discard, demote or terminate, no depth, sample
+// mask or stencil export, no other memory write; or one discard, the alpha test's under the alpha_spec constant, which the pipeline turns off) except for alpha to coverage
+// and the alpha test, which the pipeline decides (vka_tex.c vka_tex_pfb_module gives a pipeline that needs late tests the module without the mode)
+enum { PF_BitwiseAnd = 199, PF_ShiftRightLogical = 194, PF_ShiftLeftLogical = 196, PF_AtomicOr = 241, PF_Demote = 5380, PF_EarlyFragmentTests = 9, PF_DepthReplacing = 12,
+       PF_BISampleMask = 20, PF_BIFragDepth = 22, PF_BIStencilRef = 5014, PF_Fragment = 4, PF_GLCompute = 5 };
+// Word k of an instruction of opcode op (length len) is a literal, not an id, in the instructions a function body has that carry literals among ids (others: none)
+static int pf_lit(uint32_t op, uint32_t k) {
+    switch (op) {
+    case OpExtInst: return k == 4;
+    case OpLoad: return k >= 4;
+    case OpStore: return k >= 3;
+    case 79: return k >= 5;                         // OpVectorShuffle: its components
+    case 81: return k >= 4;                         // OpCompositeExtract: its indices
+    case 82: return k >= 5;                         // OpCompositeInsert
+    case OpSelectionMerge: return k == 2;
+    case OpLoopMerge: return k >= 3;
+    case OpBranchConditional: return k >= 4;        // branch weights
+    case OpSwitch: return k >= 3 && !((k - 3) & 1);
+    case 87: case 88: case 91: case 92: case 95: case 98: return k == 5;   // image operands' mask (the operands after it are ids)
+    case 89: case 90: case 93: case 94: case 96: case 97: return k == 6;
+    default: return 0;
+    }
+}
+static int pf_mem_write(uint32_t op) { return op == OpStore || op == OpCopyMemory || op == OpCopyMemorySized || (op >= 228 && op <= 242) || op == 5614 || op == 5615 || op == 6035; }
+static int pf_pass(const uint32_t *w, size_t nw, uint32_t set, uint32_t tex_binding, uint32_t fb_set, uint32_t fb_binding, unsigned flags, uint32_t alpha_spec, const uint32_t *last, uint32_t *rec, vec_t *o,
+                   int *sites, int *early, char *err, size_t errn) {
+#define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
+    uint32_t bound = w[3], nb = bound;
+    uint32_t *psc = calloc(bound, 4), *rt = calloc(bound, 4), *dset = malloc(bound * 4), *dbind = malloc(bound * 4), *ity = calloc(bound, 4), *bi = calloc(bound, 4), *vsc = calloc(bound, 4);
+    uint8_t *pool = calloc(bound, 1);
+    if (!psc || !rt || !dset || !dbind || !ity || !bi || !vsc || !pool) FAIL("out of memory");
+    memset(dset, 0xff, bound * 4); memset(dbind, 0xff, bound * 4);
+    uint32_t t_u32 = 0, t_bool = 0, p_uni_u32 = 0, model = UINT32_MAX;
+    const uint32_t scb = w[1] >= 0x10300 ? SCStorageBuffer : SCUniform, blk = w[1] >= 0x10300 ? 2u : DecBufferBlock;   // (1.3 on: StorageBuffer and Block; before: Uniform and BufferBlock)
+    int vtx = 0, kill = 0, mem_writes = 0, has_early = 0, depth_mode = 0, nsites = 0, aspec = 0;
+    size_t first_fn = nw, first_annot = nw, last_ep = nw;
+    for (size_t i = 5; i < nw;) {   // what the rewrite needs: types, the pool's variables, the sites, and whether a pixel shader's tests can run early
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) FAIL("bad instruction at word %zu", i);
+        if (op == OpEntryPoint && len >= 3) { last_ep = i; if (model == UINT32_MAX) model = w[i + 1]; else if (model != w[i + 1]) FAIL("entry points of two execution models"); if (w[i + 1] >= 1 && w[i + 1] <= 3) vtx = 1; if (w[i + 1] == 0) vtx = 1; }
+        else if (op == OpExecutionMode && len >= 3) { if (w[i + 2] == PF_EarlyFragmentTests) has_early = 1; if (w[i + 2] == PF_DepthReplacing || (w[i + 2] >= 14 && w[i + 2] <= 16)) depth_mode = 1; }
+        else if (op == OpDecorate && len >= 4 && w[i + 1] < bound) {
+            if (w[i + 2] == DecDescriptorSet) dset[w[i + 1]] = w[i + 3];
+            else if (w[i + 2] == DecBinding) dbind[w[i + 1]] = w[i + 3];
+            else if (w[i + 2] == DecBuiltIn) bi[w[i + 1]] = w[i + 3] + 1;
+            else if (w[i + 2] == DecSpecId && w[i + 3] == alpha_spec) aspec = 1;
+        }
+        else if (op == OpTypeInt && len >= 4 && w[i + 1] < bound) { ity[w[i + 1]] = w[i + 2] | (w[i + 3] ? 0x100u : 0); if (w[i + 2] == 32 && !w[i + 3] && !t_u32) t_u32 = w[i + 1]; }
+        else if (op == OpTypeBool && len >= 2 && !t_bool) t_bool = w[i + 1];
+        else if ((op == OpTypePointer || op == OpTypeForwardPointer) && len >= 3 && w[i + 1] < bound) {
+            psc[w[i + 1]] = w[i + 2] + 1;
+            if (op == OpTypePointer && len >= 4 && w[i + 2] == scb && w[i + 3] && w[i + 3] == t_u32 && !p_uni_u32) p_uni_u32 = w[i + 1];
+        }
+        else if (op == OpVariable && len >= 4 && w[i + 2] < bound) { rt[w[i + 2]] = w[i + 1]; vsc[w[i + 2]] = w[i + 3] + 1; if (dset[w[i + 2]] == set && dbind[w[i + 2]] == tex_binding) pool[w[i + 2]] = 1; }
+        else if ((op == OpConstant || op == OpSpecConstant || op == OpConstantNull || op == OpUndef) && len >= 3 && w[i + 2] < bound) rt[w[i + 2]] = w[i + 1];
+        if (is_annot(op) && first_annot == nw) first_annot = i;
+        if (op == OpFunction && first_fn == nw) first_fn = i;
+        if (first_fn < nw) {   // a function's body
+            if (op == OpKill || op == OpTerminateInvocation || op == PF_Demote) kill++;
+            if (op == OpImageWrite) mem_writes = 1;
+            else if (pf_mem_write(op) && len >= 2) { uint32_t p = op == OpStore || op == OpCopyMemory || op == OpCopyMemorySized || op == 228 ? w[i + 1] : len >= 4 ? w[i + 3] : 0;
+                uint32_t sc = p < bound && rt[p] < bound && psc[rt[p]] ? psc[rt[p]] - 1 : SCUniform;   // (a pointer of unknown class: counted as memory)
+                if (sc_mem(sc)) mem_writes = 1; }
+            if (!no_result(op) && op != OpLabel && op != OpFunction && len >= 3 && w[i + 2] < bound) rt[w[i + 2]] = w[i + 1];
+            else if (op == OpFunction && len >= 3 && w[i + 2] < bound) rt[w[i + 2]] = w[i + 1];
+            int site = (op == OpAccessChain || op == OpInBoundsAccessChain) && len >= 4 && w[i + 3] < bound && pool[w[i + 3]];
+            if (site) {
+                if (len != 5) FAIL("a texture pool access chain with %u indices", len - 4);
+                uint32_t x = w[i + 4], t = x < bound ? rt[x] : 0;
+                if (!t || t >= bound || (ity[t] & 0xff) != 32) FAIL("a texture pool index that is not a 32-bit integer");
+                nsites++;
+            }
+            for (uint32_t k = 1; k < len; k++) if (w[i + k] < bound && pool[w[i + k]] && !(site && k == 3) && !pf_lit(op, k)) FAIL("the texture pool used by opcode %u, not a one-index access chain", op);
+        }
+        i += len;
+    }
+    if (!nsites) { free(psc); free(rt); free(dset); free(dbind); free(ity); free(bi); free(vsc); free(pool); return 0; }
+    if (model == UINT32_MAX || first_fn == nw) FAIL("no entry point or function");
+    if (vtx && !(flags & VKA_PFB_VTX_STORES)) FAIL("a vertex-pipeline stage on a device without vertexPipelineStoresAndAtomics");
+    int exports = depth_mode;
+    for (uint32_t id = 1; id < bound; id++) if (bi[id] && vsc[id] == SCOutput + 1 && (bi[id] - 1 == PF_BIFragDepth || bi[id] - 1 == PF_BISampleMask || bi[id] - 1 == PF_BIStencilRef)) exports = 1;
+    // Early tests give the result late ones do: kind 1 always, kind 2 when the alpha test is off (its one discard, under the alpha_spec constant, the only one), 0 never
+    int kind = model != PF_Fragment || has_early || exports || mem_writes ? 0 : !kill ? 1 : kill == 1 && aspec ? 2 : 0;
+    int add_early = (flags & VKA_PFB_EARLY) && kind;
+    if (first_annot > first_fn) first_annot = first_fn;
+    // New ids, in the same order in both passes: missing types, the buffer's types and variable, the constants; then each site's
+    uint32_t mk_u32 = t_u32 ? 0 : nb++, mk_bool = t_bool ? 0 : nb++; if (!t_u32) t_u32 = mk_u32; if (!t_bool) t_bool = mk_bool;
+    uint32_t mk_pu = p_uni_u32 && !mk_u32 ? 0 : nb++; if (mk_pu) p_uni_u32 = mk_pu;
+    uint32_t rta = nb++, st = nb++, pst = nb++, fbv = nb++, c0 = nb++, c1 = nb++, c5 = nb++, c31 = nb++, cmask = nb++;
+    if (!put_n(o, w, 5)) FAIL("out of memory");
+    uint32_t cur = 0, cur_orig = 0, done[16]; int ndone = 0, in_fn = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16; const uint32_t *in = w + i;
+        if (op == OpEntryPoint && w[1] >= 0x10400) {   // SPIR-V 1.4 on: every global variable the entry point uses is in its interface
+            if (!put(o, (len + 1) << 16 | OpEntryPoint) || !put_n(o, in + 1, len - 1) || !put(o, fbv)) FAIL("out of memory");
+            if (i == last_ep && add_early) { uint32_t x[] = {3u << 16 | OpExecutionMode, in[2], PF_EarlyFragmentTests}; if (!put_n(o, x, 3)) FAIL("out of memory"); }
+            i += len; continue;
+        }
+        if (i == first_annot) {
+            uint32_t x[] = {4u << 16 | OpDecorate, rta, DecArrayStride, 4, 3u << 16 | OpDecorate, st, blk, 5u << 16 | OpMemberDecorate, st, 0, DecOffset, 0,
+                            4u << 16 | OpDecorate, fbv, DecDescriptorSet, fb_set, 4u << 16 | OpDecorate, fbv, DecBinding, fb_binding};
+            if (!put_n(o, x, sizeof x / 4)) FAIL("out of memory");
+        }
+        if (i == first_fn) {
+            if (mk_u32) { uint32_t x[] = {4u << 16 | OpTypeInt, mk_u32, 32, 0}; if (!put_n(o, x, 4)) FAIL("out of memory"); }
+            if (mk_bool) { uint32_t x[] = {2u << 16 | OpTypeBool, mk_bool}; if (!put_n(o, x, 2)) FAIL("out of memory"); }
+            if (mk_pu) { uint32_t x[] = {4u << 16 | OpTypePointer, mk_pu, scb, t_u32}; if (!put_n(o, x, 4)) FAIL("out of memory"); }
+            uint32_t x[] = {3u << 16 | OpTypeRuntimeArray, rta, t_u32, 3u << 16 | OpTypeStruct, st, rta, 4u << 16 | OpTypePointer, pst, scb, st,
+                            4u << 16 | OpVariable, pst, fbv, scb, 4u << 16 | OpConstant, t_u32, c0, 0, 4u << 16 | OpConstant, t_u32, c1, 1,
+                            4u << 16 | OpConstant, t_u32, c5, 5, 4u << 16 | OpConstant, t_u32, c31, 31, 4u << 16 | OpConstant, t_u32, cmask, 0xFFFFFu};
+            if (!put_n(o, x, sizeof x / 4)) FAIL("out of memory");
+        }
+        if (op == OpFunction) in_fn = 1;
+        else if (op == OpFunctionEnd) in_fn = 0;
+        if (op == OpEntryPoint && i == last_ep && add_early) {   // (before 1.4: the mode after the last entry point)
+            if (!put_n(o, in, len)) FAIL("out of memory");
+            uint32_t x[] = {3u << 16 | OpExecutionMode, in[2], PF_EarlyFragmentTests}; if (!put_n(o, x, 3)) FAIL("out of memory");
+            i += len; continue;
+        }
+        if (op == OpLabel) { cur = cur_orig = in[1]; ndone = 0; if (!put_n(o, in, len)) FAIL("out of memory"); i += len; continue; }
+        if (op == OpPhi && last) {   // a parent block that was split ends in its last piece
+            if (!put_n(o, in, 3)) FAIL("out of memory");
+            for (uint32_t k = 3; k + 1 < len; k += 2) { uint32_t par = in[k + 1]; if (!put(o, in[k]) || !put(o, par < bound && last[par] ? last[par] : par)) FAIL("out of memory"); }
+            i += len; continue;
+        }
+        if (in_fn && (op == OpAccessChain || op == OpInBoundsAccessChain) && len == 5 && in[3] < bound && pool[in[3]]) {
+            uint32_t x = in[4]; int seen = 0;
+            for (int k = 0; k < ndone; k++) if (done[k] == x) seen = 1;
+            if (!seen) {
+                if (ndone < 16) done[ndone++] = x;
+                (*sites)++;
+                int header = 0;
+                for (size_t j = i; j < nw;) { uint32_t oj = w[j] & 0xffff; if (oj == OpLoopMerge) header = 1; if (is_term(oj)) break; j += w[j] >> 16; }
+                uint32_t iu = x;
+                if (rt[x] != t_u32) { iu = nb++; uint32_t y[] = {4u << 16 | OpBitcast, t_u32, iu, x}; if (!put_n(o, y, 4)) FAIL("out of memory"); }
+                uint32_t m = nb++, wi = nb++, bt = nb++, bit = nb++, p = nb++;
+                uint32_t y[] = {5u << 16 | PF_BitwiseAnd, t_u32, m, iu, cmask, 5u << 16 | PF_ShiftRightLogical, t_u32, wi, m, c5, 5u << 16 | PF_BitwiseAnd, t_u32, bt, m, c31,
+                                5u << 16 | PF_ShiftLeftLogical, t_u32, bit, c1, bt, 6u << 16 | OpAccessChain, p_uni_u32, p, fbv, c0, wi};
+                if (!put_n(o, y, sizeof y / 4)) FAIL("out of memory");
+                if (header) { uint32_t r = nb++, z[] = {7u << 16 | PF_AtomicOr, t_u32, r, p, c1, c0, bit}; if (!put_n(o, z, 7)) FAIL("out of memory"); }   // (scope Device, semantics None)
+                else {
+                    uint32_t old = nb++, has = nb++, clr = nb++, a = nb++, l = nb++, r = nb++;
+                    uint32_t z[] = {4u << 16 | OpLoad, t_u32, old, p, 5u << 16 | PF_BitwiseAnd, t_u32, has, old, bit, 5u << 16 | OpIEqual, t_bool, clr, has, c0,
+                                    3u << 16 | OpSelectionMerge, l, 0, 4u << 16 | OpBranchConditional, clr, a, l, 2u << 16 | OpLabel, a,
+                                    7u << 16 | PF_AtomicOr, t_u32, r, p, c1, c0, bit, 2u << 16 | OpBranch, l, 2u << 16 | OpLabel, l};
+                    if (!put_n(o, z, sizeof z / 4)) FAIL("out of memory");
+                    cur = l; if (rec && cur_orig < bound) rec[cur_orig] = l;
+                }
+            }
+        }
+        if (!put_n(o, in, len)) FAIL("out of memory");
+        i += len;
+    }
+    (void)cur;
+    o->w[3] = nb;
+    if (early) *early = add_early ? kind : 0;
+    free(psc); free(rt); free(dset); free(dbind); free(ity); free(bi); free(vsc); free(pool);
+    return 1;
+fail:
+    free(psc); free(rt); free(dset); free(dbind); free(ity); free(bi); free(vsc); free(pool);
+    return -1;
+#undef FAIL
+}
+uint32_t *vka_spv_pool_fb(const uint32_t *w, size_t nw, uint32_t set, uint32_t tex_binding, uint32_t fb_set, uint32_t fb_binding, unsigned flags, uint32_t alpha_spec, size_t *out_nw, int *sites, int *early, char *err, size_t errn) {
+    int s0 = 0, e0 = 0; if (!sites) sites = &s0; if (!early) early = &e0;
+    *sites = 0; *early = 0; if (errn) err[0] = 0;
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    uint32_t *rec = calloc(w[3], 4); vec_t o = {0};
+    if (!rec) { snprintf(err, errn, "out of memory"); return NULL; }
+    int r = pf_pass(w, nw, set, tex_binding, fb_set, fb_binding, flags, alpha_spec, NULL, rec, &o, sites, early, err, errn);
+    if (r <= 0) { free(rec); free(o.w); *sites = 0; return NULL; }   // (0: no pool read, err empty)
+    free(o.w); o = (vec_t){0}; *sites = 0;
+    r = pf_pass(w, nw, set, tex_binding, fb_set, fb_binding, flags, alpha_spec, rec, NULL, &o, sites, early, err, errn);
+    free(rec);
+    if (r <= 0) { free(o.w); *sites = 0; return NULL; }
+    *out_nw = o.n;
+    return o.w;
+}

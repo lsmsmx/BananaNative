@@ -826,6 +826,7 @@ static int present_one(const pq_item *it) {
     pthread_mutex_unlock(&V.qmu);
     g_fr[k].held = im;
     if (!r) vka_ctl_shot_done(g_fr[k].fence);
+    if (r == VK_ERROR_DEVICE_LOST || pr == VK_ERROR_DEVICE_LOST) vka_device_lost(r ? "the present's submission" : "vkQueuePresentKHR");
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("present submission %d", r); return 0; }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR) g_recreate = 1;
     else if (pr == VK_SUBOPTIMAL_KHR) suboptimal();

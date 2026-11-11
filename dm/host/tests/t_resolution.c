@@ -5,6 +5,8 @@ static module_t modules[1];
 module_t *g_mod = modules; int g_nmod = 1;
 static int writes;
 void dm_guest_write_prepare(void *p, size_t n) { (void)p; (void)n; writes++; }
+void gate_obs_set(int id, void (*fn)(uint64_t *, int)) { (void)id; (void)fn; }
+int gate_obs_present(int id) { (void)id; return 0; }
 static int checks, failed;
 #define CHECK(c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "failed line %d: %s\n", __LINE__, #c); } } while (0)
 

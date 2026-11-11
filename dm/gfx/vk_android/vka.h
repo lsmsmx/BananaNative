@@ -32,7 +32,8 @@
     X(vkCreateSampler) X(vkDestroySampler) \
     X(vkCreateCommandPool) X(vkAllocateCommandBuffers) X(vkResetCommandBuffer) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkWaitSemaphores) X(vkGetSemaphoreCounterValue) X(vkSignalSemaphore) \
-    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
+    X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkGetFenceStatus) \
+    X(vkCreateEvent) X(vkDestroyEvent) X(vkSetEvent) X(vkCmdWaitEvents) X(vkDestroyCommandPool) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdUpdateBuffer) X(vkCmdFillBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
     X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) \
     X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCreateRenderPass) X(vkCreateFramebuffer) \
@@ -47,7 +48,8 @@
     X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants) X(vkCmdSetLineWidth) \
-    X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT)
+    X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) \
+    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
 #define VKA_DECL(f) PFN_##f f;
 typedef struct { PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr; VKA_GLOBAL_FNS(VKA_DECL) VKA_INSTANCE_FNS(VKA_DECL) VKA_DEVICE_FNS(VKA_DECL) } vka_fns;
 extern vka_fns vk;   // a missing optional entry point is NULL
@@ -88,7 +90,9 @@ typedef struct {
     // The draw path's device facts: push descriptors (and how many a set may hold), vertex input dynamic state, robustness2's null descriptors, 8-bit indices,
     // instance-rate divisors, logic operations, dual-source blending, geometry and tessellation stages, depth clamp, fill mode lines, wide lines
     int imageless;   // imagelessFramebuffer (Vulkan 1.2): classic render passes need it (DM_VK_CLASSIC_RP)
+    int draw_count;                                 // drawIndirectCount (Vulkan 1.2): an indirect-count multi-draw's count read by the GPU (vka_draw.c vka_mdi_gpu)
     int push_desc, vin_dyn, null_desc, idx8, divisor, logic_op, dual_src, geom, tess, depth_clamp, fill_lines, depth_bias_clamp, multi_vp, a2c;
+    int vstores, fstores;   // vertexPipelineStoresAndAtomics, fragmentStoresAndAtomics: texture-use feedback of the pool (vka_tex.c "Texture pool reads") writes from those stages
     // NVN2 task and mesh programs (VK_EXT_mesh_shader: mesh = meshShader, task = taskShader too; DM_VK_MESH=0 leaves it off): their shaders are refused without it (vka_shader.c refusal)
     // and their draws skipped. mesh_inv / task_inv: the largest workgroup (maxMeshWorkGroupInvocations / maxTaskWorkGroupInvocations); mesh_out_v / mesh_out_p: the most vertices /
     // primitives a mesh workgroup may output; task_payload: maxTaskPayloadSize; task_groups / mesh_groups: maxTaskWorkGroupCount[0] / maxMeshWorkGroupCount[0] (a draw's count)
@@ -106,6 +110,7 @@ typedef struct {
     pthread_mutex_t qmu;                            // the queue is shared by the submit and present threads
     int sparse_res;                                 // sparse residency images can be made (vka_sparse.c): binding on the queue, 2D residency, standard block shape, strict non-resident reads
     uint64_t tl_queued;                             // the highest timeline value a vkQueueSubmit so far signals (under qmu): what a later submission on the queue may wait for
+    int tl_host;                                    // the GPU signals no timeline: submissions get fences and the host signals their values (vka_dev.c "Host-signalled timelines")
 } vka_dev;
 extern vka_dev V;
 // Custom GPU drivers (vka_driver.c): DM_VK_DRIVER=<folder with meta.json, or a .so> loads that driver through libadrenotools (restart only); unset, empty or "system" = the
@@ -122,7 +127,20 @@ int vka_fp_guest(void);
 int vka_ok(void);
 uint32_t vka_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal);
-VkResult vka_submit_fence(VkCommandBuffer cb, uint64_t signal, VkFence fence);   // (vka_exec.c: an unsignalled commit's own fence)
+VkResult vka_submit_fence(VkCommandBuffer cb, uint64_t signal, VkFence fence, uint64_t gate);   // (vka_exec.c: an unsignalled commit's own fence; gate: the gate value it waits for, 0 = none)
+// Gates (vka_dev.c): the GPU waits for an event word the CPU sets (vka_qsched.h "Waits for the CPU"). vka_gate_add: a gate on word w (the NVN predicate mode / value) for the
+// submission of fence, returns the gate semaphore value the replay's next submission waits for (0: none made, park instead); park_ns: its time (0: none).
+// vka_gate_poll: open the gates that hold now (in order; any thread: nvnEventSignal calls it). vka_gate_cpu_wait: a CPU thread is about to wait for fence: the gates
+// before it open (the GPU would wait for that thread). vka_gate_banned: w's gate ran out of time (park it instead). *ev: the gate's host event (VK_NULL_HANDLE: none), set
+// when the gate opens; the gated work waits for it with the host's writes in its scope (vka_exec.c vka_rp_gate), destroyed once fence is done
+VkSemaphore vka_gate_sem(void);
+uint64_t vka_gate_add(volatile uint32_t *w, uint32_t mode, uint32_t value, uint64_t fence, uint64_t park_ns, VkEvent *ev);
+void vka_gate_poll(void);
+void vka_gate_cpu_wait(uint64_t fence);
+int vka_gate_banned(const volatile uint32_t *w);
+void vka_gate_stats(uint64_t *n_word, uint64_t *n_cpu, uint64_t *n_time, uint64_t *wait_ns);   // cumulative: opened by their word, by a CPU wait, by their time; time armed
+void vka_device_lost(const char *what);   // a call returned VK_ERROR_DEVICE_LOST: the GPU hang is declared now (vka_dev.c)
+VkResult vka_host_signal(VkSemaphore s, uint64_t v);   // the host's own signal of a timeline value (a failed submission's), in step with host-signalled timelines (vka_dev.c)
 
 // The fence ledger: fence n is "done" once the GPU passed it and its CPU-side effects (events, counters) have run
 uint64_t vka_fence_next(void);                      // reserve the next fence value (submit thread)
@@ -130,6 +148,7 @@ uint64_t vka_fence_last(void);                      // the last fence reserved (
 uint64_t vka_fence_queued(void);                    // the last fence handed to the queue: the most a submission (the present's) may wait for without a wait-before-signal on its own queue
 // The replay (vka_exec.c), entered by the replay worker (vka_worker.c) or inline by the mtl_* calls of the submitting thread
 void vka_rp_sub_begin(void);
+void vka_rp_sub_cont(int on);   // the next vka_rp_sub_begin goes on with a submission cut at a GPU wait (vka_worker.c): its texture work was done at its first part
 void vka_rp_exec(const uint8_t *handle, uint64_t fence);   // fence: the submission's, reserved before it (0 = taken at its commit)
 uint64_t vka_rp_sub_commit(uint64_t reserved);
 void vka_rp_queue_activate(uint64_t serial);
@@ -146,7 +165,15 @@ void vka_fence_post(uint64_t fence, void *ops, int n, void (*run)(void *ops, int
 uint64_t vka_done(void);
 void vka_fence_cpu(uint64_t fence, void *ops, int n, void (*run)(void *ops, int n));   // no GPU behind it (no device, a failed submit): the effects run now and fence is done
 int vka_wait_done(uint64_t fence, uint64_t timeout_ns);
-void vka_worker_cpu_wait(uint64_t fence);   // vka_worker.c: a CPU thread is about to block on fence (parked queues that hold it back are released)
+int vka_worker_cpu_wait(uint64_t fence);    // vka_worker.c: a CPU thread is about to block on fence (parked queues and gates that hold it back go on once the worker is stuck)
+void vka_worker_cpu_wait_end(int was);      // ... and is no longer blocked (was: what vka_worker_cpu_wait returned)
+uint64_t vka_worker_cpu_blocked(void);       // the highest fence CPU threads block on now (0: none)
+// The GPU-wait trace (vka_worker.c, DM_VK_QS_TRACE): the last events of the queue scheduler and the submissions, printed when a GPU hang is declared
+enum { QT_SUB = 1, QT_PARK, QT_PASS, QT_RELEASE, QT_GATE, QT_FORCE, QT_SIGNAL, QT_COMMIT, QT_PART, QT_LAND, QT_PRESENT, QT_CPU_WAIT, QT_SUBMIT_ERR, QT_SLOT };
+void vka_tex_slot_counts(uint64_t *writes, uint64_t *changes);   // vka_tex.c: pool table slot writes, and of them changes of a slot's view
+void vka_qtrace(int kind, uint64_t q, uint64_t fence, uint64_t x, uint32_t a, uint32_t b, uint32_t c, uint32_t d, const volatile void *w);
+int vka_qtrace_on(void);
+void vka_qtrace_dump(void);
 void vka_after(uint64_t fence, void (*fn)(void *), void *arg);   // deferred destruction: fn(arg) once fence is done
 
 // Host-visible scratch memory for one submission (uploads, deswizzled texels, readbacks); valid until the submission's fence
@@ -197,6 +224,7 @@ uint64_t vks_bytes_nolock(void);
 int vka_addr(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off, VkDeviceAddress *bda);   // 1 = [addr, addr + len) lies in one placed segment
 int vka_mem_release(uintptr_t lo, uintptr_t hi);    // the host gives [lo, hi) back: segments there are given back first; 0 = the host releases the range itself
 uint64_t vka_addr_run(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);   // bytes from addr (at most len) in the segment that holds addr, 0 = none
+void vka_mem_join_due(void);   // the replay thread at a submission's start: joins the parts of pools placed by parts that a range given to the GPU lies across (vka_mem.c)
 int vka_pool_bda(uint64_t addr, VkDeviceAddress *bda);   // the device address of a pool byte (the table the binding side reads)
 void *vka_mem_mapped(size_t n);   // no placed maps: a mapped allocation as a segment where the driver maps it (the selftest on an emulator)
 int vka_mem_chunks(uint64_t *lo, uint64_t *hi, uint64_t *bda, int max);   // the placed segments by address (guest range and device address); the count
@@ -268,6 +296,9 @@ typedef struct vka_img {
     uint32_t vchk;
     // A soft texture's image (vka_soft.h, profile tex_soft): base 1, its finest level left out; soft_saved: the storage bytes that level takes (the stats' soft line)
     uint8_t soft; uint64_t soft_saved;
+    // The texture cache's own bookkeeping (vka_tex.c "Live images"): its place in the live list + 1 (0: not in it), the next live image in its storage address's chain,
+    // and the video pool registrations count (dm_codec_video_epoch) at which it was last checked for lying in a video pool
+    int live_ix; struct vka_img *mnext; uint64_t vep;
 } vka_img;
 // Texture level lv as a level of im (a sparse or soft texture's image starts at level im->base): 0 when the image does not hold it
 static inline int vka_img_lv(const vka_img *im, uint32_t *lv) { return vksoft_lv(im->base, im->levels, lv); }
@@ -295,6 +326,16 @@ void vka_tex_soft_stats(char *b, size_t n);          // soft textures now: how m
 void vka_tex_big_stats(char *b, size_t n);           // the largest images the GPU has not written, with what sampled them and what lies over their storage (DM_VK_BIGIMG_MB)
 int vka_rp_is_open(void);                            // a render pass is open in the replay's command buffer (vka_draw.c)
 void vka_tex_writeback(VkCommandBuffer cb);   // mtl_sub_commit, after the last pass
+// Texture pool reads (vka_tex.c, DM_VK_POOL_FB): the texture IDs shaders read through the pool, reported by the GPU, so their images are made and kept while read
+// The bitmap, a storage buffer of 2^20 bits, in a set of its own after the pool's: on Qualcomm's driver a storage buffer in the pool's set, after its 2^20 sampled images,
+// is never written (docs/reference/rendering.md "Texture pool reads report nothing on Qualcomm's driver")
+#define VKA_POOL_FB_SET 2
+#define VKA_POOL_FB_BINDING 0
+VkDescriptorSetLayout vka_pfb_layout(void);   // the bitmap's set layout (set VKA_POOL_FB_SET of every pipeline layout), VK_NULL_HANDLE when pool reads are not reported
+VkDescriptorSet vka_pfb_set(void);            // the bitmap's set, bound with the pool's set (vka_draw.c sets_push)
+unsigned vka_tex_pfb_flags(void);              // 0: off; else the VKA_PFB_* flags of vka_spv_pool_fb for every module made (vka_shader.c's vkCreateShaderModule hook)
+void vka_tex_pfb_draw(void);                   // the draw or dispatch being recorded reads the pool (vka_draw.c): this submission copies the bitmap out
+void vka_tex_pfb_commit(VkCommandBuffer cb, uint64_t fence);   // the submission's end (vka_exec.c): the bitmap copied to a host slot and cleared
 VkImageView vka_view(vka_img *im, VkFormat fmt, VkImageViewType type, VkImageAspectFlags aspect, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers, const VkComponentMapping *swz);
 void vka_tex_prepare(VkCommandBuffer cb);           // at submit begin: dirty CPU textures re-uploaded, registered descriptors written
 void vka_tex_uploads(VkCommandBuffer cb);
@@ -308,8 +349,10 @@ void vka_xp_ts(VkCommandBuffer cb, int site);   // DM_VK_XP_TS experiment (vka_t
 extern _Atomic(VkCommandBuffer) vka_disp_pend;
 void vka_disp_settle(VkCommandBuffer cb);
 void vka_disp_census(uint64_t frame);   // the dispatches since the last call by shader and call site, one log line (vka_exec.c's statistics, every 1,800 frames)
+void vka_dobj_census(uint64_t frame);   // DM_VK_DISP_OBJ: the dispatch objects line(s), every DM_VK_DISP_OBJ_EVERY frames (vka_draw.c)
 // DM_VK_GPUPROF (vka_gprof.c): GPU timestamps between the steps of a profiled frame
 extern int vka_gp_active;
+int vka_gp_split(void);   // DM_VK_GPUPROF_SPLIT of the frame being profiled, 0 when none is
 void vka_gp_mark(VkCommandBuffer cb, const char *file, int line);
 void vka_gp_pass(const char *desc);
 void vka_gp_note(char k, uint64_t key, uint64_t pkey, uint64_t work);   // DM_VK_GPUPROF: a draw ('v' / 'm') or dispatch ('c') in the open step
@@ -333,6 +376,8 @@ int vka_tex_id_target(int id);                      // the NVN target texture ID
 int vka_tex_id_target_rec(int id);                  // the same, memoized for the recording thread (the frame path asks it for every binding with no view of the shape it wants)
 int vka_tex_id_pending(int id);                     // texture ID id is registered and its image is not made yet (its first use records commands)
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout);   // the same on the recording thread, through a memo (DM_VK_TEX_MEMO)
+VkFormat vka_tex_id_vkfmt(int id);   // the format texture ID id is viewed in, not its (possibly shared) image's (vka_tex.c)
+VkImageView vka_tex_id_view_bits(int id, VkCommandBuffer cb, VkImageLayout *layout);   // a storage view of its image as R32_UINT (4-byte texels), not written into the bindless table (vka_tex.c)
 int vka_tex_id_pending_rec(int id, uint8_t dim);
 int vka_tex_id_storage_pending(int id);            // texture ID id's image exists without storage use and would be remade with it at its next storage binding (a draw ends its pass first)
 int vka_tex_id_class(int id);                       // the numeric class of texture ID id's view format: 1 uint, 2 sint, 0 other
@@ -389,6 +434,8 @@ vka_pck_ent *vka_shader_made(size_t *n);             // the game library's shade
 unsigned vka_shader_lib_differs(void);   // what the loaded library's modules do otherwise than this host's ABI (vka_abi_compat.h VKA_ABI_*; 0 = nothing, or none loaded yet)
 vka_shader *vka_shader_by_key(uint64_t key);   // the game library's shader of key (the library loaded first if needed); NULL = not there or refused
 VkShaderModule vka_shader_module(vka_shader *s, int variant);
+void vka_shader_pfb_hook(void);                // vka_dev.c, once the device's functions are loaded: modules made from then on report their pool reads (vka_tex_pfb_flags)
+VkShaderModule vka_shader_pfb_pick(VkShaderModule m, int a2c, int alpha_func);   // a pixel module given early tests, or its twin without them for a pipeline that needs late ones
 uint32_t vka_shader_sg_pin(int stage);              // DMSH_VK_STAGE_*: the subgroup size its subgroup shaders' pipelines require (vka_shader.c sg_plan), 0 = none
 VkShaderModule vka_shader_cs_module(vka_shader *s);  // a compute shader's module: its DMSH_VK_MOD_SHUFFLE_LDS one where the device takes it (vka_shader.c shuffle_plan), else the base
 VkShaderModule vka_shader_spec_module(vka_shader *s, int gl);   // a task / mesh module with its specialization constants folded (GL depth = gl), VK_NULL_HANDLE = not needed
@@ -452,6 +499,7 @@ int vka_rp_open_for(const p_set_rt *rt, int has_rt);   // a pass is open over th
 int vka_rp_on(void);                                 // a pass is open
 int vka_mesh_on(void);                               // VK_EXT_mesh_shader is on
 int vka_cpu_read(uint64_t addr, void *out, size_t n);   // guest bytes as the CPU sees them now (1 = read)
+int vka_mdi_gpu(int indexed, uint32_t n, uint32_t stride);   // 1 = an indirect-count multi-draw of n records stride bytes apart is made whole at its first record, its count read by the GPU (vka_draw.c)
 int vka_mdx_args(uint64_t ind, VkBuffer *b, VkDeviceSize *o);   // an indirect mesh draw's {x, y, z} arguments: its record's {count, 1, 1} copy (vka_exec.c)
 int vka_rp_depth(uint32_t *w, uint32_t *h);   // the open pass has a depth / stencil attachment (*w, *h: its render area)
 void vka_rp_zstats(char *b, size_t n);   // DM_VK_PARTLOG: the depth state of the part's draws into depth targets, then reset (vka_draw.c)
@@ -475,6 +523,12 @@ void vka_draw_force(int on);   // draws on whatever the memory (the selftest, wh
 int vka_nan_on(void);
 // The command encoder thread (vka_enc.c, DM_VK_ENC): the replay thread's vkCmd* calls into its command buffer, made on a thread of their own
 void vka_enc_install(void);                 // vka_dev.c: the vk table's vkCmd* entries go through the encoder
+// The game's barriers between compute dispatches (vka_gbar.c): a compute-to-compute barrier instead of a full one where only dispatches follow (DM_VK_BAR_NARROW)
+void vka_gbar_install(void);                // vka_dev.c, after vka_enc_install: the vk table's work commands go through it
+void vka_gbar_cb(VkCommandBuffer cb);       // the replay's command buffer (a submission's, or a part's)
+void vka_gbar_settle(VkCommandBuffer cb);   // before it ends: what is pending, recorded
+int vka_gbar_game(VkCommandBuffer cb, uint32_t bits);   // a game barrier outside a draw pass: 1 = taken, 0 = record the full barrier
+void vka_gbar_stats(char *b, size_t n, double frames);
 void vka_enc_start(VkCommandBuffer cb);     // after vkBeginCommandBuffer on the replay thread: its calls into cb are deferred (when DM_VK_ENC is on)
 void vka_enc_stop(void);                    // before vkEndCommandBuffer / a submit / a pool use: every deferred call made, none deferred from now on
 void vka_enc_sync(void);                    // every deferred call made (a direct call that must land in order follows)
