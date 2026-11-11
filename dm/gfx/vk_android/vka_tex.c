@@ -1728,8 +1728,16 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
     if (!t || !t->serial || !vka_ok()) return NULL;
     pthread_mutex_lock(&g_tmu);
     smap_ent *e = map_get(t->serial);
+    int pth = 0;
     if (e) {
         vka_img *im = e->im;
+        if (im && !im->inited) {   // pre-created (DM_VK_PRECREATE): its first content here, on the recording thread
+            im->vmin = im->pvmin;
+            if (im->psoft) soft_note(im, t);
+            VkCommandBuffer ucb = !ds_here(im, cb) && cb && cb == vka_rp_cb() && vka_up_on() ? vka_up_begin() : VK_NULL_HANDLE;
+            img_first_use(im, t, ucb ? ucb : cb, im->pmode);
+            if (ucb) { vka_up_point(vka_up_cur(ucb)); vka_up_end(); pth = 1; }
+        }
         if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
         uint64_t vep = im && !im->is_video && im->mem ? dm_codec_video_epoch() : 0;
         if (vep && im->vep != vep) {   // (checked again only after a video pool came or went: "Live images" above)
@@ -1750,6 +1758,7 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
             }
         }
         pthread_mutex_unlock(&g_tmu);
+        if (pth) vka_up_throttle();   // (a pre-created image's first content went through an upload batch)
         return im;
     }
     tex_t t_mod = *t;
@@ -1805,6 +1814,69 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
     pthread_mutex_unlock(&g_tmu);
     if (throttle) vka_up_throttle();
     return im;
+}
+// ---------- Pre-creating images ahead of the draw that binds them (DM_VK_PRECREATE) ----------
+// A texture pool slot's write asks for its image while the game registers the texture; the content mode, the base and the format are decided there (they
+// read the storage: under the pool protection and g_tmu, as vka_tex_get does). Helper threads then make the driver objects (vkCreateImage, its memory,
+// the view: the seconds of a streaming burst, ~3 ms a texture with Turnip here) outside g_tmu, and register the image in the map uninitialized; the draw
+// that first binds it finds it there and gives it its first content on the recording thread (vka_tex_get). A texture that is never bound leaves an
+// uninitialized image in the cache, evictable like any other. Off unless DM_VK_PRECREATE=1; a full queue falls back to the inline path.
+typedef struct { tex_t t; vka_fmt f; uint32_t base, vmin; int mode, soft, state; } pcent;   // state: 0 empty, 1 queued, 2 being made
+enum { PC_N = 64, PC_THREADS = 2 };
+static struct { pcent e[PC_N]; pthread_mutex_t mu; pthread_cond_t cv; int started, ok; } g_pc = {.mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER};
+static int pc_on(void) { static int v = -1; if (v < 0) v = VKA_ENV("DM_VK_PRECREATE", 0) != 0; return v; }
+static void *pc_main(void *a) {
+    (void)a;
+    for (;;) {
+        pthread_mutex_lock(&g_pc.mu);
+        int i = -1;
+        while (i < 0) {
+            for (int k = 0; k < PC_N; k++) if (g_pc.e[k].state == 1) { i = k; break; }
+            if (i < 0) pthread_cond_wait(&g_pc.cv, &g_pc.mu);
+        }
+        pcent j = g_pc.e[i]; g_pc.e[i].state = 2;
+        pthread_mutex_unlock(&g_pc.mu);
+        g_zwant = j.mode == ST_ZERO && !(j.t.d.flags & NVN_TEXTURE_FLAGS_IMAGE);
+        vka_img *im = img_create(&j.t, &j.f, j.base);
+        g_zwant = 0;
+        if (im) {
+            pthread_mutex_lock(&g_tmu);
+            if (map_get(j.t.serial)) { pthread_mutex_unlock(&g_tmu); img_destroy(im); }   // (the replay made one meanwhile: ours was never used)
+            else {
+                im->pvmin = j.vmin; im->pmode = (uint8_t)j.mode; im->psoft = (uint8_t)(j.soft != 0);
+                live_add(im); map_put(j.t.serial, im);
+                pthread_mutex_unlock(&g_tmu);
+            }
+        }
+        pthread_mutex_lock(&g_pc.mu);
+        if (g_pc.e[i].state == 2) g_pc.e[i] = (pcent){0};
+        pthread_mutex_unlock(&g_pc.mu);
+    }
+    return NULL;
+}
+static void pc_start_once(void) {
+    for (int k = 0; k < PC_THREADS; k++) { pthread_t th; if (pthread_create(&th, NULL, pc_main, NULL)) { g_pc.ok = k > 0; return; } pthread_detach(th); }
+    g_pc.ok = 1;
+}
+static void pc_enqueue(const tex_t *t) {   // caller holds g_tmu and nvn_pool_use: the storage reads of first_mode need both
+    if (!pc_on()) return;
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, pc_start_once);
+    if (!g_pc.ok || !t || !t->serial) return;
+    vka_fmt f; if (!vka_fmt_of(t->d.format, &f)) return;
+    uint32_t vmin = 0, base = sparse_sampled(t, &f) ? sparse_base(t->pool, t->mem, &t->d, &t->L, &vmin) : 0;
+    int mode = first_mode(t, &f, cpuw_take(t->serial, 0));
+    int soft = !base && soft_want(t, &f, mode);
+    uint32_t b = soft ? soft_levels(d_levels_of(t)) : base;
+    pthread_mutex_lock(&g_pc.mu);
+    int slot = -1;
+    for (int k = 0; k < PC_N; k++) {
+        if (g_pc.e[k].state && g_pc.e[k].t.serial == t->serial) { pthread_mutex_unlock(&g_pc.mu); return; }
+        if (g_pc.e[k].state == 0 && slot < 0) slot = k;
+    }
+    if (slot < 0) { pthread_mutex_unlock(&g_pc.mu); return; }   // (full: the draw makes it inline, as before)
+    g_pc.e[slot] = (pcent){.t = *t, .f = f, .base = b, .vmin = vmin, .mode = mode, .soft = soft, .state = 1};
+    pthread_cond_signal(&g_pc.cv);
+    pthread_mutex_unlock(&g_pc.mu);
 }
 vka_img *vka_tex_acquire(uint64_t serial) {
     pthread_mutex_lock(&g_tmu); smap_ent *e = map_get(serial); vka_img *im = e ? e->im : NULL; if (im) { im->refs++; im->holds++; im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); } pthread_mutex_unlock(&g_tmu); return im;
@@ -2581,6 +2653,15 @@ static void write_tex(int id, VkCommandBuffer cb, VkWriteDescriptorSet *w, VkDes
         smap_ent *se = e->t.serial ? map_get(e->t.serial) : NULL;
         im = se ? se->im : NULL;
         if (im) im->holds++;
+        if (!im && pc_on()) {   // its image is made ahead (DM_VK_PRECREATE); the slot itself names the null view this write, as before
+            pthread_mutex_unlock(&g_tmu);
+            nvn_pool_use(1);
+            pthread_mutex_lock(&g_tmu);
+            pc_enqueue(&e->t);
+            pthread_mutex_unlock(&g_tmu);
+            nvn_pool_use(0);
+            pthread_mutex_lock(&g_tmu);
+        }
         pthread_mutex_unlock(&g_tmu);
     }
     // (img_storage_upgrade runs without nvn_pool_use: it copies image to image and never reads the storage)

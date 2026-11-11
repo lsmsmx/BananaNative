@@ -283,6 +283,8 @@ typedef struct vka_img {
     // Texture levels in views, render targets and copies go through vka_img_lv
     // vmin: the texture level its sampled views start at (vka_tex.c sparse_base: the finest level from which every level is wholly mapped)
     uint32_t base, vmin;
+    uint32_t pvmin;          // a pre-created image (DM_VK_PRECREATE): the vmin and mode its creator decided, and whether it is soft
+    uint8_t pmode, psoft;
     // A sparse residency image (vka_sparse.c): memory only behind its mapped 64 KB tiles (rs_tw x rs_th texels), va bytes of the sparse address space; bfloor: the finest level it
     // may start at (levels left out to fit the address space, vka_tex.c img_create), a hint kept while vks_va_free() is less than bneed (the address space the next finer start asked for when it did not fit)
     struct vks_img *rs; uint32_t rs_tw, rs_th, bfloor; uint64_t va, bneed;
