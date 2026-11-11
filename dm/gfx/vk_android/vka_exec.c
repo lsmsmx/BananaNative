@@ -22,7 +22,7 @@ enum { NSLOT = 8 };
 enum { NCHUNK = 32 };
 static struct { VkCommandBuffer cb; uint64_t fence; VkCommandBuffer x[NCHUNK]; VkFence vf; int vf_on; } g_slot[NSLOT];   // vf: set when its commit had no timeline signal (vf_on)   // x: the command buffers a submission goes on in once it hands its first part to the queue (chunk)
 static unsigned g_slot_i;
-static int g_chunk_draws = -1, g_nx; static uint64_t g_chunk_d0;   // chunk(): draws a part, parts this submission, draws at its part's start
+static int g_chunk_draws = -1, g_chunk_first = -1, g_nx; static uint64_t g_chunk_d0;   // chunk(): draws a part, the first part's own draw count, parts this submission, draws at its part's start
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cb;   // the submission being recorded (NULL without a device)
 VkCommandBuffer vka_rp_cb(void) { return g_cb; }
@@ -515,6 +515,7 @@ void vka_rp_sub_begin(void) {
     vka_draw_sub_begin(g_cb, k);
     { void vka_pso_pause(int on); vka_pso_pause(0); }   // the game submits: resumed (mtl_drain paused the pipeline threads)
     g_chunk_draws = VKA_ENV("DM_VK_CHUNK", 600);   // live: from the next submission
+    g_chunk_first = VKA_ENV("DM_VK_CHUNK_FIRST", 128);   // live: the first part ends this early (0: DM_VK_CHUNK), so the GPU starts while the rest is recorded
     g_nx = 0; g_chunk_d0 = g_stat_draws;
     g_t_begin += now_ns() - tb0;
 }
@@ -598,8 +599,12 @@ static inline void chunk_check(void) {
     }
     if (!g_cb || g_nx >= NCHUNK) return;   // no part left: chunk() would do nothing and leave the draw count, so every later draw would end its pass
     uint64_t in = g_stat_draws - g_chunk_d0;
-    if (g_chunk_draws > 0 && in >= (uint64_t)g_chunk_draws && vka_rp_split_ok(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); return; }
+    // The first part of a submission ends early (DM_VK_CHUNK_FIRST, default 128 draws; 0: DM_VK_CHUNK), so the GPU starts on it while the rest of the
+    // submission is still recorded, instead of waiting out the whole recording (MacNativeGames cuts its first segment at 30 draws for the same reason)
+    int lim = g_chunk_draws > 0 ? (g_nx ? g_chunk_draws : (g_chunk_first > 0 && g_chunk_first < g_chunk_draws ? g_chunk_first : g_chunk_draws)) : 0;
+    if (lim > 0 && in >= (uint64_t)lim && vka_rp_split_ok(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); return; }
     int cp = VKA_ENV("DM_VK_CHUNK_PASS", 600);
+    if (g_chunk_draws > 0 && !g_nx && g_chunk_first > 0 && cp > g_chunk_first) cp = g_chunk_first;
     if (cp > 0 && in >= (uint64_t)cp && vka_rp_open_for(&S.rt, S.has_rt)) {
         uint32_t w = 0, h = 0; int dep = vka_rp_depth(&w, &h);
         if (VKA_ENV("DM_VK_PARTLOG", 0)) VLOG("part split inside a pass of %ux%u%s", w, h, dep ? " with depth" : "");
