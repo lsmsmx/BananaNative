@@ -187,7 +187,8 @@ static uint64_t *g_cpuw; static size_t g_cpuwcap, g_cpuwn;   // serials the CPU 
 static pthread_mutex_t g_tmu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_img_bytes;
 static vksoft_set g_soft_hard; static uint64_t g_soft_n, g_soft_bytes, g_soft_made, g_soft_whole;   // (under g_tmu) soft textures ("Soft textures" below): live, the storage bytes left out, made, made whole
-static int g_zwant;   // (under g_tmu) img_create_ may make a zero-shared image: vka_tex_get's new image whose content is ST_ZERO ("Zero-shared images" below)
+static __thread int g_zwant;   // img_create_ may make a zero-shared image: the caller's new image whose content is ST_ZERO ("Zero-shared images" below).
+                               // (thread-local: a pre-creation thread calls img_create_ on its own; the replay thread's setting is its own)
 
 // The images' memory for the stats line: all of it, and the part whose content the GPU wrote (render targets, copy and storage destinations); the rest was filled from the
 // texture's storage in guest memory, which stays in its memory pool, so those bytes are held twice
