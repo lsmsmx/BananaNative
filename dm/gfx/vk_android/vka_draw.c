@@ -1437,11 +1437,10 @@ typedef struct {
     uint64_t lay, texgen, memgen, fbgen, alpha, spush, pools, base, sk[VKA_NSTAGE], stemo[VKA_NSTAGE][2];
     int rast_discard;
 } sets_key;
-// Eight entries, not one: a scene reaches back over more patterns (material A, B, A ...) than a single entry covers
-// (20 % of the draws that could keep their writes on the phone; four entries measured 21-32 %). Sixteen is not tried:
-// an entry holds the walk's records, ~200 KB each
+// One entry: the hit path pushes g_w as the last build left it, so only the entry that build filled can answer. More entries were tried
+// (four, then eight) and reverted: a hit on an older entry pushed the newest build's writes, not that entry's.
 typedef struct { sets_key k; int ok, any, n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint64_t rv[VKA_NSTAGE][512]; vka_res r[VKA_NSTAGE][512]; } sets_memo;
-enum { SNMEMO = 8 };
+enum { SNMEMO = 1 };
 static sets_memo g_sm[SNMEMO]; static unsigned g_smn;
 static int sets_memo_ways(void) {   // DM_VK_SETS_MEMO_WAYS: 1 is the earlier one-entry memo, for the A/B
     static int v = -1;
