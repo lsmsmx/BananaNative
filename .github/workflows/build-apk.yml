@@ -80,8 +80,18 @@ jobs:
 
       - name: Build deps, shasum shim, Linux port of build.sh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zsh ninja-build cmake git curl zlib1g-dev
+          # apt in three tries, with its own HTTP timeouts and IPv4 forced: a resolver hiccup on the
+          # runner used to stall 5 s per host, per index and per package and then end the job (exit
+          # 100) after ten minutes of "Temporary failure resolving"
+          ok=""
+          for i in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::ForceIPv4=true update \
+               && sudo apt-get install -y -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::ForceIPv4=true \
+                    zsh ninja-build cmake git curl zlib1g-dev; then ok=1; break; fi
+            echo "apt attempt $i failed (transient DNS?); retrying in 10 s"; sleep 10
+          done
+          [ -n "$ok" ] || { echo "apt-get failed after 3 attempts"; exit 1; }
+          cmake --version; ninja --version; zsh --version
           sudo tee /usr/local/bin/shasum > /dev/null <<'EOF'
           #!/bin/sh
           [ "$1" = "-a" ] && [ "$2" = "256" ] && shift 2
