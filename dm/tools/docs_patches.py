@@ -108,6 +108,8 @@ SWITCH_BINDING = [
      'why': "Horizon's limit, on for every game; `off` only for a profile whose pool is too small (Switch 1 games, not supported)"}),
     ('alloc_big_align', '', {'what': "StandardAllocator blocks of 64 KB and more aligned to 64 KB", 'now': 'game', 'goal': 'host', 'purpose': 'memory',
      'why': "the cause is a memory pool's GPU address, big-page aligned on hardware and the CPU address here: pool GPU addresses aligned as hardware does, or this alignment for every game"}),
+    ('av1_decoder', '', {'what': 'frame-parallel dav1d for AV1 movies', 'now': 'game', 'goal': 'host', 'purpose': 'frame rate',
+     'why': "the default decoder drops frames of this game's movies on the phone; frame-parallel dav1d for every game once it is checked on the other games' movies"}),
     ('vconv_range', '', {'what': 'CPU vertex conversion over the vertices a draw reads', 'now': 'game', 'goal': 'host', 'purpose': 'power',
      'why': f'the same vertices as the whole range, for less work; DM_NVN_VCONV_CHECK checks it: {DEFAULT_SOON}'}),
     ('tex_flush_upload', '', {'what': 'CPU-written textures uploaded after a flush', 'now': 'game', 'goal': 'host', 'purpose': 'rendering',

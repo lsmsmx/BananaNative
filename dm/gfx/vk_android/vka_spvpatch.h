@@ -8,6 +8,8 @@ uint32_t *vka_spv_vin_retype(const uint32_t *w, size_t nw, uint32_t umask, uint3
 // Subgroup operations and built-ins rewritten as subgroups of one invocation, for a stage the device runs none in (vka_spvpatch.c). A malloc'd copy (*out_nw words,
 // *changed = 1), NULL with err empty when the module has none, NULL with the reason in err when it cannot be rewritten
 uint32_t *vka_spv_subgroup_single(const uint32_t *w, size_t nw, size_t *out_nw, int *changed, char *err, size_t errn);
+// 1 when module w (nw words) decorates BuiltIn SubgroupId or NumSubgroups: it addresses whole subgroups, which vka_spv_subgroup_single leaves as the device has them
+int vka_spv_subgroup_rows(const uint32_t *w, size_t nw);
 // A geometry shader's memory writes, counted (the return; -1 with err on failure) and, with out and a count above 0, the module with each of them made only by the run of
 // the shader that first claims its primitive in the storage buffer at set 0 binding (zeroed for each draw, a word per primitive), malloc'd (*out_nw words): vka_spvpatch.c
 int vka_spv_gs_claim(const uint32_t *w, size_t nw, uint32_t binding, uint32_t **out, size_t *out_nw, char *err, size_t errn);

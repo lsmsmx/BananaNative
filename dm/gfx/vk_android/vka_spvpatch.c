@@ -142,6 +142,18 @@ enum { DecBuiltIn = 11, BISubgroupSize = 36, BISubgroupLocalInvocationId = 41, B
 static int bi_kind(uint32_t b) {   // 1 = value 0 (id, lt, gt), 2 = value 1 (size, eq, le, ge), 0 = not a subgroup built-in
     switch (b) { case BISubgroupLocalInvocationId: case BILt: case BIGt: return 1; case BISubgroupSize: case BIEq: case BILe: case BIGe: return 2; default: return 0; }
 }
+int vka_spv_subgroup_rows(const uint32_t *w, size_t nw) {
+    enum { BINumSubgroups = 38, BISubgroupId = 40 };
+    if (nw < 5 || w[0] != 0x07230203) return 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) return 0;
+        if (op == OpDecorate && len >= 4 && w[i + 2] == DecBuiltIn && (w[i + 3] == BINumSubgroups || w[i + 3] == BISubgroupId)) return 1;
+        if (op == OpFunction) return 0;   // decorations come before the functions
+        i += len;
+    }
+    return 0;
+}
 uint32_t *vka_spv_subgroup_single(const uint32_t *w, size_t nw, size_t *out_nw, int *changed, char *err, size_t errn) {
 #define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
     uint8_t *bi = NULL, *chain = NULL; int32_t *cval = NULL; vec_t o = {0}; *changed = 0;

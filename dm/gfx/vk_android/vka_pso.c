@@ -338,6 +338,7 @@ typedef struct {
     VkPipelineColorBlendAttachmentState cb[8]; VkPipelineColorBlendStateCreateInfo bs; VkDynamicState dyn[24]; VkPipelineDynamicStateCreateInfo dy;
     VkFormat cf[8]; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci; int tess, mesh;   // mesh: a task / mesh pipeline (pstate_fill)
     VkDescriptorSetLayout set0;   // the layout's set 0 (the library probe's independent-sets layout)
+    vka_shader *sh[VKA_NSTAGE];
 } pstate;
 
 // A VkFormat's class for colour outputs: 1 UINT, 2 SINT, 0 the rest (float, normalized, scaled)
@@ -357,6 +358,7 @@ static void fout_masks(const vka_shader *fs, const vka_gkey *k, uint32_t *um, ui
 // 0 = a stage's module is missing (logged by vka_shader_module)
 static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
     memset(P, 0, sizeof *P);
+    memcpy(P->sh, sh, sizeof P->sh);
     // Stages: vertex, tess control, tess evaluation, geometry, fragment; the GL depth constant on the last of the first four. A mesh pipeline (NVN2 task and mesh programs,
     // nvnCommandBufferDrawMeshTasks): task (optional), mesh, fragment, the GL depth constant on the mesh stage; it has no vertex input or input assembly state
     static const int ovtx[5] = {0, 3, 4, 2, 1}, omesh[5] = {6, 7, 1, -1, -1};
@@ -494,12 +496,14 @@ static void heavy_load(void) {
 }
 static void build_end(int i) {
     if (i < 0) return;
-    uint64_t vs = atomic_load(&g_build[i].vs), age = now_ns() - atomic_load(&g_build[i].t0); const char *what = atomic_load(&g_build[i].what);
+    uint64_t vs = atomic_load(&g_build[i].vs), fs = atomic_load(&g_build[i].fs), age = now_ns() - atomic_load(&g_build[i].t0);
+    const char *what = atomic_load(&g_build[i].what);
     atomic_store(&g_build[i].tid, 0);
     int ms = VKA_ENV("DM_VK_PREWARM_HEAVY_MS", 1000);
-    if (vs && ms > 0 && age >= (uint64_t)ms * 1000000ull && !heavy_has(vs)) {
-        heavy_add(vs, 1);
-        VLOG("long compile: %s of shader %016llx took %.1f s: remembered (%s), prewarm makes such shaders one at a time", what, (unsigned long long)vs, age / 1e9, g_heavy_path[0] ? g_heavy_path : "this run only");
+    uint64_t k = vs ? vs : fs;
+    if (k && ms > 0 && age >= (uint64_t)ms * 1000000ull && !heavy_has(k)) {
+        heavy_add(k, 1);
+        VLOG("long compile: %s of shader %016llx took %.1f s: remembered (%s), compiles hold for such shaders", what, (unsigned long long)k, age / 1e9, g_heavy_path[0] ? g_heavy_path : "this run only");
     }
 }
 // The same list in the log, with each thread's name (the memory maps thread's histogram, vka_mem.c maps_hist_log, DM_VK_MAPS_HIST): which compiles run while the maps
@@ -596,7 +600,7 @@ static int gpl_on(void) { return V.gpl && !atomic_load(&g_gpl_off) && !vka_class
 #define LIB_REFUSED ((void *)(uintptr_t)1)
 #define LIB_BUSY ((void *)(uintptr_t)2)
 static pthread_cond_t g_lib_cv = PTHREAD_COND_INITIALIZER;
-static VkPipeline lib_make(int kind, const void *key, size_t klen, VkGraphicsPipelineCreateInfo *ci, VkGraphicsPipelineLibraryFlagsEXT part, int *refused) {
+static VkPipeline lib_make(int kind, const void *key, size_t klen, VkGraphicsPipelineCreateInfo *ci, VkGraphicsPipelineLibraryFlagsEXT part, int *refused, uint64_t vs, uint64_t fs) {
     uint64_t h = fnv(key, klen, 1469598103934665603ull);
     pthread_mutex_lock(&g_mu);
     void *hit;
@@ -608,7 +612,7 @@ static VkPipeline lib_make(int kind, const void *key, size_t klen, VkGraphicsPip
     VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, .pNext = shp && (g_pre_adapt & A_NORI) ? NULL : ci->pNext, .flags = part};
     ci->pNext = &li; ci->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | (g_pre_adapt & A_RETAIN ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0);
     uint64_t t0 = now_ns();
-    int bs = build_begin(g_lib_name[kind], 0, 0);
+    int bs = build_begin(g_lib_name[kind], vs, fs);
     VkPipeline p = VK_NULL_HANDLE; VkResult r = vk.vkCreateGraphicsPipelines(V.dev, shp && (g_pre_adapt & A_NOCACHE) ? VK_NULL_HANDLE : g_pc, 1, ci, NULL, &p);
     build_end(bs);
     ci->pNext = li.pNext;
@@ -701,13 +705,16 @@ static unsigned pre_probe(const VkGraphicsPipelineCreateInfo *ci0, const pstate 
 }
 // The parts of P, each made once; then the link. VK_NULL_HANDLE = a part failed (the caller makes the whole pipeline)
 static VkPipeline gpl_link(pstate *P, const vka_gkey *k) {
+    const vka_shader *pre0 = P->mesh ? P->sh[7] : P->sh[0];
+    uint64_t vs_key = pre0 ? pre0->key : 0;
+    uint64_t fs_key = P->sh[1] ? P->sh[1]->key : 0;
     VkDynamicState dl[NLIB][24]; VkPipelineDynamicStateCreateInfo dy[NLIB];
     for (int i = 0; i < NLIB; i++) dyn_of(P, i, dl[i], &dy[i]);
     VkPipeline part[4]; uint32_t nparts = 0;
     {   vikey key; memset(&key, 0, sizeof key); key.topo = k->topo; key.vin_static = k->vin_static;
         if (k->vin_static) { memcpy(key.va, k->va, sizeof key.va); memcpy(key.vb, k->vb, sizeof key.vb); }
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pVertexInputState = &P->vi, .pInputAssemblyState = &P->ia, .pDynamicState = &dy[L_VI]};
-        if (!(part[nparts++] = lib_make(L_VI, &key, sizeof key, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, NULL))) return VK_NULL_HANDLE; }
+        if (!(part[nparts++] = lib_make(L_VI, &key, sizeof key, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, NULL, 0, 0))) return VK_NULL_HANDLE; }
     VkPipelineShaderStageCreateInfo pre[4], *fs = NULL; uint32_t npre = 0;
     for (uint32_t i = 0; i < P->ns; i++) { if (P->ss[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) fs = &P->ss[i]; else if (npre < 4) pre[npre++] = P->ss[i]; }
     VkPipelineRenderingCreateInfo ri0 = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};   // the shader parts take only the view mask (0); the formats are the output's
@@ -723,13 +730,13 @@ static VkPipeline gpl_link(pstate *P, const vka_gkey *k) {
         VkPipelineShaderStageCreateInfo both[5]; uint32_t nb = 0; for (uint32_t i = 0; i < npre; i++) both[nb++] = pre[i]; if (fs) both[nb++] = *fs;
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri0, .stageCount = nb, .pStages = both, .pTessellationState = P->tess ? &P->ts : NULL,
                                            .pViewportState = &P->vp, .pRasterizationState = &P->rs, .pMultisampleState = &P->ms, .pDepthStencilState = &P->ds, .pDynamicState = &dy[L_PREFS], .layout = P->ci.layout};
-        if (!(part[nparts++] = lib_make(L_PREFS, &key, sizeof key, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT | VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, NULL))) return VK_NULL_HANDLE;
+        if (!(part[nparts++] = lib_make(L_PREFS, &key, sizeof key, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT | VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, NULL, vs_key, fs_key))) return VK_NULL_HANDLE;
     } else {
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri0, .stageCount = npre, .pStages = pre, .pTessellationState = P->tess ? &P->ts : NULL,
                                            .pViewportState = &P->vp, .pRasterizationState = &P->rs, .pDynamicState = &dy[L_PRE], .layout = P->ci.layout};
         int refused = 0;
         VkGraphicsPipelineCreateInfo ci_probe = ci;   // (lib_make chains its own structure onto ci and restores it)
-        if (!(part[nparts++] = lib_make(L_PRE, &pk, sizeof pk, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &refused))) {
+        if (!(part[nparts++] = lib_make(L_PRE, &pk, sizeof pk, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, &refused, vs_key, 0))) {
             if (refused && !__atomic_load_n(&g_nlib[L_PRE], __ATOMIC_RELAXED)) {
                 int first = 0;
                 pthread_mutex_lock(&g_mu); int nref = ++g_pre_refused; if (!g_pre_probed) { g_pre_probed = 1; first = 1; } pthread_mutex_unlock(&g_mu);
@@ -747,23 +754,41 @@ static VkPipeline gpl_link(pstate *P, const vka_gkey *k) {
         }
         VkGraphicsPipelineCreateInfo cf = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri0, .stageCount = fs ? 1 : 0, .pStages = fs, .pMultisampleState = &P->ms,
                                            .pDepthStencilState = &P->ds, .pDynamicState = &dy[L_FS], .layout = P->ci.layout};
-        if (!(part[nparts++] = lib_make(L_FS, &fk, sizeof fk, &cf, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, NULL))) return VK_NULL_HANDLE;
+        if (!(part[nparts++] = lib_make(L_FS, &fk, sizeof fk, &cf, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, NULL, 0, fs_key))) return VK_NULL_HANDLE;
     }
     {   fokey key; memset(&key, 0, sizeof key);
         memcpy(key.cfmt, k->cfmt, sizeof key.cfmt); key.dfmt = k->dfmt; key.sfmt = k->sfmt; key.ncolor = k->ncolor; key.samples = (uint8_t)P->ms.rasterizationSamples; key.a2c = k->a2c;
         key.logic_en = k->logic_en; key.logic_op = k->logic_op; key.vin_static = (uint8_t)k->vin_static; memcpy(key.att, k->att, sizeof key.att);
         VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &P->ri, .pMultisampleState = &P->ms, .pColorBlendState = &P->bs, .pDynamicState = &dy[L_FO]};
-        if (!(part[nparts++] = lib_make(L_FO, &key, sizeof key, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, NULL))) return VK_NULL_HANDLE; }
+        if (!(part[nparts++] = lib_make(L_FO, &key, sizeof key, &ci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, NULL, 0, 0))) return VK_NULL_HANDLE; }
     VkPipelineLibraryCreateInfoKHR libs = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = nparts, .pLibraries = part};
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &libs, .layout = P->ci.layout};   // no LINK_TIME_OPTIMIZATION: the fast link
     uint64_t t0 = now_ns();
-    int bs = build_begin("graphics pipeline (no cache)", 0, 0);
+    int bs = build_begin("graphics pipeline (no cache)", vs_key, fs_key);
     VkPipeline p = VK_NULL_HANDLE; VkResult r = vk.vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p);
     build_end(bs);
     pthread_mutex_lock(&g_mu); g_link_ms += (now_ns() - t0) / 1e6; if (!r) { g_nlinked++; __atomic_store_n(&g_nlinked_pub, g_nlinked, __ATOMIC_RELAXED); } pthread_mutex_unlock(&g_mu);
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("graphics pipeline link: %d; the whole pipeline is made instead", r); return VK_NULL_HANDLE; }
     return p;
 }
+
+static int pso_overlap(void) { return VKA_ENV("DM_VK_PREWARM_OVERLAP", V.driver_id != VK_DRIVER_ID_MESA_TURNIP) != 0; }
+static int pso_heavy_ms(void) { return VKA_ENV("DM_VK_PREWARM_HEAVY_MS", 1000); }
+static uint64_t pso_heavy_ns(void) { int ms = pso_heavy_ms(); return ms > 0 ? (uint64_t)ms * 1000000ull : 0; }
+
+// Whether a pipeline thread holds its next compile: while a build anywhere in the process (frame path, asynchronous, prewarm) has run for heavy_ns or more, or while
+// another build of the same pre-rasterization or compute shader (key) runs.
+static int pw_heavy_hold(uint64_t key, uint64_t heavy_ns) {
+    uint64_t t = now_ns(); int mine = key && heavy_has(key);
+    for (int i = 0; i < NBUILD; i++) {
+        if (atomic_load(&g_build[i].tid) <= 0) continue;
+        uint64_t vs = atomic_load(&g_build[i].vs);
+        uint64_t fs = atomic_load(&g_build[i].fs);
+        if (t - atomic_load(&g_build[i].t0) >= heavy_ns || (key && (vs == key || fs == key)) || (mine && ((vs && heavy_has(vs)) || (fs && heavy_has(fs))))) return 1;
+    }
+    return 0;
+}
+static pthread_mutex_t g_pw_one = PTHREAD_MUTEX_INITIALIZER;
 
 // The background thread that makes the optimized pipelines, one after another, oldest first; each takes its linked pipeline's place in its map entry
 typedef struct opt_job { struct opt_job *next; gval *g; vka_shader *sh[VKA_NSTAGE]; vka_layout lay; vka_gkey k; } opt_job;
@@ -781,8 +806,17 @@ static void *opt_main(void *a) {
         while (!g_opt_head) pthread_cond_wait(&g_opt_cv, &g_opt_mu);
         opt_job *j = g_opt_head; g_opt_head = j->next; if (!g_opt_head) g_opt_tail = &g_opt_head;
         pthread_mutex_unlock(&g_opt_mu);
+        uint64_t heavy_ns = pso_heavy_ns();
+        int one = !pso_overlap();
+        const vka_shader *pre = j->sh[7] ? j->sh[7] : j->sh[0];
+        uint64_t key = pre ? pre->key : (j->sh[1] ? j->sh[1]->key : 0);
+        if (one) pthread_mutex_lock(&g_pw_one);
+        if (heavy_ns) {
+            while (pw_heavy_hold(key, heavy_ns)) { usleep(50000); pause_point(); }
+        }
         pstate *P = malloc(sizeof *P);
         VkPipeline p = P && pstate_fill(P, j->sh, &j->lay, &j->k) ? full_pipeline(P, j->sh, " in the background") : VK_NULL_HANDLE;
+        if (one) pthread_mutex_unlock(&g_pw_one);
         pthread_mutex_lock(&g_mu);
         if (p) { __atomic_store_n(&j->g->p, p, __ATOMIC_RELEASE); __atomic_store_n(&j->g->linked, 0, __ATOMIC_RELEASE); g_nopt++; }   // a failure keeps the linked pipeline (logged)
         g_opt_waiting--;
@@ -978,28 +1012,6 @@ static uint64_t mem_avail_mb(void) {
     return kb >> 10;
 }
 static _Atomic uint64_t g_pw_memwait_ns, g_pw_heavywait_ns;
-// Whether a prewarm thread holds its next compile: while a build anywhere in the process (frame path, asynchronous, prewarm) has run for heavy_ns or more, or while
-// another build of the same pre-rasterization or compute shader (key) runs. Turnip's compiler keeps thousands of 64 KiB-1 MiB blocks for the length of a multi-second
-// compile, and Android's allocator (scudo's secondary) maps each block apart with a guard: two process memory maps a block, 4.1 GB in 27,000 blocks for three compiles
-// at once. Ocarina of Time (0400486024DEC000, Turnip Gen8 V39 on the Adreno 830): a 13 s mesh compile and two of vertex shader b1f06157308e3b22 at once took the
-// maps outside the guest block from 6,000 to 59,662 in 10 s, past vm.max_map_count (65,530); the driver's next allocation failed (SIGSEGV at 0, std::bad_alloc).
-// Open: why these shaders take Turnip 8-22 s and that much memory (a driver matter); the hold only keeps them from piling up
-// A key known to be long (heavy_has: an earlier build of it took heavy_ns or more, this run or an earlier one) also holds while any other known one is being built, from
-// its first millisecond: the age check alone let three start together. (Prewarm builds themselves never overlap: g_pw_one, in pw_main)
-static int pw_heavy_hold(uint64_t key, uint64_t heavy_ns) {
-    uint64_t t = now_ns(); int mine = key && heavy_has(key);
-    for (int i = 0; i < NBUILD; i++) {
-        if (atomic_load(&g_build[i].tid) <= 0) continue;
-        uint64_t vs = atomic_load(&g_build[i].vs);
-        if (t - atomic_load(&g_build[i].t0) >= heavy_ns || (key && vs == key) || (mine && vs && heavy_has(vs))) return 1;
-    }
-    return 0;
-}
-// One prewarm build at a time on VK_DRIVER_ID_MESA_TURNIP (DM_VK_PREWARM_OVERLAP=1: as before, one a thread; the default on other drivers). A build's cost is known only
-// after it, and four unknown ones that started within one second (Ocarina of Time on Turnip: e963ef2241a51be8, cf04467527cbcf8f, 171409a493cf5268, 11-12 s each) took
-// the process past vm.max_map_count again with the hold above in place. The threads still look up and prepare their keys in parallel; a warm run's cache hits take
-// milliseconds each. Qualcomm's driver's compiler does not take the maps with it (21,450 at most, same phone and game), so its threads keep building side by side
-static pthread_mutex_t g_pw_one = PTHREAD_MUTEX_INITIALIZER;
 static void *pw_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-prewarm"); vka_fp_host("vk-prewarm");
     setpriority(PRIO_PROCESS, 0, 10);   // this thread (Linux: per-thread nice), under the game's threads
@@ -1019,8 +1031,8 @@ static void *pw_main(void *a) {
     // ENOMEM, a crash at 83 s). The first thread goes on as the frame path would make the same pipelines one at a time anyway
     uint32_t mem_mb = (uint32_t)VKA_ENV("DM_VK_PREWARM_MEM_MB", 2048);
     // Each thread holds its next compile while a long one runs (DM_VK_PREWARM_HEAVY_MS, default 1000; 0 never), or another build of the same shader (pw_heavy_hold)
-    int heavy_ms = VKA_ENV("DM_VK_PREWARM_HEAVY_MS", 1000); uint64_t heavy_ns = heavy_ms > 0 ? (uint64_t)heavy_ms * 1000000ull : 0;
-    int overlap = VKA_ENV("DM_VK_PREWARM_OVERLAP", V.driver_id != VK_DRIVER_ID_MESA_TURNIP) != 0;   // 1: each thread builds on its own (default off Turnip); 0: g_pw_one
+    uint64_t heavy_ns = pso_heavy_ns();
+    int overlap = pso_overlap();   // 1: each thread builds on its own (default off Turnip); 0: g_pw_one
     for (;;) {
         pause_point();
         if (me > 0 && mem_mb) { uint64_t t0 = 0, av; while ((av = mem_avail_mb()) && av < mem_mb && atomic_load(&g_pw_next) < n) { if (!t0) t0 = now_ns(); usleep(250000); pause_point(); }
@@ -1079,10 +1091,12 @@ static void *pw_main(void *a) {
 }
 // DM_VK_PREWARM threads (default 4, at most 4; 2 before 2026-11-08). With the pipeline cache warm a key costs a few milliseconds (297 in 0.1 s on 2 threads); with it
 // cold each is a compile of 60-100 ms, some vertex and mesh ones 2-9 s on Qualcomm's compiler, and Ocarina of Time's title scene alone needs about 130, so the list is
-// done before the game's first 3D frame only on more threads. They run at nice 10, under the game's threads, during logos and menus that leave most cores idle
+// done before the game's first 3D frame only on more threads. They run at nice 10, under the game's threads, during logos and menus that leave most cores idle.
+// Default off on Qualcomm's driver before 512.800 (V.qcom_old): 512.676 appears to keep about 6 MB of memory outside the process per pipeline (MemAvailable against the pipeline count), and the list's ~650 pipelines
+// took MemAvailable from 3.3 GB to 1.1-1.6 GB in Fire Emblem Fortune's Weave's opening (321 made without it); the low-memory killer then ended the game in the class showcase. DM_VK_PREWARM=<n> wins
 static void pw_start(void) {
-    int nt = VKA_ENV("DM_VK_PREWARM", 4);
-    if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (DM_VK_PREWARM=0): %u keys not made ahead", g_pw_load_n); return; }
+    int nt = VKA_ENV("DM_VK_PREWARM", V.qcom_old ? 0 : 4);
+    if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (%s): %u keys not made ahead", getenv("DM_VK_PREWARM") ? "DM_VK_PREWARM=0" : "default on Qualcomm's driver before 512.800; DM_VK_PREWARM=4 on", g_pw_load_n); return; }
     if (nt > 4) nt = 4;
     heavy_load();   // the shaders earlier runs found long on this driver (build_end)
     g_pw_t0 = now_ns(); g_pw_threads = 0;
@@ -1120,8 +1134,17 @@ static void *as_main(void *a) {
         while (!g_as_head) pthread_cond_wait(&g_as_cv, &g_as_mu);
         as_job *j = g_as_head; g_as_head = j->next; if (!g_as_head) g_as_tail = &g_as_head;
         pthread_mutex_unlock(&g_as_mu);
+        uint64_t heavy_ns = pso_heavy_ns();
+        int one = !pso_overlap();
+        const vka_shader *pre = j->sh[7] ? j->sh[7] : j->sh[0];
+        uint64_t key = pre ? pre->key : (j->sh[1] ? j->sh[1]->key : 0);
+        if (one) pthread_mutex_lock(&g_pw_one);
+        if (heavy_ns) {
+            while (pw_heavy_hold(key, heavy_ns)) { usleep(50000); pause_point(); }
+        }
         uint64_t t0 = now_ns();
         gfx_build(j->g, j->len, j->sh, &j->lay, &j->k, 0, 1, j->t0);
+        if (one) pthread_mutex_unlock(&g_pw_one);
         uint64_t t1 = now_ns(), lat = t1 - j->t0, cur = atomic_load(&g_as_lat_max_ns);
         while (lat > cur && !atomic_compare_exchange_weak(&g_as_lat_max_ns, &cur, lat)) {}
         atomic_fetch_add(&g_as_ns, t1 - t0); atomic_fetch_add(&g_as_made, 1); atomic_fetch_sub(&g_as_depth, 1);

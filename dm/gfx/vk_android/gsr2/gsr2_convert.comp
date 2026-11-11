@@ -1,0 +1,32 @@
+#version 450
+//============================================================================================================
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+//============================================================================================================
+// Snapdragon GSR2 3-pass (snapdragon-gsr d926f074, sgsr/v2/include/glsl_3_pass_cs/sgsr2_convert.comp; BSD-3-Clause, notice above and LICENSE) for NVN2's DLSS
+// stand-in (vka_dlss.c, DM_VK_DLSS=3). Changes from upstream: YCoCg kept
+// in RGBA16F (no 11/11/10 packing); reversed depth read natively (nearest = max); the game's motion vectors (render-size UV, scaled by mvs); no opaque colour.
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform highp sampler2D InputDepth;
+layout(set = 0, binding = 1) uniform highp sampler2D InputColor;
+layout(set = 0, binding = 2) uniform highp sampler2D InputVelocity;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D YCoCgColor;              // Y, Co - 0.5, Cg - 0.5
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D MotionDepthAlphaBuffer;  // motion (NDC), nearest reversed depth of the 3x3, alpha mask 0
+layout(push_constant) uniform P { vec2 renderSize; vec2 renderSizeRcp; vec2 mvs; float kfov; float reset; ivec2 cbase; float vrej; float vlo; float vk; } p;   // activate's block
+void main()
+{
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy), lim = ivec2(p.renderSize) - 1;
+    if (any(greaterThan(ip, lim))) return;
+    float nz = 0.0;
+    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) nz = max(nz, texelFetch(InputDepth, clamp(ip + ivec2(dx, dy), ivec2(0), lim), 0).x);
+    vec2 motion = -2.0 * texelFetch(InputVelocity, ip, 0).xy * p.mvs;
+    vec3 c = max(texelFetch(InputColor, ip + p.cbase, 0).xyz, vec3(0.0));
+    c /= max(max(c.x, c.y), c.z) + 1.0;   // simple tonemap (preExposure 1)
+    float Y = 0.25 * (c.x + 2.0 * c.y + c.z);
+    float Co = clamp(0.5 * c.x + 0.5 - 0.5 * c.z, 0.0, 1.0);
+    float Cg = clamp(Y + Co - c.x, 0.0, 1.0);
+    imageStore(YCoCgColor, ip, vec4(Y, Co - 0.5, Cg - 0.5, 0.0));
+    imageStore(MotionDepthAlphaBuffer, ip, vec4(motion, nz, 0.0));
+}

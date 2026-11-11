@@ -33,8 +33,8 @@
 #include <string.h>
 
 enum { QS_NRET = 17, QS_NQ = 16, QS_NMARK = 256, QS_NDEF = 64, QS_NEV0 = 256, QS_DEFER_MAX = 32, QS_BACKLOG_MAX = 256, QS_NGW = 32, QS_GATE_LEARN = 2 };
-enum { QS_WHY_PRESENT, QS_WHY_FORGET, QS_WHY_CPU_WAIT, QS_WHY_SLOTS, QS_WHY_BACKLOG, QS_WHY_TIMEOUT, QS_NWHY };
-static const char *const qs_why_name[QS_NWHY] = {"present", "queue finalized", "CPU wait", "command buffers", "backlog", "park time"};
+enum { QS_WHY_PRESENT, QS_WHY_FORGET, QS_WHY_CPU_WAIT, QS_WHY_SLOTS, QS_WHY_BACKLOG, QS_WHY_TIMEOUT, QS_WHY_PROG, QS_NWHY };
+static const char *const qs_why_name[QS_NWHY] = {"present", "queue finalized", "CPU wait", "command buffers", "backlog", "park time", "program finalized"};
 
 // Where a submission cut at a wait goes on: the record after the wait, and the return points of the command lists that called it (innermost last)
 typedef struct qs_cont { const uint8_t *p; int nret; const uint8_t *ret[QS_NRET]; } qs_cont;

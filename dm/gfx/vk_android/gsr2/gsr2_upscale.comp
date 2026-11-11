@@ -1,0 +1,132 @@
+#version 450
+//============================================================================================================
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+//============================================================================================================
+// Snapdragon GSR2 3-pass (snapdragon-gsr d926f074, sgsr/v2/include/glsl_3_pass_cs/sgsr2_upscale.comp; BSD-3-Clause, notice above and LICENSE) for NVN2's DLSS
+// stand-in (vka_dlss.c). Changes from upstream: texel fetches of the RGBA16F YCoCg in place
+// of R32UI gathers; the scene colour is written tonemapped (dlss_rcas.comp undoes it after RCAS); levers for the history floor (hmin), motion -> current weight (motw),
+// motion -> box shrink (boxmotw), box tolerance, history weight scale (hscale); a motion ramp (mlo, mrcp) driving hsmov / afmot / bsmov, and a Catmull-Rom
+// history fetch (hcr: 1 everywhere, 2 along the ramp); the motion from the render texel the output pixel lies in (mvnear) and the host's cap of the still-pixel box size
+// (scaleRatio.y = min(area ratio^3, sfcap)). The tunes are vka_dlss.c's G_TUNES. Algorithm otherwise unchanged.
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform highp sampler2D PrevHistoryOutput;
+layout(set = 0, binding = 1) uniform highp sampler2D MotionDepthClipAlphaBuffer;
+layout(set = 0, binding = 2) uniform highp sampler2D YCoCgColor;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D HistoryOutput;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D SceneColorOutput;
+layout(push_constant) uniform P {
+    vec2 renderSize; vec2 outputSize; vec2 renderSizeRcp; vec2 outputSizeRcp; vec2 jitterOffset; vec2 scaleRatio;
+    float minLerpContribution; float reset; int tm; int tap9; float hmin; float motw; float boxtol; float boxmotw; float hscale;
+    float mlo; float mrcp; float hsmov; float afmot; float bsmov; float hcr; float mvnear; float pad3[4];
+} params;
+float FastLanczos(float base) { float y = base - 1.0f; float y2 = y * y; float y_temp = 0.75f * y + y2; return y_temp * y2; }
+// 4x4 Catmull-Rom fetch of the history colour (motion clarity: the bilinear re-sample blurs moving content a little more every frame), clamped to the 2x2 bilinear
+// footprint's min / max so it cannot ring; the W channel stays bilinear
+vec3 HCR(vec2 uv) {
+    ivec2 hs = ivec2(params.outputSize) - 1; vec2 p = uv * params.outputSize - 0.5; vec2 f = floor(p); vec2 t = p - f; ivec2 b = ivec2(f);
+    vec2 w0 = ((-0.5 * t + 1.0) * t - 0.5) * t, w1 = (1.5 * t - 2.5) * t * t + 1.0, w2 = ((-1.5 * t + 2.0) * t + 0.5) * t, w3 = (0.5 * t - 0.5) * t * t;
+    vec3 acc = vec3(0.0), mn = vec3(1e30), mx = vec3(-1e30);
+    for (int j = 0; j < 4; j++) {
+        float wy = j == 0 ? w0.y : j == 1 ? w1.y : j == 2 ? w2.y : w3.y; vec3 row = vec3(0.0);
+        for (int i = 0; i < 4; i++) {
+            float wx = i == 0 ? w0.x : i == 1 ? w1.x : i == 2 ? w2.x : w3.x;
+            vec3 c = texelFetch(PrevHistoryOutput, clamp(b + ivec2(i - 1, j - 1), ivec2(0), hs), 0).xyz; row += c * wx;
+            if ((i == 1 || i == 2) && (j == 1 || j == 2)) { mn = min(mn, c); mx = max(mx, c); }
+        }
+        acc += row * wy;
+    }
+    return clamp(acc, mn, mx);
+}
+vec3 C(ivec2 q) { return texelFetch(YCoCgColor, clamp(q, ivec2(0), ivec2(params.renderSize) - 1), 0).xyz; }
+void main()
+{
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(gid, ivec2(params.outputSize)))) return;
+    float Biasmax_viewportXScale = min(params.outputSize.x / params.renderSize.x, 1.99);
+    float scalefactor = params.scaleRatio.y;   // the host's min((output / render area)^3, sfcap): upstream's cap is 20
+    vec2 Hruv = (vec2(gid) + 0.5) * params.outputSizeRcp;
+    vec2 InputJitter = params.jitterOffset;
+    vec2 Jitteruv = clamp(Hruv + InputJitter * params.renderSizeRcp, 0.0, 1.0);
+    ivec2 InputPos = ivec2(Jitteruv * params.renderSize);
+    vec4 mdn = texelFetch(MotionDepthClipAlphaBuffer, clamp(InputPos, ivec2(0), ivec2(params.renderSize) - 1), 0);
+    float alphab = mdn.w;
+    vec3 mda = textureLod(MotionDepthClipAlphaBuffer, Jitteruv, 0.0).xyz;
+    // The motion of the render texel this output pixel lies in, not the bilinear blend of a silhouette's foreground and background motion (which drags history
+    // half a step along); the depth clip stays bilinear
+    vec2 Motion = params.mvnear != 0.0 ? mdn.xy : mda.xy;
+    vec2 PrevUV = clamp(vec2(-0.5 * Motion.x + Hruv.x, -0.5 * Motion.y + Hruv.y), 0.0, 1.0);
+    float depthfactor = mda.z;
+    float history_value = fract(alphab);
+    float alphamask = (alphab - history_value) * 0.001f;
+    history_value *= 2.0;
+    vec4 History = textureLod(PrevHistoryOutput, PrevUV, 0.0);
+    vec3 HistoryColor = History.xyz;
+    float motion_viewport_len = length(Motion * params.outputSize);
+    // Motion ramp, 0 below mlo, 1 above mlo + 1 / mrcp (units of motion_viewport_len, about 2x the output-pixel motion); mrcp 0 = off (upstream behaviour)
+    float motramp = clamp((motion_viewport_len - params.mlo) * params.mrcp, 0.0, 1.0);
+    if (params.hcr == 1.0) HistoryColor = HCR(PrevUV);                                                       // Catmull-Rom history everywhere
+    else if (params.hcr == 2.0 && motramp > 0.0) HistoryColor = mix(HistoryColor, HCR(PrevUV), motramp);    // only along the motion ramp (still / slow: bilinear)
+    float Wfactor = max(clamp(abs(History.w), 0.0, 1.0), alphamask);
+    vec4 Upsampledcw = vec4(0.0);
+    float kernelfactor = clamp(Wfactor + params.reset, 0.0, 1.0);
+    float biasmax = Biasmax_viewportXScale - Biasmax_viewportXScale * kernelfactor;
+    float biasmin = max(1.0f, 0.3 + 0.3 * biasmax);
+    float biasfactor = max(0.25f * depthfactor, kernelfactor);
+    float kernelbias = mix(biasmax, biasmin, biasfactor);
+    float curvebias = mix(-2.0, -3.0, clamp(motion_viewport_len * 0.02, 0.0, 1.0));
+    vec3 rectboxcenter = vec3(0.0), rectboxvar = vec3(0.0), rectboxmin = vec3(0.0), rectboxmax = vec3(0.0);
+    float rectboxweight = 0.0;
+    vec2 srcpos = vec2(InputPos) + vec2(0.5) - InputJitter;
+    vec2 srcpos_srcOutputPos = srcpos - Hruv * params.renderSize;
+    kernelbias *= 0.5f;
+    float kernelbias2 = kernelbias * kernelbias;
+    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+        vec3 samplecolor = C(InputPos + ivec2(dx, dy));
+        vec2 baseoffset = srcpos_srcOutputPos + vec2(dx, dy);
+        float baseoffset_dot = dot(baseoffset, baseoffset);
+        float weight = FastLanczos(clamp(baseoffset_dot * kernelbias2, 0.0, 1.0));
+        Upsampledcw += vec4(samplecolor * weight, weight);
+        float boxweight = exp(baseoffset_dot * curvebias);
+        if (dx == -1 && dy == -1) { rectboxmin = samplecolor; rectboxmax = samplecolor; } else { rectboxmin = min(rectboxmin, samplecolor); rectboxmax = max(rectboxmax, samplecolor); }
+        vec3 wsample = samplecolor * boxweight;
+        rectboxcenter += wsample; rectboxvar += samplecolor * wsample; rectboxweight += boxweight;
+    }
+    rectboxweight = 1.0 / rectboxweight;
+    rectboxcenter *= rectboxweight;
+    rectboxvar *= rectboxweight;
+    rectboxvar = sqrt(abs(rectboxvar - rectboxcenter * rectboxcenter));
+    Upsampledcw.xyz = clamp(Upsampledcw.xyz / Upsampledcw.w, rectboxmin - vec3(params.boxtol), rectboxmax + vec3(params.boxtol));
+    Upsampledcw.w = Upsampledcw.w * (1.0f / 3.0f);
+    float tcontribute = history_value * clamp(rectboxvar.x * 10.0f, 0.0, 1.0);
+    float OneMinusWfactor = 1.0f - Wfactor;
+    tcontribute = tcontribute * OneMinusWfactor;
+    // Along the motion ramp, fade the anti-flicker pass-through of out-of-box history (afmot), tighten the history box (bsmov) and move the history weight scale from
+    // hscale to hsmov (below)
+    tcontribute *= 1.0 - motramp * params.afmot;
+    float baseupdate = OneMinusWfactor - OneMinusWfactor * depthfactor;
+    baseupdate = min(baseupdate, mix(baseupdate, Upsampledcw.w * 10.0f, clamp(10.0f * motion_viewport_len, 0.0, 1.0)));
+    baseupdate = min(baseupdate, mix(baseupdate, Upsampledcw.w, clamp(motion_viewport_len * params.motw, 0.0, 1.0)));
+    float basealpha = baseupdate;
+    const float EPSILON = 1.192e-07f;
+    float boxscale = max(max(depthfactor, clamp(motion_viewport_len * params.boxmotw, 0.0, 1.0)), motramp * params.bsmov);
+    float boxsize = mix(scalefactor, 1.0f, boxscale);
+    vec3 sboxvar = rectboxvar * boxsize;
+    rectboxmax = min(rectboxmax, rectboxcenter + sboxvar);
+    rectboxmin = max(rectboxmin, rectboxcenter - sboxvar);
+    vec3 clampedcolor = clamp(HistoryColor, rectboxmin, rectboxmax);
+    float lerpcontribution = (any(greaterThan(rectboxmin, HistoryColor)) || any(greaterThan(HistoryColor, rectboxmax))) ? tcontribute : 1.0f;
+    lerpcontribution = lerpcontribution - lerpcontribution * sqrt(alphamask);
+    HistoryColor = mix(clampedcolor, HistoryColor, clamp(lerpcontribution, 0.0, 1.0));
+    float basemin = min(basealpha, params.hmin);
+    basealpha = mix(basemin, basealpha, clamp(lerpcontribution, 0.0, 1.0));
+    basealpha *= mix(params.hscale, params.hsmov, motramp);
+    float alphasum = max(EPSILON, basealpha + Upsampledcw.w);
+    float alpha = clamp(Upsampledcw.w / alphasum + params.reset, 0.0, 1.0);
+    Upsampledcw.xyz = mix(HistoryColor, Upsampledcw.xyz, alpha);
+    imageStore(HistoryOutput, gid, vec4(Upsampledcw.xyz, Wfactor));
+    float x_z = Upsampledcw.x - Upsampledcw.z;
+    imageStore(SceneColorOutput, gid, vec4(clamp(vec3(x_z + Upsampledcw.y, Upsampledcw.x + Upsampledcw.z, x_z - Upsampledcw.y), 0.0, 1.0), 0.0));
+}

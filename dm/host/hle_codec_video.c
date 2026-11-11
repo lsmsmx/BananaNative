@@ -32,6 +32,7 @@
 #define CV_READY 4                  // decoded pictures waiting for a released buffer at which the submission-ready event goes down
 #define CV_HOLD 12                  // and at which packets are refused. Mario Tennis Fever's player sends one packet per signal and ignores the result (nro0+0xd16130), so a signal in flight when the
                                     // event goes down must still find room: refused at 4, a packet about 6 s into the title movie was lost, and libvpx found every frame after it corrupt
+#define CV_HOLDMAX (CV_HOLD + 16)  // room past CV_HOLD for frame-parallel dav1d (profile av1_decoder dav1d): its pictures in flight (up to DM_DAV1D_FRAME_DELAY) come at once at the end of a stream
 #define CV_EVENT_OFF 0x100          // the submission-ready SystemEventType inside the decoder type
 #define CV_STAT_N 512               // samples a DM_CODEC_STATS window keeps (5 s of a 60 fps stream is 300)
 #define CV_R(desc) ((Result)(0x6f | ((desc) << 9)))   // nn::codec results (module 111)
@@ -50,7 +51,7 @@ typedef struct {
     struct { cv_pool *pool; uint32_t pidx; int reg, filled; uint32_t gen, filled_gen; uint16_t w, h; int64_t ts; uint8_t eos; } buf[CV_BUFS];
     uint32_t fifo[8], fhead, fcount;          // acquirable indices
     uint32_t pend[CV_BUFS], phead, pcount;    // released, waiting for a picture
-    vpx_image_t *held[CV_HOLD]; int64_t held_ts[CV_HOLD]; uint8_t held_eos[CV_HOLD]; int nheld;
+    vpx_image_t *held[CV_HOLDMAX]; int64_t held_ts[CV_HOLDMAX]; uint8_t held_eos[CV_HOLDMAX]; int nheld;
     int eos_pending;
     int seq, skipped; uint64_t stream_pkts;   // DM_MOVIE_SKIP: the decoder's place in the session; the stream was ended by it (later packets dropped until Stop / Flush); packets since Stop / Flush
     struct {   // DM_CODEC_STATS (=1): one log line every 5 s of a stream (cv_stat_*)
@@ -114,11 +115,33 @@ static void spt_unarm(void *e) { pthread_mutex_lock(&g_spt_mu); for (int k = 0; 
 #define CV_NATIVE_ALIGN 0x4000ull
 static uint32_t native_stride(uint32_t w) { return (w * 4 + 63) & ~63u; }
 static uint64_t native_size(uint32_t w, uint32_t h) { return ((uint64_t)native_stride(w) * h + CV_NATIVE_ALIGN - 1) & ~(CV_NATIVE_ALIGN - 1); }
-static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
+// Frame-parallel dav1d (profile av1_decoder dav1d, mav1_async): its pictures are converted to RGBA on the decode thread (into user_priv), so the buffer release, which Fire Emblem
+// Fortune's Weave makes on its main thread, only copies them into the pool (Pad 3, 2560x1440: md_rgba 7-13 ms against a 2 ms copy). DM_AV1_RGBA_EARLY=0 converts at the release.
+// Costs 4 w h bytes per picture waiting for a buffer (14.7 MB at 2560x1440)
+static int rgba_early(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_AV1_RGBA_EARLY"); v = !(e && *e == '0'); } return v; }
+static void cv_img_free(vpx_image_t *im) { if (!im) return; free(im->user_priv); im->user_priv = NULL; vpx_img_free(im); }
+// The pool's memory is the game's, under the GPU replay's write tracking (nvn_dirty.c, Android): its pages are read-only after each upload of the texture made over it, and a write
+// faults once per page. A 2560x1440 picture took about 2,500 faults and 16-17 ms a frame on the releasing thread (Fire Emblem Fortune's Weave, Pad 3: 8.3 million faults in one
+// 110 s movie). With hold (frame-parallel dav1d's pictures) the pages are released (and stamped written) in one go first, as a host read into guest memory does
+#ifdef __ANDROID__
+__attribute__((weak)) void nvn_dirty_hold(const void *addr, size_t len);
+__attribute__((weak)) void nvn_dirty_unhold(void);
+#define CV_HOLD_PAGES(a, n) do { if (&nvn_dirty_hold) nvn_dirty_hold((a), (n)); } while (0)
+#define CV_UNHOLD_PAGES() do { if (&nvn_dirty_unhold) nvn_dirty_unhold(); } while (0)
+#else   // Mach-O has no undefined weak reference without -U (as MD_SWAP_RB): the Mac's replay tracks no pages this way
+#define CV_HOLD_PAGES(a, n) ((void)0)
+#define CV_UNHOLD_PAGES() ((void)0)
+#endif
+static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im, int hold) {
     if (!p->mem || (i + 1) * native_size(p->w, p->h) > p->size) return;
     uint8_t *dst = p->mem + i * native_size(p->w, p->h);
     uint32_t stride = native_stride(p->w);
-    if (stride == (uint32_t)p->w * 4) { md_rgba(im, dst, p->w, p->h); }
+    if (hold) CV_HOLD_PAGES(dst, (size_t)stride * p->h);
+    if (im->user_priv && im->d_w == p->w && im->d_h == p->h) {   // converted already (rgba_early)
+        if (stride == (uint32_t)p->w * 4) memcpy(dst, im->user_priv, (size_t)p->w * p->h * 4);
+        else for (uint32_t y = 0; y < p->h; y++) memcpy(dst + (size_t)y * stride, (uint8_t *)im->user_priv + (size_t)y * p->w * 4, (size_t)p->w * 4);
+    }
+    else if (stride == (uint32_t)p->w * 4) { md_rgba(im, dst, p->w, p->h); }
     else {
         uint8_t *tmp = malloc((size_t)p->w * p->h * 4);
         if (!tmp) return;
@@ -126,6 +149,7 @@ static void pool_native_write(cv_pool *p, uint32_t i, const vpx_image_t *im) {
         for (uint32_t y = 0; y < p->h; y++) memcpy(dst + (size_t)y * stride, tmp + (size_t)y * p->w * 4, (size_t)p->w * 4);
         free(tmp);
     }
+    if (hold) CV_UNHOLD_PAGES();
     atomic_fetch_add_explicit(&p->gen, 1, memory_order_release);
     atomic_fetch_add_explicit(&g_vpool_writes, 1, memory_order_release);
 }
@@ -164,10 +188,11 @@ static void drain_from(cv_dec *d, int took, int before) {
         typeof(d->buf[0]) *b = &d->buf[i];
         if (d->nheld) {
             vpx_image_t *im = d->held[0]; int64_t ts = d->held_ts[0]; uint8_t eos = d->held_eos[0];
-            memmove(d->held, d->held + 1, sizeof d->held[0] * (CV_HOLD - 1)); memmove(d->held_ts, d->held_ts + 1, sizeof d->held_ts[0] * (CV_HOLD - 1));
-            memmove(d->held_eos, d->held_eos + 1, CV_HOLD - 1); d->nheld--;
+            memmove(d->held, d->held + 1, sizeof d->held[0] * (CV_HOLDMAX - 1)); memmove(d->held_ts, d->held_ts + 1, sizeof d->held_ts[0] * (CV_HOLDMAX - 1));
+            memmove(d->held_eos, d->held_eos + 1, CV_HOLDMAX - 1); d->nheld--;
             b->w = (uint16_t)im->d_w; b->h = (uint16_t)im->d_h; b->ts = ts; b->eos = eos;
-            if (b->pool && b->pidx < b->pool->count) { pool_native_write(b->pool, b->pidx, im); if (b->pool->img[b->pidx]) vpx_img_free(b->pool->img[b->pidx]); b->pool->img[b->pidx] = im; } else vpx_img_free(im);
+            if (b->pool && b->pidx < b->pool->count) { pool_native_write(b->pool, b->pidx, im, d->codec == CV_AV1 && mav1_async(d->av1)); free(im->user_priv); im->user_priv = NULL;
+                if (b->pool->img[b->pidx]) cv_img_free(b->pool->img[b->pidx]); b->pool->img[b->pidx] = im; } else cv_img_free(im);
             if (!d->pictures++) LOG("[codec] %s decoder %u: first picture %ux%u into buffer %u", k_cv_name[d->codec], d->id, b->w, b->h, i);
         } else { b->w = b->h = 0; b->ts = 0; b->eos = 1; d->eos_pending = 0; }
         if (b->eos) LOG("[codec] %s decoder %u: end of stream after %llu pictures", k_cv_name[d->codec], d->id, (unsigned long long)d->pictures);
@@ -224,7 +249,7 @@ HLE_FORCE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTy
     for (int k = 0; k < 16; k++) if (g_cv[k]) { pthread_mutex_lock(&g_cv[k]->mu); for (int i = 0; i < CV_BUFS; i++) if (g_cv[k]->buf[i].pool == p) g_cv[k]->buf[i].pool = NULL; pthread_mutex_unlock(&g_cv[k]->mu); }
     if (p->slot) g_cv_pools[p->slot - 1] = NULL;
     pthread_mutex_unlock(&g_cv_mu);
-    for (uint32_t i = 0; i < p->count; i++) if (p->img[i]) vpx_img_free(p->img[i]);
+    for (uint32_t i = 0; i < p->count; i++) if (p->img[i]) cv_img_free(p->img[i]);
     free(p->img); p->magic = 0; free(p); *(cv_pool **)t = NULL;
 }
 HLE_FORCE("_ZN2nn5codec36GetDecoderImagePoolNativeImageHandleEPKNS0_25VideoDecoderImagePoolTypeEj", "a handle the host's nvnNativeImage knows; the pool keeps its pictures as RGBA from now on",
@@ -405,7 +430,7 @@ static Result cv_dec_fin(void *t) {
     if (d->codec != CV_H264 && d->codec != CV_AV1 && d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->avc) mavc_free(d->avc);
     if (d->av1) mav1_free(d->av1);
-    for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
+    for (int i = 0; i < d->nheld; i++) cv_img_free(d->held[i]);
     free(d->csd); d->magic = 0;
     // The submission-ready event goes with the decoder, as in the SDK. Kept, it stayed in the host's bound-event table, so the next decoder initialised in the same memory found its
     // event "bound" and was not given one: the game had cleared that memory, and nn::os aborted on the uninitialised event (Donkey Kong Bananza, its second movie)
@@ -440,7 +465,7 @@ static Result cv_dec_reset(void *t) {   // Stop / Flush: pictures not yet given 
     cv_dec *d = cv_of(t); if (!d) return 0;
     pthread_mutex_lock(&d->mu);
     if (d->th_ok) cv_qwait(d);   // queued packets dropped, a decode running finishes (its pictures given up) before the codec starts over
-    for (int i = 0; i < d->nheld; i++) vpx_img_free(d->held[i]);
+    for (int i = 0; i < d->nheld; i++) cv_img_free(d->held[i]);
     if (cv_stat_on()) { cv_stat_flush(d, now_ns(), " (to Stop / Flush)"); d->st.last_pic_ns = 0; }
     d->nheld = 0; d->eos_pending = 0; d->skipped = 0; d->stream_pkts = 0;
     cv_open(d);
@@ -459,7 +484,7 @@ static Result cv_dec_start(void *t) {
 }
 static Result cv_dec_event(void **out, void *t) { cv_dec *d = cv_of(t); *out = d ? d->event : NULL; return d ? 0 : CV_R(2004); }
 static int cv_hold(cv_dec *d, vpx_image_t *c, int64_t ts) {   // a decoded picture waits for a released buffer (decoder lock held); 0 when the host holds no more
-    if (d->nheld >= CV_HOLD) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: a packet gave more pictures than the host holds: one dropped", k_cv_name[d->codec]); vpx_img_free(c); return 0; }
+    if (d->nheld >= CV_HOLDMAX) { static int n; if (n++ < 4) LOG("[RED] nn::codec %s: a packet gave more pictures than the host holds: one dropped", k_cv_name[d->codec]); cv_img_free(c); return 0; }
     d->held[d->nheld] = c; d->held_ts[d->nheld] = ts; d->held_eos[d->nheld] = 0; d->nheld++; return 1;
 }
 static vpx_image_t *nv12_to_i420(const uint8_t *nv12, unsigned w, unsigned h) {   // VideoToolbox's NV12 as the I420 the pool keeps
@@ -471,10 +496,15 @@ static vpx_image_t *nv12_to_i420(const uint8_t *nv12, unsigned w, unsigned h) { 
         c->planes[2][(size_t)y * c->stride[2] + x] = uv[(size_t)y * w + 2 * x + 1]; }
     return c;
 }
-static vpx_image_t *av1_to_i420(const mav1_picture *p) {   // the decoder's NV12, rows at its strides, as the I420 the pool keeps
+static vpx_image_t *av1_to_i420(const mav1_picture *p) {   // the decoder's NV12 (or its three planes: u / v, frame-parallel dav1d), rows at its strides, as the I420 the pool keeps
     vpx_image_t *c = vpx_img_alloc(NULL, VPX_IMG_FMT_I420, (unsigned)p->w, (unsigned)p->h, 1); if (!c) return NULL;
     c->cs = p->matrix == 2 ? VPX_CS_BT_709 : p->matrix == 5 ? VPX_CS_BT_2020 : VPX_CS_BT_601; c->range = p->full_range ? VPX_CR_FULL_RANGE : VPX_CR_STUDIO_RANGE;
     for (int y = 0; y < p->h; y++) memcpy(c->planes[0] + (size_t)y * c->stride[0], p->y + (size_t)y * p->ystride, (size_t)p->w);
+    if (p->u) {
+        for (int y = 0; y < (p->h + 1) / 2; y++) { memcpy(c->planes[1] + (size_t)y * c->stride[1], p->u + (size_t)y * p->cstride, (size_t)(p->w + 1) / 2);
+                                                   memcpy(c->planes[2] + (size_t)y * c->stride[2], p->v + (size_t)y * p->cstride, (size_t)(p->w + 1) / 2); }
+        return c;
+    }
     for (int y = 0; y < (p->h + 1) / 2; y++) {
         const uint8_t *uv = p->uv + (size_t)y * p->uvstride; uint8_t *u = c->planes[1] + (size_t)y * c->stride[1], *v = c->planes[2] + (size_t)y * c->stride[2];
         for (int x = 0; x < (p->w + 1) / 2; x++) { u[x] = uv[2 * x]; v[x] = uv[2 * x + 1]; }
@@ -488,8 +518,24 @@ static vpx_image_t *av1_to_i420(const mav1_picture *p) {   // the decoder's NV12
 static int cv_skip_mode(void) { const char *s = getenv("DM_MOVIE_SKIP"); return !s ? 0 : !strcmp(s, "all") ? 2 : !strcmp(s, "1") ? 1 : 0; }
 // One packet's pictures, at most cap of them, into pic / pts. Touches only the codec state: the decode thread runs it without the decoder lock (Stop / Flush and Finalize
 // wait for it to finish, cv_qwait); the synchronous path holds the lock
+// Frame-parallel dav1d's pictures (mav1_send / mav1_flush): copied, converted to RGBA here on the decode thread (rgba_early), at most cap of them
+typedef struct { vpx_image_t **pic; int64_t *pts; int cap, n; } cv_fp;
+static void cv_fp_take(void *c_, const mav1_picture *p, int64_t ts) {
+    cv_fp *c = c_; vpx_image_t *im = av1_to_i420(p);
+    if (!im) return;
+    if (c->n >= c->cap) { static int k; if (k++ < 4) LOG("[RED] nn::codec AV1: a packet gave more pictures than the host holds: one dropped"); vpx_img_free(im); return; }
+    if (rgba_early() && (im->user_priv = malloc((size_t)im->d_w * im->d_h * 4))) md_rgba(im, im->user_priv, (int)im->d_w, (int)im->d_h);
+    c->pic[c->n] = im; c->pts[c->n++] = ts;
+}
+static int cv_room(cv_dec *d) { return d->codec == CV_AV1 && mav1_async(d->av1) ? CV_HOLDMAX : CV_HOLD; }   // pictures a decoder may hold (CV_HOLDMAX: frame-parallel dav1d)
 static int cv_decode(cv_dec *d, const void *data, uint64_t size, int64_t ts, bool eos, vpx_image_t **pic, int64_t *pts, int cap) {
     int n = 0;
+    if (d->codec == CV_AV1 && mav1_async(d->av1)) {   // profile av1_decoder dav1d: pictures leave some packets after their own, each with its packet's time; all of them at the end of the stream
+        cv_fp c = {pic, pts, cap, 0};
+        if (size) mav1_send(d->av1, data, (size_t)size, ts, cv_fp_take, &c);
+        if (eos) mav1_flush(d->av1, cv_fp_take, &c);
+        return c.n;
+    }
     if (d->codec == CV_H264 && d->avc) {   // VideoToolbox reorders: pictures leave in presentation order, all of them at the end of the stream
         if (size && mavc_decode(d->avc, data, (int)size, ts / 1000) < 0) { static int k; if (k++ < 4) LOG("[RED] nn::codec H.264: VideoToolbox could not decode a packet"); }
         uint8_t *nv12 = malloc((size_t)d->w * d->h * 3 / 2); int64_t p = 0;
@@ -538,9 +584,9 @@ static void *cv_worker(void *a) {
         cv_pkt *p = d->q; d->q = p->next; if (!d->q) d->qtail = &d->q;
         // The room the pictures have, taken under the lock as the synchronous path does: only this thread adds pictures and releases only take them, so it holds until
         // they are delivered. With CV_HOLD here, a packet's pictures beyond the room were dropped at delivery (cv_hold), most likely the last ones of a stream
-        uint32_t gen = d->qgen; int cap = CV_HOLD - d->nheld; d->busy = 1;
+        uint32_t gen = d->qgen; int cap = cv_room(d) - d->nheld; d->busy = 1;
         pthread_mutex_unlock(&d->mu);
-        vpx_image_t *pic[CV_HOLD]; int64_t pts[CV_HOLD]; uint64_t t0 = now_ns();
+        vpx_image_t *pic[CV_HOLDMAX]; int64_t pts[CV_HOLDMAX]; uint64_t t0 = now_ns();
         int n = cap > 0 ? cv_decode(d, p->data, p->size, p->ts, p->eos, pic, pts, cap) : 0;
         uint64_t dns = now_ns() - t0;
         pthread_mutex_lock(&d->mu);
@@ -548,7 +594,7 @@ static void *cv_worker(void *a) {
         // packet, and Mario Tennis Fever's player counts each as a packet it may send (CV_HOLD)
         int before = d->nheld + d->nq; d->nq--; d->busy = 0;
         if (gen == d->qgen && !d->quit) { cv_deliver(d, pic, pts, n, p->eos, dns, p->size || p->eos); drain_from(d, 0, before); }
-        else for (int k = 0; k < n; k++) vpx_img_free(pic[k]);   // decoded across a Stop / Flush or Finalize: given up
+        else for (int k = 0; k < n; k++) cv_img_free(pic[k]);   // decoded across a Stop / Flush or Finalize: given up
         pthread_cond_broadcast(&d->idle);
         free(p);
     }
@@ -579,8 +625,8 @@ static Result cv_dec_submit(uint64_t *out, void *t, const void *data, uint64_t s
         *d->qtail = p; d->qtail = &p->next; d->nq++;
         pthread_cond_signal(&d->qcv);
     } else {
-        vpx_image_t *pic[CV_HOLD]; int64_t pts[CV_HOLD]; uint64_t t0 = now_ns();
-        int n = cv_decode(d, data, size, ts, eos, pic, pts, CV_HOLD - d->nheld);
+        vpx_image_t *pic[CV_HOLDMAX]; int64_t pts[CV_HOLDMAX]; uint64_t t0 = now_ns();
+        int n = cv_decode(d, data, size, ts, eos, pic, pts, cv_room(d) - d->nheld);
         cv_deliver(d, pic, pts, n, eos, now_ns() - t0, size || eos);
     }
     *out = ++d->submits; d->stream_pkts++;

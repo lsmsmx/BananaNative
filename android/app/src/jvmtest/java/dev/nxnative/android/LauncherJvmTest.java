@@ -115,6 +115,9 @@ public final class LauncherJvmTest {
         check(lim.fpsLimit == 30 && !lim.decoupled && !lim.drs, "fps_limit column: " + lim.fpsLimit);
         check(l.get(0).fpsLimit == 0 && Profile.parse("0400486024DEC000\tO\t0\tx\t\t\t\t\t\t\t\t\t\t1\t\t").get(0).fpsLimit == 0
                 && Profile.parse("0400486024DEC000\tO\t0\tx\t\t\t\t\t\t\t\t\t\t\t\tx").get(0).fpsLimit == 0, "no fps_limit: 0");
+        // The DLSS stand-in's Upscaler row (build.gradle dlssOf, the 17th column, after fps_limit): only with "1"
+        check(!l.get(0).dlss && !lim.dlss && Profile.parse("04007EF01F8AE000\tF\t0\tx\t\t\t\t\t\t\t\t\t\t\t\t\t1").get(0).dlss
+                && !Profile.parse("04007EF01F8AE000\tF\t0\tx\t\t\t\t\t\t\t\t\t\t\t\t1\t").get(0).dlss, "dlss column");
         check(Profile.versionName(0).equals("the base game") && Profile.versionName(458752).equals("update 458752"), "versionName");
         check(Profile.of("040074A01BF12000") != null && Profile.of("0100000000010000") == null, "Profile.of over BuildConfig.NX_PROFILES");
         check(Profile.missing("0100000000010000", "Mario").startsWith("This app version does not include Mario (0100000000010000).") && Profile.missing("040074A01BF12000", null) == null, "Profile.missing");

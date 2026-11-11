@@ -1,7 +1,7 @@
 // The texture cache's size and eviction policy (vka_tex.c vka_tex_prune_locked), free of Vulkan so the Mac's unit test (dm/host/tests/t_android_texlimit.c) can check it.
 // The limit is the most image memory the device can hold without pushing the game or the system out of RAM, measured, not guessed: the images' own bytes plus what the
 // process could still allocate (the smaller of Android's MemAvailable less a reserve and the image heap's budget, VK_EXT_memory_budget, less what else uses that heap), never
-// under a floor. DM_VK_IMG_LIMIT_MB, when set, replaces it. Eviction is least recently used first and never takes an image used in the current or the previous frame: when
+// under a floor, and no more than the images it holds while the system stalls on memory (vktl_pressure_limit). DM_VK_IMG_LIMIT_MB, when set, replaces it. Eviction is least recently used first and never takes an image used in the current or the previous frame: when
 // everything over the limit is in use the cache stays over it (a working set larger than the limit would otherwise be uploaded again every frame: the thrash
 // docs/reference/memory.md "Texture cache thrash" describes)
 #ifndef VKA_TEXLIMIT_H
@@ -18,12 +18,29 @@ typedef struct {
     uint64_t heap_size;                // the image memory type's heap (0 = not known)
     uint64_t heap_budget, heap_usage;  // VK_EXT_memory_budget for that heap (budget 0 = not available)
     uint64_t img_bytes;                // the cache's own image bytes now (part of mem_total - mem_avail and of heap_usage)
+    double psi_some10;                 // /proc/pressure/memory "some avg10": the share of the last 10 s some task stalled on memory, in percent (< 0 = not known)
 } vktl_in;
 
 static inline uint64_t vktl_sub(uint64_t a, uint64_t b) { return a > b ? a - b : 0; }
 // What RAM keeps free for the game's own growth, the rest of the process and the system: a 32nd, at least 512 MiB. Small on purpose: Android keeps MemAvailable low while
 // it has cached apps and compressed swap to give (Mario Kart World runs at 0.7-1 GB of it on a 16 GB phone), so a larger reserve would put a game that fits over the limit
-static inline uint64_t vktl_reserve(uint64_t mem_total) { uint64_t r = mem_total / 32; return r < 512 * VKTL_MIB ? 512 * VKTL_MIB : r; }
+// On a device of 12 GB or less (MemTotal up to 12 GiB) an eighth: there the game itself needs nearly all the RAM the system leaves (Ocarina of Time on an
+// Odin 2 Portal, 11 GiB: the images grew to 3.2 GiB without one prune while MemAvailable stayed above 512 MiB, and lmkd killed the game), and Android's
+// compressed swap keeps MemAvailable up while the game already stalls
+static inline uint64_t vktl_reserve(uint64_t mem_total) {
+    if (mem_total && mem_total <= 12 * 1024 * VKTL_MIB) return mem_total / 8;
+    uint64_t r = mem_total / 32; return r < 512 * VKTL_MIB ? 512 * VKTL_MIB : r;
+}
+// Memory pressure (Linux PSI): Android's lmkd kills the foreground game by how long tasks stall on memory, not by how much is free, so the cache follows it too.
+// From VKTL_PSI_HOLD percent of the last 10 s stalled the cache stops growing (the limit is what it holds: a new image evicts an old one); from VKTL_PSI_SHRINK
+// it gives an eighth back at each limit update, down to the floor. Images in use stay either way (vktl_evictable)
+#define VKTL_PSI_HOLD 5.0
+#define VKTL_PSI_SHRINK 15.0
+static inline uint64_t vktl_pressure_limit(uint64_t lim, uint64_t img_bytes, double psi_some10) {
+    if (psi_some10 >= VKTL_PSI_SHRINK) { uint64_t l = img_bytes - img_bytes / 8; if (l < lim) lim = l; }
+    else if (psi_some10 >= VKTL_PSI_HOLD) { if (img_bytes < lim) lim = img_bytes; }
+    return lim < VKTL_FLOOR ? VKTL_FLOOR : lim;
+}
 // The limit in bytes; floor when nothing is known
 static inline uint64_t vktl_limit(const vktl_in *in) {
     uint64_t lim = UINT64_MAX;
@@ -33,6 +50,7 @@ static inline uint64_t vktl_limit(const vktl_in *in) {
         uint64_t l = vktl_sub(in->heap_budget - in->heap_budget / 16, other); if (l < lim) lim = l;
     } else if (in->heap_size) { uint64_t l = in->heap_size / 2; if (l < lim) lim = l; }   // (no budget: half the heap, which on a unified-memory phone is the RAM)
     if (lim == UINT64_MAX || lim < VKTL_FLOOR) lim = VKTL_FLOOR;
+    if (in->psi_some10 > 0) lim = vktl_pressure_limit(lim, in->img_bytes, in->psi_some10);
     return lim;
 }
 // Prune down to this once over the limit (a margin, so one new image does not start another prune)

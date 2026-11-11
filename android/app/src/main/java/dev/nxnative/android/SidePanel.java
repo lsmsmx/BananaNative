@@ -422,6 +422,7 @@ final class SidePanel extends FrameLayout {
             });
         }
         box.addView(caps);
+        if (Prefs.limited(game()) && Prefs.presentOnly(game())) note(Prefs.PRESENT_ONLY_NOTE);   // fps_limit_present: the limit paces the presents only
         if (Prefs.paced(game())) {   // Full game speed at low frame rates: sead's controller at the measured rate (Game settings has the same), live in the host
             android.widget.CheckBox full = new android.widget.CheckBox(act);
             full.setText("Full game speed at low frame rates");
@@ -430,7 +431,7 @@ final class SidePanel extends FrameLayout {
             box.addView(full);
         }
         fpsNow = note("");
-        if (GameUpscaler.shown(act, game())) {   // right under the frame rate cap: the Upscaler (the game's own upscaler and the window's scaling to the screen), for games whose network it replaces
+        if (Prefs.dlssGame(game()) || GameUpscaler.shown(act, game())) {   // right under the frame rate cap: the Upscaler (the game's own upscaler and the window's scaling to the screen), for games whose network it replaces; for a game on the DLSS stand-in (no network to replace), the stand-in's modes with Motion clarity / sharpness
             GameUpscaler.rows(act, game(), box);
             note(act instanceof GameActivity && ((GameActivity) act).live() ? "Applies from the next frame, kept for this game (the same setting as Game settings › Upscaler)."
                     : "Applies at the next start (this run takes no live changes: DM_CTL is off).");

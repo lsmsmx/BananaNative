@@ -215,6 +215,15 @@ static void fb_tick(int target, const char *src) {
     }
 }
 
+// The row of a target frame rate the game steps by, at the place the rewriter found (dm/tools/fps_target.py; main's fixups FPS_TARGET_PTR, FPS_TARGET_FIELD): an int32 frame rate in the
+// object a global points to, which the game's readers divide 60.0 by to step it, and which the game sets to 30 or 60 itself. Fire Emblem Fortune's Weave's gxc graphics object holds it
+// (+0x1dc; its present asks for interval 60 / target), so at 60 the game asks for interval 1 and steps by 1.0 a frame. 0 rows: not found in this main
+static int target_row(const module_t *m, lock_t *out) {
+    if (!m->fps_target_ptr) return 0;
+    *out = (lock_t){ "", "target frame rate", m->fps_target_ptr, m->fps_target_field, FPS_I32, 1, 0 };
+    return 1;
+}
+
 // The Unreal rows of this main: the profile's frame-limit variable and the present intervals, at the objects the rewriter found (0 rows: not an Unreal main). *missing: an Unreal main
 // (the rewriter found some of its variables) without the profile's frame-limit variable
 static int ue_rows(const module_t *m, lock_t *out, int *missing) {
@@ -230,13 +239,14 @@ static int ue_rows(const module_t *m, lock_t *out, int *missing) {
 }
 
 // The running main's engine limiters, found once: by the first present (dm_fps_lock_tick) or by the graphics layer's present cap, which may ask first (dm_fps_lock_engine, from the acquire)
-#define NROWS (NLOCKS + 3 + NSTEPS)
-static lock_t ue[3], steps[NSTEPS > 0 ? NSTEPS : 1]; static const lock_t *rows[NROWS]; static int nrow, nier, ue_missing; static uint8_t *base; static uint32_t display;
+#define NROWS (NLOCKS + 4 + NSTEPS)
+static lock_t ue[3], target_lock, steps[NSTEPS > 0 ? NSTEPS : 1]; static const lock_t *rows[NROWS]; static int nrow, nier, ue_missing; static uint8_t *base; static uint32_t display;
 static pthread_once_t g_found = PTHREAD_ONCE_INIT;
 static void lock_find(void) {
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
         for (int k = 0; k < (int)(sizeof k_nier_dr / sizeof *k_nier_dr); k++) if (!strcmp(g_mod[i].build_id, k_nier_dr[k].build)) { base = g_mod[i].base; nier = 1; display = k_nier_dr[k].display; }
         for (int k = 0; k < NLOCKS; k++) if (!strcmp(g_mod[i].build_id, k_locks[k].build)) { rows[nrow++] = &k_locks[k]; base = g_mod[i].base; }
+        if (target_row(&g_mod[i], &target_lock)) { rows[nrow++] = &target_lock; base = g_mod[i].base; }
         int nue = ue_rows(&g_mod[i], ue, &ue_missing);
         for (int k = 0; k < nue; k++) { rows[nrow++] = &ue[k]; base = g_mod[i].base; }
         for (int k = 0; k < NSTEPS; k++) if (k_steps[k].build[0] && !strcmp(g_mod[i].build_id, k_steps[k].build)) {   // a step count: field = the count, scale = the mode field

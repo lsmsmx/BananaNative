@@ -25,6 +25,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * The launcher. Two pages in one activity (so every picker's result comes back here): Home, the short path to playing (pick your dump, prepare it, Play), and Settings
@@ -549,7 +550,7 @@ public final class MainActivity extends Activity {
             android.util.Log.w("nxnative", g.titleId + " " + g.gameDir + " with pack " + g.packDir + ": " + b.label() + ": " + b.detail);
             Problem s = new Problem(b.label(), dump && (b.kind == BuildCheck.Kind.OTHER_BUILD || b.kind == BuildCheck.Kind.MISSING));   // Prepare makes a pack of the dump's build; it cannot fix unreadable files, an unsupported build or another version's data
             s.anyway = b.kind == BuildCheck.Kind.UNSUPPORTED || b.kind == BuildCheck.Kind.ROMFS;
-            s.reason = s.anyway ? "Untested: it may not start or may crash. Play asks first." : s.prepare ? "The pack does not fit this dump. Prepare makes a new one." : "";
+            s.reason = s.anyway ? "Untested: it may not start or may crash. Play asks first." : s.prepare ? "The pack is for another update of this game. Prepare again rewrites the game's code (a few minutes; shaders are kept)." : "";
             s.detail = b.message + "\n\n" + b.detail + "\nPack: " + pd;
             return s;
         }
@@ -559,7 +560,15 @@ public final class MainActivity extends Activity {
             s.playable = Pack.playableLibrary(pd, g.titleId) != null;
             s.legacy = !s.playable && Pack.legacyLibrary(pd, g.titleId) != null;
             if (!s.playable && !s.legacy) {
-                s.reason = dump ? "This app version needs new shaders. Prepare shaders makes them from your dump." : "The pack has no shaders for this app version.";
+                int delta = Ondevice.deltaShaders(pd, g.titleId);
+                Profile prof = Profile.of(g.titleId);
+                if (dump && delta == 0) {
+                    s.reason = "Shaders up to date: nothing to translate.";
+                } else if (dump && delta > 0 && prof != null) {
+                    s.reason = String.format(Locale.getDefault(), "Translating %,d new shaders (the other %,d are reused; code is kept).", delta, prof.shaderTotal - delta);
+                } else {
+                    s.reason = dump ? "This app version needs new shaders. Prepare shaders translates them from your dump (the game's code is kept)." : "The pack has no shaders for this app version.";
+                }
                 s.detail = Pack.libraryProblem(pd, g.titleId);
             }
             return s;
@@ -649,7 +658,7 @@ public final class MainActivity extends Activity {
                 }
                 // A pack whose code other tools made: a small chip; its tap says what that means
                 TextView n = Ui.warnChip(this, "Pack from other tools", "Pack from other tools",
-                        "This game's pack was made by other tools than this app's. It usually still runs. If the game misbehaves, ⋯ › Prepare again remakes it from your dump.");
+                        "This game's pack was made by other tools than this app's. It usually still runs. If the game misbehaves, ⋯ › Prepare again rewrites the game's code from your dump (a few minutes; shaders are kept).");
                 LinearLayout.LayoutParams lp = Ui.wrap();
                 lp.topMargin = dp(6);
                 info.addView(n, lp);
@@ -1192,7 +1201,7 @@ public final class MainActivity extends Activity {
         }
         if (lp != null) {
             AlertDialog.Builder b = new AlertDialog.Builder(this).setTitle("Shaders missing")
-                    .setMessage((dump ? "Prepare " + Ondevice.shadersText(new File(g.packDir), g.titleId).replaceFirst("^Updates", "updates").replaceFirst("^Makes", "makes") : "Without them the game draws nothing.")
+                    .setMessage((dump ? Ondevice.shadersText(new File(g.packDir), g.titleId) : "Without them the game draws nothing.")
                             + "\n\n" + lp)
                     .setNeutralButton("Pick pack folder", (d, w) -> pickPack.run()).setNegativeButton("Cancel", null);
             if (dump) b.setPositiveButton("Prepare", (d, w) -> Ondevice.prepare(this, gd, false));
@@ -1210,7 +1219,7 @@ public final class MainActivity extends Activity {
     private void packProblem(Game g, String why, String detail, Runnable pickPack) {
         File gd = new File(g.gameDir);
         boolean dump = Ondevice.isDump(gd);
-        AlertDialog.Builder b = Ui.explain(this, "The pack cannot start this game", why + (dump ? "\n\nPrepare again makes a pack from your dump, on this phone." : ""),
+        AlertDialog.Builder b = Ui.explain(this, "The pack cannot start this game", why + (dump ? "\n\nPrepare again rewrites the game's code from your dump (a few minutes; shaders are kept)." : ""),
                         (detail.isEmpty() ? "" : detail + "\n") + "Pack: " + g.packDir)
                 .setNegativeButton("Cancel", null).setNeutralButton("Pick pack folder", (d, w) -> pickPack.run());
         if (dump) b.setPositiveButton("Prepare again", (d, w) -> Ondevice.prepare(this, gd, false));

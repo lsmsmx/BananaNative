@@ -592,7 +592,8 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     // A 3D texture is drawn into slice by slice (NVN render target views of its slices, or all of them layered): 2D / 2D-array views of slices need this (Vulkan 1.1 maintenance1)
     if (is3d && (u & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     // Zero-shared images (below): a large GPU-content image the caller makes (g_zwant: vka_tex_get, its content ST_ZERO) is made to alias the zeroed memory of its create info
-    int zs = g_zwant && VKA_ENV("DM_VK_ZSHARE", 1) && vkz_candidate(t->L.size, (uint64_t)(VKA_ENVF("DM_VK_ZSHARE_MB", 4.0) * 1048576.0), (uint64_t)(VKA_ENVF("DM_VK_ZSHARE_MAX_MB", 32.0) * 1048576.0), res, im->samples, is3d, compressed(f),
+    int zs = g_zwant && VKA_ENV("DM_VK_ZSHARE", 1) && vkz_candidate(t->L.size, (uint64_t)(VKA_ENVF("DM_VK_ZSHARE_MB", 4.0) * 1048576.0),
+                                                                    vkz_max(f->kind >= 3, V.driver_id == VK_DRIVER_ID_MESA_TURNIP, (int64_t)VKA_ENVF("DM_VK_ZSHARE_MAX_MB", -1.0)), res, im->samples, is3d, compressed(f),
                                                                     (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_DISPLAY)) != 0);
     if (zs) fl |= VK_IMAGE_CREATE_ALIAS_BIT;
     VkImageType it = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
@@ -1441,6 +1442,13 @@ void vka_tex_own(vka_img *im, VkCommandBuffer cb) {
 }
 
 // ---------- Soft textures (vka_soft.h; profile tex_soft) ----------
+// How many of the finest levels a soft texture leaves out: DM_VK_TEX_SOFT_LEVELS (live, 1 by default, 1 to 3), leaving at least two levels. Each level out quarters what
+// is left: 1 keeps a quarter of the texture, 2 a sixteenth. For a game whose textures in use alone overrun memory (Mario Kart World on a 12 GB device: 3.9 GB of images in use)
+static uint32_t soft_levels(uint32_t levels) {
+    uint32_t n = (uint32_t)VKA_ENV("DM_VK_TEX_SOFT_LEVELS", 1); if (n < 1) n = 1; if (n > 3) n = 3;
+    return levels > 2 && n > levels - 2 ? levels - 2 : n;
+}
+static uint32_t d_levels_of(const tex_t *t) { return t->d.levels ? (uint32_t)t->d.levels : 1; }
 // A large block-compressed texture from the game's files (vksoft_candidate, with content from its storage: ST_TRACK / ST_FILL) is an image from texture level 1 (img_create's
 // base, the mechanism a sparse texture's left-out levels use): uploads deswizzle texture level image level + base (upload_, upload_mt), views, render targets and copies map
 // texture levels through vka_img_lv / vksoft_view, and a view of level 0 starts at level 1 while a copy of level 0 is skipped. What the game sees differently: softer texels
@@ -1468,14 +1476,72 @@ static void soft_line(char *b, size_t n) {   // caller holds g_tmu
              (unsigned long long)g_soft_n, g_soft_bytes / 1048576.0, (unsigned long long)g_soft_made, (unsigned long long)g_soft_whole);
 }
 static void soft_note(vka_img *im, const tex_t *t) {   // a new soft image (caller holds g_tmu)
-    if (im->base != 1) return;   // (img_create_ starts it at 0 when it could not)
-    im->soft = 1; im->soft_saved = vksoft_saved(nvn_tex_level_offset(&t->d, 1), im->layers);
+    if (!im->base) return;   // (img_create_ starts it at 0 when it could not; DM_VK_TEX_SOFT_LEVELS may start it at 2 or 3)
+    im->soft = 1; im->soft_saved = vksoft_saved(nvn_tex_level_offset(&t->d, im->base ? im->base : 1), im->layers);
     g_soft_n++; g_soft_bytes += im->soft_saved; g_soft_made++;
-    if (g_soft_made <= 4) VLOG("soft texture serial %llu %ux%u layers %u levels %u format %#x: an image of its levels 1-%u (%.1f MiB of storage left out)", (unsigned long long)t->serial,
-                               t->d.width, t->d.height, im->layers, t->d.levels, t->d.levels - 1, im->soft_saved / 1048576.0);
+    if (g_soft_made <= 4) VLOG("soft texture serial %llu %ux%u layers %u levels %u format %#x: an image of its levels %u-%u (%.1f MiB of storage left out)", (unsigned long long)t->serial,
+                               t->d.width, t->d.height, im->layers, t->d.levels, t->d.format, im->base, t->d.levels - 1, im->soft_saved / 1048576.0);
     if (!(g_soft_made & (g_soft_made - 1)) || !(g_soft_made % 1024)) { char b[300]; soft_line(b, sizeof b); VLOG("%s", b); }   // (1, 2, 4, ... and every 1024th; the ctl stats print it too)
 }
 void vka_tex_soft_stats(char *b, size_t n) { pthread_mutex_lock(&g_tmu); soft_line(b, n); pthread_mutex_unlock(&g_tmu); }
+
+// ---------- Where the image memory goes (diagnostic, the ctl stats) ----------
+// The live images by content and by why the cache keeps them (vktl_evictable's reasons), and the largest ones: for a game whose images in use overrun memory (Mario Kart World,
+// 3.9 GB on a 12 GB device) this says which lever helps - smaller texture assets (soft textures, compressed or resized), render targets (resolution), or images kept by a rule
+enum { IK_GPU, IK_ZERO_SHARED, IK_BC, IK_RAW, IK_SPARSE, IK_CLEARED, IK_N };
+static const char *const ik_name[IK_N] = {"GPU-written", "zero-shared, not yet written", "from storage, block-compressed", "from storage, uncompressed", "sparse", "cleared, never written"};
+enum { IR_HELD, IR_NEW, IR_FENCE, IR_RECENT, IR_GPU_GRACE, IR_EVICTABLE, IR_N };
+static const char *const ir_name[IR_N] = {"held", "never used", "GPU not done", "used in the last 2 frames", "GPU-written, used in the last 120 frames", "evictable"};
+static int img_kind(const vka_img *im) {
+    if (im->gpu_owned) return IK_GPU;
+    if (im->m.z) return IK_ZERO_SHARED;
+    if (im->mode == ST_SPARSE || im->rs) return IK_SPARSE;
+    if (im->mode == ST_TRACK || im->mode == ST_FILL) return im->f.bw > 1 ? IK_BC : IK_RAW;
+    return IK_CLEARED;
+}
+static int img_keep_reason(const vka_img *im, uint64_t cur, uint64_t done) {
+    if (im->holds) return IR_HELD;
+    if (!im->last_frame || cur <= im->last_frame) return IR_NEW;
+    if (im->last_fence && done < im->last_fence) return IR_FENCE;
+    uint64_t age = cur - im->last_frame;
+    if (age < VKTL_KEEP_FRAMES) return IR_RECENT;
+    if (im->gpu_owned && age < VKTL_GPU_FRAMES) return IR_GPU_GRACE;
+    return IR_EVICTABLE;
+}
+void vka_tex_kind_log(void) {
+    pthread_mutex_lock(&g_tmu);
+    uint64_t cur = vka_frame(), done = vka_done(), kb[IK_N] = {0}, rb[IR_N] = {0}, kr[IK_N][IR_N] = {{0}}, soft_b = 0, bc_big = 0;
+    int kn[IK_N] = {0}, rn[IR_N] = {0}, soft_n = 0;
+    enum { TOP = 16 }; vka_img *top[TOP]; int nt = 0;
+    for (int i = 0; i < g_nlive; i++) {
+        vka_img *im = g_live[i]; int k = img_kind(im), r = img_keep_reason(im, cur, done);
+        kb[k] += im->bytes; kn[k]++; rb[r] += im->bytes; rn[r]++; kr[k][r] += im->bytes;
+        if (im->soft) { soft_n++; soft_b += im->bytes; } else if (k == IK_BC && im->bytes >= 4 * 1048576ull) bc_big += im->bytes;
+        int j = nt < TOP ? nt++ : TOP; if (j == TOP) { if (im->bytes <= top[TOP - 1]->bytes) continue; j = TOP - 1; }
+        while (j > 0 && top[j - 1]->bytes < im->bytes) { top[j] = top[j - 1]; j--; }
+        top[j] = im;
+    }
+    char b[1600]; size_t l = (size_t)snprintf(b, sizeof b, "ctl: images by content, frame %llu:", (unsigned long long)cur);
+    for (int k = 0; k < IK_N && l < sizeof b; k++) {
+        if (!kn[k]) continue;
+        l += (size_t)snprintf(b + l, sizeof b - l, " %s %.0f MiB (%d;", ik_name[k], kb[k] / 1048576.0, kn[k]);
+        for (int r = 0; r < IR_N && l < sizeof b; r++) if (kr[k][r]) l += (size_t)snprintf(b + l, sizeof b - l, " %s %.0f", ir_name[r], kr[k][r] / 1048576.0);
+        if (l < sizeof b) l += (size_t)snprintf(b + l, sizeof b - l, ");");
+    }
+    VLOG("%s", b);
+    l = (size_t)snprintf(b, sizeof b, "ctl: images by why they stay:");
+    for (int r = 0; r < IR_N && l < sizeof b; r++) l += (size_t)snprintf(b + l, sizeof b - l, " %s %.0f MiB (%d);", ir_name[r], rb[r] / 1048576.0, rn[r]);
+    if (l < sizeof b) snprintf(b + l, sizeof b - l, " soft textures %.0f MiB (%d); block-compressed from storage, 4 MiB or more and not soft, %.0f MiB", soft_b / 1048576.0, soft_n, bc_big / 1048576.0);
+    VLOG("%s", b);
+    for (int i = 0; i < nt; i++) {
+        vka_img *im = top[i];
+        VLOG("ctl: image %d: serial %llu %ux%ux%u layers %u levels %u (from %u) format %#x vk %d samples %u, %.1f MiB, %s, %s (last used %lld frames ago), %d holds, sampled by %u draws%s%s",
+             i + 1, (unsigned long long)im->serial, im->w, im->h, im->depth, im->layers, im->levels, im->base, im->d.format, (int)im->f.vk, im->samples, im->bytes / 1048576.0,
+             ik_name[img_kind(im)], ir_name[img_keep_reason(im, cur, done)], im->last_frame ? (long long)(cur - im->last_frame) : -1LL, im->holds, im->nsamp,
+             im->soft ? ", soft" : "", im->is_video ? ", video" : "");
+    }
+    pthread_mutex_unlock(&g_tmu);
+}
 // The image of a soft texture made again from level 0 and uploaded whole from its storage, swapped in place (every serial and view that shares it follows; the texture IDs
 // that name it are written again); the old image goes after the submission being recorded, or once its holders let it go. Caller holds nvn_pool_use and g_tmu; 1 = whole
 static int soft_harden(vka_img *im, VkCommandBuffer cb, const char *why) {
@@ -1550,20 +1616,27 @@ static void img_evict_locked(vka_img *im) {
     im->refs = 1;
     unref_locked(im);
 }
-// The texture cache's limit (vka_texlimit.h): measured from the device every 60 frames (vka_tex_prepare), or DM_VK_IMG_LIMIT_MB. Images over it are evicted least recently
+// The texture cache's limit (vka_texlimit.h): measured from the device every 60 frames (15 under memory pressure), or DM_VK_IMG_LIMIT_MB. Images over it are evicted least recently
 // used first, never one used in this frame or the last; a working set larger than the limit stays (logged), as uploading it again every frame costs far more than the memory
 static uint64_t g_img_lim, g_lim_frame, g_prune_dry;
+static int g_psi_pressed;   // memory pressure past VKTL_PSI_HOLD at the last update: measured every 15 frames instead of 60
 static uint64_t meminfo_kb(const char *buf, const char *key) { const char *p = strstr(buf, key); return p ? strtoull(p + strlen(key), NULL, 10) : 0; }
 static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
-    if (g_img_lim && cur_frame < g_lim_frame + 60) return;
+    if (g_img_lim && cur_frame < g_lim_frame + (g_psi_pressed ? 15 : 60)) return;
     g_lim_frame = cur_frame;
     uint64_t imgs = g_img_bytes + vka_imem_zbytes();
     int env = VKA_ENV("DM_VK_IMG_LIMIT_MB", 0);
-    vktl_in in = {.img_bytes = imgs};
+    vktl_in in = {.img_bytes = imgs, .psi_some10 = -1};
     if (env <= 0) {
         int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
         if (fd >= 0) { char buf[2048]; ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
                        if (n > 0) { buf[n] = 0; in.mem_total = meminfo_kb(buf, "MemTotal:") << 10; in.mem_avail = meminfo_kb(buf, "MemAvailable:") << 10; } }
+        // Memory pressure (vktl_pressure_limit): "some avg10=" of /proc/pressure/memory; DM_VK_IMG_PSI=0 leaves it out
+        if (VKA_ENV("DM_VK_IMG_PSI", 1)) {
+            int pf = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC);
+            if (pf >= 0) { char pb[256]; ssize_t pn = read(pf, pb, sizeof pb - 1); close(pf);
+                           if (pn > 0) { pb[pn] = 0; const char *a = strstr(pb, "some avg10="); if (a) in.psi_some10 = strtod(a + 11, NULL); } }
+        }
         uint32_t heap = V.local_type < V.memp.memoryTypeCount ? V.memp.memoryTypes[V.local_type].heapIndex : 0;
         if (heap < V.memp.memoryHeapCount) in.heap_size = V.memp.memoryHeaps[heap].size;
         static PFN_vkGetPhysicalDeviceMemoryProperties2 gmp2;
@@ -1575,6 +1648,13 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
         }
     }
     uint64_t lim = env > 0 ? (uint64_t)env << 20 : vktl_limit(&in), old = g_img_lim;
+    int pressed = env <= 0 && in.psi_some10 >= VKTL_PSI_HOLD;
+    if (pressed != g_psi_pressed) {
+        static _Atomic int np;
+        if (atomic_fetch_add(&np, 1) < 32) VLOG("image cache: memory pressure %.1f %% (some avg10): %s, limit %llu MiB, images %.0f MiB", in.psi_some10 < 0 ? 0 : in.psi_some10,
+                                                 pressed ? (in.psi_some10 >= VKTL_PSI_SHRINK ? "shrinking" : "holding") : "eased, the RAM rule again", (unsigned long long)(lim >> 20), imgs / 1048576.0);
+        g_psi_pressed = pressed;
+    }
     g_img_lim = lim;
     uint64_t d = lim > old ? lim - old : old - lim;
     static _Atomic int nl;
@@ -1699,9 +1779,8 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
             vka_tex_prune_locked();
             mode = first_mode(t, &f, cpuw_take(t->serial, 0));
             soft = !base && soft_want(t, &f, mode);
-            // the size cap is vkz_candidate's (DM_VK_ZSHARE_MAX_MB): a second one here stopped the large targets that switch exists for before it was asked
-            g_zwant = mode == ST_ZERO && !(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE);
-            im = img_create(t, &f, soft ? 1 : base);
+            g_zwant = mode == ST_ZERO && !(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE);   // (size: vkz_candidate)
+            im = img_create(t, &f, soft ? soft_levels(d_levels_of(t)) : base);
             g_zwant = 0;
             if (im && soft) soft_note(im, t);   // (a soft texture: from level 1, "Soft textures" above)
         }
@@ -2147,14 +2226,14 @@ static VkImageView g_null_view;
 // depth tests (each one that reads the pool then runs its tests after shading). Needs fragmentStoresAndAtomics and update-after-bind storage buffers beyond set 0's
 // (a vertex-pipeline module also vertexPipelineStoresAndAtomics, else it reports nothing). Idea and bitmap layout after Anka Native's texture-use feedback (MIT, copyright 2026
 // seedds and 2026 EddizEge), which needs a library built with it; here no library change
-enum { PFB_BYTES = 1 << 17, PFB_RING = 8, PFB_WANT = 1, PFB_NULL = 2 };
+enum { PFB_BYTES = 1 << 17, PFB_RING = 8, PFB_WANT = 1, PFB_NULL = 2, PFB_MADE = 4 };
 static _Atomic int g_pfb = -1;   // -1 not decided; 0 off; 1 on (the bitmap and the ring made)
 static vka_span g_pfb_map, g_pfb_ring;
 static VkDescriptorSetLayout g_pfb_dsl; static VkDescriptorPool g_pfb_dpool; static VkDescriptorSet g_pfb_set;   // the bitmap's set (made in bindless_init)
 static struct { uint64_t fence; uint32_t n; int busy; } g_pfb_r[PFB_RING];   // (under g_tmu)
 static _Atomic int g_pfb_any;   // the submission being recorded has a draw or dispatch that reads the pool
 static uint8_t *g_pfb_st;   // (under g_tmu) per texture ID: PFB_WANT, PFB_NULL (its slot was last written with the null view)
-static uint64_t g_pfb_nrb, g_pfb_skip, g_pfb_hits, g_pfb_wants, g_pfb_made, g_pfb_made_b, g_pfb_logged;   // (under g_tmu)
+static uint64_t g_pfb_nrb, g_pfb_skip, g_pfb_hits, g_pfb_wants, g_pfb_made, g_pfb_made_b, g_pfb_again, g_pfb_logged;   // (under g_tmu)
 static int pfb_avail(void) {
     int v = atomic_load(&g_pfb);
     if (v >= 0) return v;
@@ -2248,8 +2327,8 @@ static void pfb_consume_locked(void) {
     }
     if (g_pfb_nrb >= g_pfb_logged + 1800 || (g_pfb_nrb && !g_pfb_logged)) {
         g_pfb_logged = g_pfb_nrb;
-        VLOG("texture pool reads: %llu readbacks (%llu put off, every slot waiting), %llu IDs read in them, %llu slots made for a read (%llu images made, %.1f MiB)",
-             (unsigned long long)g_pfb_nrb, (unsigned long long)g_pfb_skip, (unsigned long long)g_pfb_hits, (unsigned long long)g_pfb_wants, (unsigned long long)g_pfb_made, g_pfb_made_b / 1048576.0);
+        VLOG("texture pool reads: %llu readbacks (%llu put off, every slot waiting), %llu IDs read in them, %llu slots made for a read (%llu images made, %.1f MiB, %llu of them for an ID made before: evicted and read again)",
+             (unsigned long long)g_pfb_nrb, (unsigned long long)g_pfb_skip, (unsigned long long)g_pfb_hits, (unsigned long long)g_pfb_wants, (unsigned long long)g_pfb_made, g_pfb_made_b / 1048576.0, (unsigned long long)g_pfb_again);
     }
 }
 
@@ -2510,7 +2589,7 @@ static void write_tex(int id, VkCommandBuffer cb, VkWriteDescriptorSet *w, VkDes
     pthread_mutex_lock(&g_tmu);
     if (g_pfb_st && !e->img) {   // (whether the slot holds the null view: a pool read of it asks for its image, pfb_hit)
         if (view == g_null_view) g_pfb_st[id] |= PFB_NULL; else g_pfb_st[id] &= (uint8_t)~PFB_NULL;
-        if (want && im) { g_pfb_made++; g_pfb_made_b += im->bytes; }
+        if (want && im) { g_pfb_made++; g_pfb_made_b += im->bytes; if (g_pfb_st[id] & PFB_MADE) g_pfb_again++; g_pfb_st[id] |= PFB_MADE; }   // (again: an ID whose image a read made before, evicted since)
     }
     im_unhold_locked(im);
     if (im && e->img) { pthread_mutex_unlock(&g_tmu); vka_img_written(im); pthread_mutex_lock(&g_tmu); }   // an image registration: shaders write it (vka_tex_id_view)

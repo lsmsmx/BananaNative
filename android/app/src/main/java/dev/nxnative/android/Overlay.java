@@ -262,6 +262,14 @@ final class Overlay {
         private ByteBuffer px;
         private String key;
         private boolean sent;
+        private int inL, inT, inR;   // transparent margin round the text (OverlayInset): the host draws the bitmap flush in its corner, so this keeps the text clear of a rounded one
+
+        /** The margin (px) from the window's rounded corners and cutout (GameActivity.insetOverlay); the block is drawn again at the next host() when it changed */
+        void inset(int left, int top, int right) {
+            if (left == inL && top == inT && right == inR) return;
+            inL = left; inT = top; inR = right;
+            sent = false;
+        }
 
         Block(int slot, TextView view) {
             this.slot = slot; this.view = view;
@@ -290,18 +298,22 @@ final class Overlay {
             int w = view.getMeasuredWidth(), h = view.getMeasuredHeight();
             if (w <= 0 || h <= 0) return Native.overlaySet(slot, null, 0, 0, 0);
             view.layout(0, 0, w, h);
-            if (bm == null || bm.getWidth() < w || bm.getHeight() < h) {   // a little larger than asked, so a block a few pixels wider does not need a new one
-                bm = Bitmap.createBitmap(Math.max(w + 32, bm != null ? bm.getWidth() : 0), Math.max(h + 16, bm != null ? bm.getHeight() : 0), Bitmap.Config.ARGB_8888);
+            int bw = w + inL + inR, bh = h + inT;   // the margin is empty pixels at the block's top and its side(s)
+            if (bm == null || bm.getWidth() < bw || bm.getHeight() < bh) {   // a little larger than asked, so a block a few pixels wider does not need a new one
+                bm = Bitmap.createBitmap(Math.max(bw + 32, bm != null ? bm.getWidth() : 0), Math.max(bh + 16, bm != null ? bm.getHeight() : 0), Bitmap.Config.ARGB_8888);
                 canvas = new Canvas(bm);
                 px = ByteBuffer.allocateDirect(bm.getByteCount());
             }
             bm.eraseColor(Color.TRANSPARENT);
+            canvas.save();
+            canvas.translate(inL, inT);
             int save = canvas.saveLayerAlpha(0, 0, w, h, Math.round(view.getAlpha() * 255));   // the view's own alpha, which its parent applies on screen
             view.draw(canvas);
             canvas.restoreToCount(save);
+            canvas.restore();
             px.rewind();
             bm.copyPixelsToBuffer(px);   // premultiplied RGBA bytes, as the present blends them
-            return Native.overlaySet(slot, px, w, h, bm.getRowBytes());
+            return Native.overlaySet(slot, px, bw, bh, bm.getRowBytes());
         }
     }
 

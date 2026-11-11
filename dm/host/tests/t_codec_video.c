@@ -26,6 +26,9 @@ void mav1_reset(mav1 *a) { (void)a; }
 int mav1_decode(mav1 *a, const uint8_t *data, size_t n, mav1_picture *out) { (void)a; (void)data; (void)n; (void)out; return 0; }
 const char *mav1_backend(const mav1 *a) { (void)a; return "none (test)"; }
 void mav1_set_time(mav1 *a, int64_t ts) { (void)a; (void)ts; }
+int mav1_async(const mav1 *a) { (void)a; return 0; }
+int mav1_send(mav1 *a, const uint8_t *data, size_t n, int64_t ts, mav1_emit emit, void *ctx) { (void)a; (void)data; (void)n; (void)ts; (void)emit; (void)ctx; return 0; }
+int mav1_flush(mav1 *a, mav1_emit emit, void *ctx) { (void)a; (void)emit; (void)ctx; return 0; }
 
 static const uint8_t vp8[] = {
     0xf0,0x02,0x00,0x9d,0x01,0x2a,0x10,0x00,0x10,0x00,0x00,0x47,0x08,0x85,0x85,0x88,

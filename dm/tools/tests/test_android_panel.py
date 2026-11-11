@@ -1,4 +1,4 @@
-"""The in-game panel's pure parts (android/app/src/jvmtest's PanelJvmTest): PanelLook's size presets, PictureFit's picture size slider, and PictureFit.rect, the
+"""The in-game panel's pure parts (android/app/src/jvmtest's PanelJvmTest): PanelLook's size presets, PictureFit's picture size slider, DlssTune's Upscaler row and slider steps, and PictureFit.rect, the
 launcher's twin of the present's vka_fit_rect (dm/gfx/vk_android/vka_present_fit.h): the touch mapping must land where the picture is drawn, so both are run over a
 grid of screens, Fit / Stretch, sizes and places and must agree within a pixel. The JVM part is skipped without a JDK, the C part without a C compiler."""
 import shutil
@@ -9,7 +9,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 JAVA = REPO / 'android/app/src/main/java/dev/nxnative/android'
-SRC = [JAVA / 'PanelLook.java', JAVA / 'PictureFit.java']
+SRC = [JAVA / 'PanelLook.java', JAVA / 'PictureFit.java', JAVA / 'DlssTune.java']
 TEST = REPO / 'android/app/src/jvmtest/java/dev/nxnative/android/PanelJvmTest.java'
 FIT = REPO / 'dm/gfx/vk_android/vka_present_fit.h'
 CC = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')

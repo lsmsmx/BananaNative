@@ -258,7 +258,9 @@ __attribute__((weak)) int vka_swap_rb(void);
 #endif
 
 // I420 → RGBA (native texture mode): by the colour space and range the picture declares (VP9 colour config; when undeclared BT.709 from 720 lines up, else BT.601), 16-bit fixed point; a smaller picture is padded with black, a larger one cropped
+static int g_rgba_neon = -1;   // DM_MOVIE_RGBA_NEON=0: the scalar loop only (A/B)
 void md_rgba(const vpx_image_t *im, uint8_t *dst, int w, int h) {
+    if (g_rgba_neon < 0) { const char *e = getenv("DM_MOVIE_RGBA_NEON"); g_rgba_neon = !(e && *e == '0'); }
     int full = im->range == VPX_CR_FULL_RANGE, b709 = im->cs == VPX_CS_BT_709 || (im->cs == VPX_CS_UNKNOWN && h >= 720);
     double ky = full ? 1.0 : 255.0 / 219.0, kc = full ? 1.0 : 255.0 / 224.0;
     double rv = b709 ? 1.5748 : 1.402, gu = b709 ? 0.1873 : 0.3441, gv = b709 ? 0.4681 : 0.7141, bu = b709 ? 1.8556 : 1.772;
@@ -271,6 +273,29 @@ void md_rgba(const vpx_image_t *im, uint8_t *dst, int w, int h) {
         const uint8_t *py = im->planes[0] + (size_t)y * im->stride[0], *pu = im->planes[1] + (size_t)(y >> 1) * im->stride[1], *pv = im->planes[2] + (size_t)(y >> 1) * im->stride[2];
         uint32_t *o32 = (uint32_t *)(dst + (size_t)y * w * 4);
         int x = 0;
+#if defined(__aarch64__)
+        if (g_rgba_neon) for (; x + 16 <= cw; x += 16) {   // the same 16.16 arithmetic, 16 pixels at a time (a 2560x1440 AV1 picture each video frame: Fire Emblem Fortune's Weave)
+            uint8x16_t yy = vld1q_u8(py + x); uint8x8_t u8 = vld1_u8(pu + x / 2), v8 = vld1_u8(pv + x / 2);
+            uint8x8x2_t uz = vzip_u8(u8, u8), vz = vzip_u8(v8, v8);
+            uint8x8_t ys[2] = {vget_low_u8(yy), vget_high_u8(yy)}, r8[2], g8[2], b8[2];
+            for (int k = 0; k < 2; k++) {
+                int16x8_t y16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(ys[k])), vdupq_n_s16((int16_t)y0));
+                int16x8_t u16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uz.val[k])), vdupq_n_s16(128)), v16 = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vz.val[k])), vdupq_n_s16(128));
+                uint16x4_t rr[2], gg[2], bb[2];
+                for (int h2 = 0; h2 < 2; h2++) {
+                    int32x4_t l = vmulq_n_s32(vmovl_s16(h2 ? vget_high_s16(y16) : vget_low_s16(y16)), Y), uu = vmovl_s16(h2 ? vget_high_s16(u16) : vget_low_s16(u16)), vv = vmovl_s16(h2 ? vget_high_s16(v16) : vget_low_s16(v16));
+                    l = vaddq_s32(l, vdupq_n_s32(32768));
+                    rr[h2] = vqmovun_s32(vshrq_n_s32(vmlaq_n_s32(l, vv, RV), 16));
+                    gg[h2] = vqmovun_s32(vshrq_n_s32(vmlsq_n_s32(vmlsq_n_s32(l, uu, GU), vv, GV), 16));
+                    bb[h2] = vqmovun_s32(vshrq_n_s32(vmlaq_n_s32(l, uu, BU), 16));
+                }
+                r8[k] = vqmovn_u16(vcombine_u16(rr[0], rr[1])); g8[k] = vqmovn_u16(vcombine_u16(gg[0], gg[1])); b8[k] = vqmovn_u16(vcombine_u16(bb[0], bb[1]));
+            }
+            uint8x16_t R = vcombine_u8(r8[0], r8[1]), G = vcombine_u8(g8[0], g8[1]), B = vcombine_u8(b8[0], b8[1]);
+            uint8x16x4_t px = {{swap_rb ? B : R, G, swap_rb ? R : B, vdupq_n_u8(255)}};
+            vst4q_u8((uint8_t *)(o32 + x), px);
+        }
+#endif
         if (swap_rb) {
             for (; x + 4 <= cw; x += 4) {
                 int u0 = pu[x >> 1] - 128, v0 = pv[x >> 1] - 128;

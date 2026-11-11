@@ -127,9 +127,11 @@ final class PrepareText {
             if (during) s.append(String.format(Locale.getDefault(), "  ·  %,d shaders left", Math.max(0, total - done)));
             else if (done > 0) s.append(String.format(Locale.getDefault(), "  ·  %,d of %,d shaders", done, total));
             else s.append(String.format(Locale.getDefault(), "  ·  %,d shaders to make", total));
+        } else if (kept > 0) {
+            s.append("  ·  shaders up to date: nothing to translate");
         }
         if (during && eta != null && !eta.isEmpty()) s.append("  ·  ").append(eta);
-        if (kept > 0) s.append(String.format(Locale.getDefault(), "  ·  %,d unchanged kept", kept));
+        if (kept > 0 && total > 0) s.append(String.format(Locale.getDefault(), "  ·  the other %,d are reused", kept));
         return s.toString();
     }
 
@@ -150,7 +152,7 @@ final class PrepareText {
      */
     static String needsPreparing(boolean packThere, boolean unfinished, boolean jobStopped) {
         if (jobStopped) return "Preparing was not finished. Tap Continue to go on where it stopped.";
-        if (unfinished) return "The pack's game code was left unfinished. Prepare finishes it.";
+        if (unfinished) return "The pack's game code was left unfinished. Prepare finishes it (a few minutes; shaders are kept).";
         if (packThere) return "The pack cannot be read. Prepare makes it again.";
         return "No pack yet. Prepare makes one from your dump.";
     }

@@ -1,0 +1,105 @@
+/*
+ * dav1d 1.5.4 configuration for the Android host (android/host/CMakeLists.txt): dm/third_party/dav1d/config/config.h (meson, arm64 Apple) with the arm64 assembly kept,
+ * PREFIX undefined (ELF symbols have no leading underscore), HAVE_GETAUXVAL 1 (bionic) and HAVE_PTHREAD_SETNAME_NP 0 (as the vendored config's non-Apple block).
+ * Derived from the meson output; regenerate from that file when dav1d is updated.
+ * Do not edit, your changes will be lost.
+ */
+
+#pragma once
+
+#define ARCH_AARCH64 1
+
+#define ARCH_ARM 0
+
+#define ARCH_LOONGARCH 0
+
+#define ARCH_LOONGARCH32 0
+
+#define ARCH_LOONGARCH64 0
+
+#define ARCH_PPC64LE 0
+
+#define ARCH_RISCV 0
+
+#define ARCH_RV32 0
+
+#define ARCH_RV64 0
+
+#define ARCH_X86 0
+
+#define ARCH_X86_32 0
+
+#define ARCH_X86_64 0
+
+#define AS_ARCH_LEVEL armv8.6-a+crc
+
+#define CONFIG_16BPC 1
+
+#define CONFIG_8BPC 1
+
+#define CONFIG_LOG 1
+
+#define ENDIANNESS_BIG 0
+
+#define HAVE_ALIGNED_ALLOC 1
+
+#define HAVE_ASM 1
+
+#define HAVE_AS_ARCHEXT_DOTPROD_DIRECTIVE 1
+
+#define HAVE_AS_ARCHEXT_I8MM_DIRECTIVE 1
+
+#define HAVE_AS_ARCHEXT_SVE2_DIRECTIVE 1
+
+#define HAVE_AS_ARCHEXT_SVE_DIRECTIVE 1
+
+#define HAVE_AS_ARCH_DIRECTIVE 1
+
+#define HAVE_AS_FUNC 0
+
+#define HAVE_C11_GENERIC 1
+
+#define HAVE_CLOCK_GETTIME 1
+
+#define HAVE_DLSYM 0
+
+#define HAVE_DOTPROD 1
+
+#define HAVE_ELF_AUX_INFO 0
+
+#define HAVE_GETAUXVAL 1   // bionic getauxval for the CPU features
+
+#define HAVE_I8MM 1
+
+#define HAVE_IO_H 0
+
+#define HAVE_MEMALIGN 0
+
+#define HAVE_POSIX_MEMALIGN 1
+
+#define HAVE_PTHREAD_GETAFFINITY_NP 0
+
+#define HAVE_PTHREAD_NP_H 0
+
+#define HAVE_PTHREAD_SETAFFINITY_NP 0
+
+#define HAVE_PTHREAD_SETNAME_NP 0
+
+#define HAVE_PTHREAD_SET_NAME_NP 0
+
+#define HAVE_SIGACTION 1
+
+#define HAVE_SVE 1
+
+#define HAVE_SVE2 1
+
+#define HAVE_SYS_TYPES_H 1
+
+#define HAVE_UNISTD_H 1
+
+#define PIC 3
+
+// #define PREFIX: left undefined (asm.S tests #ifdef PREFIX): ELF symbols have no leading underscore
+
+#define TRIM_DSP_FUNCTIONS 1
+

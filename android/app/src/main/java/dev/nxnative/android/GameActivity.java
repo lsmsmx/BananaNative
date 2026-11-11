@@ -83,6 +83,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
 
     @Override protected void onCreate(Bundle saved) {
         super.onCreate(saved);
+        fitOrientation();
         setShowWhenLocked(true);
         setTurnScreenOn(true);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -98,6 +99,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             return;
         }
         FrameLayout root = new FrameLayout(this);
+        rootView = root;
         SurfaceView surface = new SurfaceView(this);
         surface.getHolder().addCallback(this);
         root.addView(surface);
@@ -116,7 +118,8 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         // The log block may grow at most up to the tag's bottom edge (its top margin), so a long log never runs under the tag
         tag.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) overlay.getLayoutParams();
-            if (lp.topMargin != b) { lp.topMargin = b; overlay.post(overlay::requestLayout); }
+            int top = b + ((FrameLayout.LayoutParams) tag.getLayoutParams()).topMargin;
+            if (lp.topMargin != top) { lp.topMargin = top; overlay.post(overlay::requestLayout); }
         });
         fps = overlayText(Gravity.TOP | Gravity.END, 0.85f);
         root.addView(fps, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END));
@@ -171,6 +174,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         pausedView.setOnClickListener(v -> unpause());
         root.addView(pausedView, root.indexOfChild(handle), new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         panelHint(root);
+        root.setOnApplyWindowInsetsListener((v, in) -> { insetOverlay(in); return in; });   // again whenever the insets change (a turn, a fold)
         setContentView(root);
         immersive();
         TextInput.screen(this);   // the keyboard applet's input box shows on this screen (again, when the game was waiting on it as the screen was recreated)
@@ -206,6 +210,32 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         return t;
     }
 
+    /**
+     * The overlay stays clear of the window's rounded corners and the display cutout (issue #105: the window is edge to edge, so a corner cut the top-right items in half).
+     * From the window's insets, per corner, whatever the display: RoundedCorner's radius (null where the window does not reach a corner), and the cutout's safe insets
+     * (OverlayInset). The views get it as margins, the blocks the host draws as transparent margin in their bitmaps (Overlay.Block.inset)
+     */
+    private void insetOverlay(android.view.WindowInsets in) {
+        android.view.RoundedCorner tl = in.getRoundedCorner(android.view.RoundedCorner.POSITION_TOP_LEFT), tr = in.getRoundedCorner(android.view.RoundedCorner.POSITION_TOP_RIGHT),
+                bl = in.getRoundedCorner(android.view.RoundedCorner.POSITION_BOTTOM_LEFT);
+        android.view.DisplayCutout cut = in.getDisplayCutout();
+        int cl = cut == null ? 0 : cut.getSafeInsetLeft(), ct = cut == null ? 0 : cut.getSafeInsetTop(), cr = cut == null ? 0 : cut.getSafeInsetRight();
+        int[] a = OverlayInset.topLeft(tl == null ? 0 : tl.getRadius(), cl, ct), b = OverlayInset.topRight(tr == null ? 0 : tr.getRadius(), cr, ct);
+        tagBlock.inset(a[0], a[1], 0);
+        fpsBlock.inset(0, b[1], b[0]);
+        margins(tag, a[0], a[1], 0);
+        margins(fps, 0, b[1], b[0]);
+        int[] c = OverlayInset.topLeft(bl == null ? 0 : bl.getRadius(), cl, 0);   // the log block, bottom left: sideways by the corner, up by the same as a top one down
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) overlay.getLayoutParams();
+        if (lp.leftMargin != c[0] || lp.bottomMargin != c[1]) { lp.leftMargin = c[0]; lp.bottomMargin = c[1]; overlay.requestLayout(); }
+    }
+    private static void margins(View v, int l, int t, int r) {
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) v.getLayoutParams();
+        if (lp.leftMargin == l && lp.topMargin == t && lp.rightMargin == r) return;
+        lp.leftMargin = l; lp.topMargin = t; lp.rightMargin = r;
+        v.requestLayout();
+    }
+
     private boolean overlayOn() { return overlayEnv != null ? overlayEnv : Prefs.overlay(this); }
 
     /** Thread placement (Native.pinThreads): every 5 s, for threads the game and the replay start later; stops when the phone reports no clocks */
@@ -218,6 +248,51 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     private void pinStart() {
         ui.removeCallbacks(pinRun);
         if (Prefs.pinThreads(this, titleId())) ui.postDelayed(pinRun, 2000);
+    }
+
+    /**
+     * The skipped-work notice (SkipNotice): every 5 s from 30 s after the start, ask the host whether the replay skipped a large share of the game's draws for causes of the
+     * GPU driver (Native.skipStatus, DM_VK_SKIP_WARN); the host says so once, after the first loading seconds, and the notice shows once per run: small, at the bottom,
+     * a tap dismisses it, it fades after 20 s. Stops after showing, or when this host cannot say (no such entry point: an empty answer every time is still polled, cheaply)
+     */
+    private static boolean skipShown;
+    private FrameLayout rootView;
+    private final Runnable skipRun = this::skipTick;
+    private void skipTick() {
+        if (skipShown || rootView == null) return;
+        if (!stopped && !paused) {
+            int pct = SkipNotice.percent(Native.skipStatus());
+            if (pct > 0) { skipShown = true; skipShow(pct); return; }
+        }
+        ui.postDelayed(skipRun, 5000);
+    }
+    private void skipStart() {
+        ui.removeCallbacks(skipRun);
+        if (!skipShown) ui.postDelayed(skipRun, 30000);
+    }
+    private void skipShow(int pct) {
+        GpuDriver.Info drv = GpuDriver.selected(this, titleId());
+        String st = Native.skipStatus();
+        Native.note("skipped work: notice shown (" + pct + " % of draws; driver: " + (drv == null ? "system" : drv.label()) + ")");
+        TextView h = new TextView(this);
+        h.setText(SkipNotice.noMesh(st) ? SkipNotice.textNoMesh(pct) : SkipNotice.text(pct, drv == null ? null : drv.label()));
+        h.setTextColor(Color.WHITE);
+        h.setTextSize(13);
+        float dp = getResources().getDisplayMetrics().density;
+        int p = Math.round(10 * dp);
+        h.setPadding(p, p, p, p);
+        android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+        bg.setColor(0xCC000000);
+        bg.setCornerRadius(10 * dp);
+        h.setBackground(bg);
+        h.setMaxWidth(Math.round(460 * dp));
+        h.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        lp.bottomMargin = Math.round(24 * dp);
+        rootView.addView(h, panel != null ? rootView.indexOfChild(panel) : rootView.getChildCount(), lp);
+        Runnable gone = () -> h.animate().alpha(0).setDuration(600).withEndAction(() -> rootView.removeView(h)).start();
+        h.setOnClickListener(v -> gone.run());
+        h.postDelayed(gone, 20000);
     }
 
     /**
@@ -450,13 +525,9 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
                     .append(" in Settings › GPU driver, or in this game's Game settings.");
             else m.append(custom ? ".\n\nThe game may stop or draw wrongly. A custom GPU driver (Settings › GPU driver) may help." : ".\n\nThe game may stop or draw wrongly.");
             readinessDialog("Not ready for this game", m.toString(), details(fails, warns, gpu), report, placed ? "Start anyway (black screen)" : "Try anyway", true);
-        } else if (!warns.isEmpty() && !seenWarned(id, warns)) {
-            StringBuilder m = new StringBuilder("Runs with less: ");
-            for (Readiness.Check c : warns) m.append(c.title).append(", ");
-            m.setLength(m.length() - 2);
-            m.append('.');
-            readinessDialog("Ready, with limits", m.toString(), details(fails, warns, gpu), report, "Continue", false);
-        } else start();
+        } else {   // warnings only ("Ready, with limits"): no notice at the start, it stopped every start; the log has the line (readinessLine) and Settings › Readiness check the details
+            start();
+        }
     }
 
     /** The Details of the start-up notice: each failure and warning with its sentence, then the GPU and memory */
@@ -566,6 +637,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
             env.add(0, "NX_BUILD_TAG=" + Prefs.buildTag(this) + " \u00b7 signer " + Prefs.signerId(this));   // nxlaunch.c writes it as the log's first line; the signer says which key signed the APK (Signer)
             String gpuNote = settingsEnv(id, env);
             pinStart();   // Use fast cores (Game settings, Settings)
+            skipStart();
             // DM_TEST_CRASH (a test crash, ExitWatch): the test app only
             if (!testApp() && user.removeIf(kv -> kv.startsWith("DM_TEST_CRASH="))) unknownNotes.add("[nxlaunch] DM_TEST_CRASH not taken: the test app only");
             env.addAll(user);
@@ -714,6 +786,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (hostPaused == 1 || hostInBackground && Prefs.pauseOnReturn(this, titleId())) { paused = true; Native.lifecycle(4); pausedView.setVisibility(View.VISIBLE); }
         ui.postDelayed(this::fpsTick, 500);
         pinStart();
+        skipStart();
     }
 
     /** The game's screen was stopped (the game in the background) and not started again; a stop for a configuration change is no trip to the background */
@@ -977,6 +1050,20 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (resumedNow) Native.motionStart();
     }
 
+    /**
+     * The orientation request, by the display's size (GameOrientation): sensorLandscape from the manifest on a phone; none on a large screen (a tablet, a foldable's inner
+     * screen), where the system does not turn the display for the request but letterboxes the landscape-locked window inside the portrait-shaped display (the bottom
+     * 346 px of a 2172x2352 inner screen showed the wallpaper). Without a request the window is the whole display and the present fits the 16:9 picture into it, so a
+     * resize (the window's size changes, surfaceChanged) stands in for the rotation. Not resizeableActivity, minAspectRatio or the compat-override properties: the window
+     * is already resizable (targetSdk 35), and these only change which part of the display the system gives a window that asks for an orientation, not the request
+     */
+    private void fitOrientation() {
+        android.graphics.Rect b = getWindowManager().getMaximumWindowMetrics().getBounds();
+        int want = GameOrientation.fixedLandscape(b.width(), b.height(), getResources().getDisplayMetrics().density)
+                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
+        if (getRequestedOrientation() != want) setRequestedOrientation(want);
+    }
+
     /** Full screen: the status and navigation bars (and the swipe handle) are hidden, a swipe from the edge shows them for a moment; the picture also runs under a display cutout */
     private void immersive() {
         getWindow().getAttributes().layoutInDisplayCutoutMode = android.view.WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
@@ -1030,6 +1117,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
     }
     @Override public void onConfigurationChanged(Configuration c) {
         super.onConfigurationChanged(c);
+        fitOrientation();   // a fold or an unfold changes the display: the other screen may want the other answer
         if (started) Native.motionRotation(getDisplay().getRotation());
     }
 

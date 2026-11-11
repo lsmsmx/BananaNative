@@ -160,6 +160,11 @@ static VkFormat raw_unorm_twin(VkFormat f) {
     default: return f;
     }
 }
+// The window texture's own format, for the views the present samples it through (rot_copy, fsr_copy) and the screenshot. Textures of one memory and shape share one image
+// (vka_tex.c same_shape): Fire Emblem Fortune's Weave's 3840x2160 RGBA8 sRGB window textures lie over its A2B10G10R10 target and share that image, made in VkFormat 64 with RGBA8 in its format list.
+// The game draws its frame through an RGBA8 view, so the image's own format reads RGBA8 bits as 10:10:10:2 (black as blue, the rest posterised). The present takes the
+// window texture's format when the image's list has it; DM_VK_PRESENT_OWNFMT=0 (live) keeps the image's format (A/B). Present thread only
+static VkFormat g_pfmt;
 int vka_swap_rb(void) {
     const char *e = getenv("DM_VK_SWAP_RB");
     if (e && *e) return atoi(e);
@@ -186,7 +191,7 @@ static void rot_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, 
         .b = VK_COMPONENT_SWIZZLE_R,
         .a = VK_COMPONENT_SWIZZLE_A
     };
-    VkImageView view = ok ? vka_view(im, raw_unorm_twin(im->f.vk), VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, vka_swap_rb() ? &swz_rb : NULL) : VK_NULL_HANDLE;
+    VkImageView view = ok ? vka_view(im, g_pfmt ? g_pfmt : raw_unorm_twin(im->f.vk), VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, vka_swap_rb() ? &swz_rb : NULL) : VK_NULL_HANDLE;
     if (view) {
         VkDescriptorImageInfo ii = {g_rot.samp[linear && !VKA_ENV("DM_VK_PRESENT_NEAREST", 0)], view, VK_IMAGE_LAYOUT_GENERAL};   // DM_VK_PRESENT_NEAREST: the launcher's Upscaler, nearest neighbor
         VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_rot.set[k], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
@@ -311,7 +316,7 @@ static uint32_t fsr_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 // FsrRcasCon (ffx_fsr1.h) in C; for a lower-left origin (the texture stored bottom-up) EASU's rows are read from the bottom: con0's y scale negated and its offset from the crop's top.
 // 0 = nothing recorded (the texture has no view to sample): the caller blits
 static int fsr_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
-    VkImageView src = vka_view(im, raw_unorm_twin(im->f.vk), VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL);
+    VkImageView src = vka_view(im, g_pfmt ? g_pfmt : raw_unorm_twin(im->f.vk), VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL);
     if (!src) { VRED_ONCE("FSR: window texture serial %llu (format %#x) has no view to sample: blitted", (unsigned long long)im->serial, im->d.format); return 0; }
     vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
     VkDescriptorImageInfo ii[2] = {{g_fsr.samp, src, VK_IMAGE_LAYOUT_GENERAL}, {g_fsr.samp, g_fsr.view[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
@@ -704,11 +709,22 @@ static void refresh_poll(void) {
     }
     if (g_refresh_n > 300) g_refresh_n = 0;   // settled
 }
+static VkFormat present_fmt(const pq_item *it, const vka_img *im) {
+    if (!im) return VK_FORMAT_UNDEFINED;
+    VkFormat own = raw_unorm_twin(im->f.vk); vka_fmt wf;
+    if (it->src || !VKA_ENV("DM_VK_PRESENT_OWNFMT", 1) || !vka_fmt_of(it->t.d.format, &wf)) return own;
+    VkFormat w = raw_unorm_twin(wf.vk);
+    if (w == own || !(vkfl_has(&im->fl, im->f.vk, w) || vkfl_has(&im->fl, im->f.vk, wf.vk))) return own;
+    static int told; if (!told++) VLOG("present: window texture serial %llu (NVN format %#x, VkFormat %d) shares an image of VkFormat %d: presented through a view in its own format",
+                                      (unsigned long long)it->t.serial, it->t.d.format, wf.vk, im->f.vk);
+    return w;
+}
 static int present_one(const pq_item *it) {
     if (!g_surf || vka_hung()) return 0;
     { static int rw = -1; int w = rot_wanted(); if (rw >= 0 && w != rw) { VLOG("DM_VK_PRETRANSFORM=%d: new swapchain", w); g_recreate = 1; } rw = w; }
     if (!g_swap || g_recreate) { if (g_swap) { swap_destroy(0); } if (!swap_create()) return 0; }
     vka_img *im = it->src ? vka_tex_ref(it->src) : vka_tex_acquire(it->t.serial);
+    g_pfmt = present_fmt(it, im); int ownfmt = im && g_pfmt != raw_unorm_twin(im->f.vk);   // a view in the window texture's format: sampled, never blitted (a blit reads the image's format)
     unsigned k = g_fi++ % NFRAME;
     if (!g_fr[k].cb) {
         if (!g_ppool) { VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = V.qf}; vk.vkCreateCommandPool(V.dev, &pi, NULL, &g_ppool); }
@@ -758,7 +774,7 @@ static int present_one(const pq_item *it) {
     }
     if (fsr && fsr_ready(g_swap_fmt) && fsr_mid(k, (uint32_t)dw, (uint32_t)dh) && fsr_copy(cb, k, idx, im, cx, cy, cw, ch, dx, dy, dw, dh)) {
         blit = -1;
-    } else if (rot_rotates(g_pre) || vka_swap_rb()) {
+    } else if (rot_rotates(g_pre) || vka_swap_rb() || (ownfmt && g_sview[idx])) {
         int ok = im && im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind == 0 && im->samples == 1 && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && g_sview[idx];
         if (ok) vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
         else if (im) VRED_ONCE("window texture serial %llu (format %#x) cannot be sampled for the rotated copy: presented black", (unsigned long long)im->serial, im->d.format);
@@ -780,7 +796,7 @@ static int present_one(const pq_item *it) {
     } else if (im && !blit) VRED_ONCE("window texture serial %llu (format %#x) cannot be blitted to the swapchain: presented black", (unsigned long long)im->serial, im->d.format);
     if (blit >= 0) vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     ovl_draw(cb, k, idx);   // the launcher's overlay over the picture (generated frames too)
-    if (!it->src) vka_ctl_shot_record(cb, im, cx, cy, cw, ch);   // the game's own frames only
+    if (!it->src) vka_ctl_shot_record(cb, im, g_pfmt, cx, cy, cw, ch);   // the game's own frames only
     vk.vkEndCommandBuffer(cb);
     VkSemaphore ws[2] = {g_fr[k].acq, V.tl}; uint64_t wv[2] = {0, it->fence}; VkPipelineStageFlags st[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};   // the image's first barrier is ALL_COMMANDS
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 2, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};

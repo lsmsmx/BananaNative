@@ -1,0 +1,70 @@
+#version 450
+//============================================================================================================
+//                  Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
+//                              SPDX-License-Identifier: BSD-3-Clause
+//============================================================================================================
+// Snapdragon GSR2 3-pass (snapdragon-gsr d926f074, sgsr/v2/include/glsl_3_pass_cs/sgsr2_activate.comp; BSD-3-Clause, notice above and LICENSE) for NVN2's DLSS
+// stand-in (vka_dlss.c). Changes from upstream: texel fetches in place of gathers; the disocclusion depth
+// test reads the previous frame's nearest depth (a ping-pong copy) in place of this frame's at the reprojected place; reversed depth (max, d > 1e-5); luma history in
+// RGBA16F in place of a packed R32UI; velocity rejection (vrej, vlo, vk: this pixel's motion against the previous frame's over the reprojected 2x2, on a 640x360 grid).
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform highp sampler2D PrevLumaHistory;
+layout(set = 0, binding = 1) uniform highp sampler2D MotionDepthAlphaBuffer;
+layout(set = 0, binding = 2) uniform highp sampler2D YCoCgColor;
+layout(set = 0, binding = 3) uniform highp sampler2D PrevMotionDepthAlphaBuffer;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D MotionDepthClipAlphaBuffer;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D LumaHistory;
+layout(push_constant) uniform P { vec2 renderSize; vec2 renderSizeRcp; vec2 mvs; float kfov; float reset; ivec2 cbase; float vrej; float vlo; float vk; } p;
+float PD(ivec2 q) { return texelFetch(PrevMotionDepthAlphaBuffer, clamp(q, ivec2(0), ivec2(p.renderSize) - 1), 0).z; }
+void main()
+{
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(ip, ivec2(p.renderSize)))) return;
+    vec2 ViewportUV = (vec2(ip) + vec2(0.5)) * p.renderSizeRcp;
+    float luma_reference = texelFetch(YCoCgColor, ip, 0).x;
+    vec4 mda = texelFetch(MotionDepthAlphaBuffer, ip, 0);
+    float depth = mda.z; float alphamask = mda.w; vec2 motion = mda.xy;
+    vec2 PrevUV = vec2(-0.5 * motion.x + ViewportUV.x, -0.5 * motion.y + ViewportUV.y);
+    vec2 pf = PrevUV * p.renderSize - 0.5; ivec2 ib = ivec2(floor(pf)); vec2 fr = pf - floor(pf);
+    float depthclip = 0.0;
+    if (depth > 1.0e-05 && p.reset == 0.0) {
+        float w0 = (1.0 - fr.x) * (1.0 - fr.y), w1 = fr.x * (1.0 - fr.y), w2 = (1.0 - fr.x) * fr.y, w3 = fr.x * fr.y;
+        float Ds = 1.37e-05 * p.kfov * length(p.renderSize);
+        const float EPS = 1.19e-07;
+        float a2 = max(PD(ib + ivec2(0, -1)), PD(ib + ivec2(-1, -1)));
+        float f0 = max(max(PD(ib + ivec2(-1, 0)), PD(ib)), a2);
+        float f1 = max(max(PD(ib), PD(ib + ivec2(-1, 0))), a2);
+        float b2 = max(PD(ib + ivec2(1, -1)), PD(ib + ivec2(0, -1)));
+        float f2 = max(max(PD(ib), PD(ib + ivec2(1, 0))), b2);
+        float f3 = max(max(PD(ib + ivec2(1, 0)), PD(ib)), b2);
+        float W = clamp(Ds * max(f0, depth) / (abs(f0 - depth) + EPS), 0.0, 1.0) * w0 + clamp(Ds * max(f1, depth) / (abs(f1 - depth) + EPS), 0.0, 1.0) * w1
+                + clamp(Ds * max(f2, depth) / (abs(f2 - depth) + EPS), 0.0, 1.0) * w2 + clamp(Ds * max(f3, depth) / (abs(f3 - depth) + EPS), 0.0, 1.0) * w3;
+        depthclip = clamp(1.0 - W, 0.0, 1.0);
+    }
+    // Velocity rejection: where the motion changed against the history's (non-rigid motion: a cape, a wing, a weapon; the depth test does not see it), the history
+    // counts less, its box tightens and the anti-flicker term is off, as for a depth clip. dv in pixels of a 640x360 grid, the units vlo / vk were fitted in at any render size
+    if (p.vrej > 0.0 && p.reset == 0.0) {
+        float dv = 1e30;
+        for (int k = 0; k < 4; k++) {
+            ivec2 q = clamp(ib + ivec2(k & 1, k >> 1), ivec2(0), ivec2(p.renderSize) - 1);
+            vec2 pm = texelFetch(PrevMotionDepthAlphaBuffer, q, 0).xy;
+            dv = min(dv, length(0.5 * (motion - pm) * vec2(640.0, 360.0)));
+        }
+        depthclip = max(depthclip, clamp((dv - p.vlo) * p.vk, 0.0, 1.0) * p.vrej);
+    }
+    vec2 prev_luma_diff = p.reset != 0.0 ? vec2(0.0) : texelFetch(PrevLumaHistory, clamp(ib, ivec2(0), ivec2(p.renderSize) - 1), 0).xy;
+    bool enable = false;
+    if (depthclip + p.reset < 0.1) enable = all(greaterThanEqual(PrevUV, vec2(0.0))) && all(lessThanEqual(PrevUV, vec2(1.0)));
+    float luma_diff = luma_reference - prev_luma_diff.x;
+    vec2 current_luma_diff;
+    if (!enable) current_luma_diff = vec2(0.0);
+    else {
+        current_luma_diff.x = luma_reference;
+        current_luma_diff.y = (prev_luma_diff.y != 0.0) ? ((sign(luma_diff) == sign(prev_luma_diff.y)) ? (sign(luma_diff) * min(abs(prev_luma_diff.y), abs(luma_diff))) : prev_luma_diff.y) : luma_diff;
+    }
+    alphamask = floor(alphamask) + 0.5 * float((current_luma_diff.x != 0.0) && (abs(current_luma_diff.y) != abs(luma_diff)));
+    imageStore(LumaHistory, ip, vec4(current_luma_diff, 0.0, 0.0));
+    imageStore(MotionDepthClipAlphaBuffer, ip, vec4(motion, depthclip, alphamask));
+}

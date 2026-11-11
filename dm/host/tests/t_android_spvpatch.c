@@ -131,6 +131,14 @@ int main(void) {
     }
     CHECK(!vka_spv_vin_retype(SPV_TRI_VERT, n, 4, 0, &on, err, sizeof err), "a location the module does not read is refused");
     CHECK(!vka_spv_vin_retype(SPV_TRI_VERT, n, 1, 1, &on, err, sizeof err), "a location both uint and int is refused");
+    {   // vka_spv_subgroup_rows: a module decorating BuiltIn SubgroupId (40) or NumSubgroups (38) addresses whole subgroups; SubgroupLocalInvocationId (41) alone does not
+        uint32_t m[] = {0x07230203, 0x00010300, 0, 8, 0, 2u << 16 | 17, 1, 4u << 16 | 71, 5, 11, 41, 4u << 16 | 71, 6, 11, 40};   // OpCapability Shader; OpDecorate %5/%6 BuiltIn
+        CHECK(vka_spv_subgroup_rows(m, sizeof m / 4), "SubgroupId found");
+        m[14] = 38; CHECK(vka_spv_subgroup_rows(m, sizeof m / 4), "NumSubgroups found");
+        m[14] = 36; CHECK(!vka_spv_subgroup_rows(m, sizeof m / 4), "SubgroupSize and SubgroupLocalInvocationId only: not found");
+        CHECK(!vka_spv_subgroup_rows(SPV_TRI_VERT, n), "the selftest vertex shader: not found");
+        m[14] = 40; m[11] = 0; CHECK(!vka_spv_subgroup_rows(m, sizeof m / 4), "a zero-length instruction before the decoration: not found");
+    }
     {   // A float colour output into an integer target (vka_spv_fout_retype): the selftest's fragment shader, its vec4 output at location 0 as uvec4 / ivec4
         size_t fn = sizeof SPV_TRI_FRAG / 4;
         for (int c = 0; c < 2; c++) {

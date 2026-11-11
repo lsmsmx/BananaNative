@@ -14,7 +14,9 @@ import java.util.List;
 /**
  * The Upscaler: what runs in place of a game's own neural upscaler, and how the window is scaled to the screen (Nintendo's NDSR, emulated and slow on phones: DM_VK_NDSR, DM_VK_NDSR_SHARP in dm/gfx/vk_android/vka_draw.c), per game:
  * a nearest-neighbour or bilinear stretch, FSR 1 (the default, with RCAS at AMD's default sharpness), Qualcomm's Snapdragon Game Super Resolution 1 (one pass, its own sharpening), or the game's network itself ("Native"). Set in Game settings and live in the in-game panel, sent to the
- * running game as lines of its live control file (DM_CTL) as the in-game panel's other live settings do
+ * running game as lines of its live control file (DM_CTL) as the in-game panel's other live settings do. For a game whose DLSS runs on the host's GSR2 stand-in (Prefs.dlssGame),
+ * the Upscaler row offers the stand-in's modes instead (dlss_mode: DM_VK_DLSS), with its Motion clarity and Temporal sharpness sliders (DlssTune, StepSlider; DM_VK_GSR2_CLARITY,
+ * DM_VK_DLSS_SHARP); the stored ndsr_choice2 then drives the present's scaling alone, without DM_VK_NDSR (DlssTune's rule)
  */
 final class GameUpscaler {
     private GameUpscaler() {}
@@ -50,6 +52,29 @@ final class GameUpscaler {
     static String sharpName(Context c, String titleId) { return sharpName(sharp(c, titleId)); }
     static int sharpIndex(float s) { for (int i = 0; i < SHARPS.length; i++) if (SHARPS[i] == s) return i; return 0; }
 
+    // A game whose DLSS runs on the host's GSR2 stand-in (Prefs.dlssGame): Motion clarity and Temporal sharpness (DlssTune), each game's own or the default, sent live like the rest
+    static boolean ownClarity(Context c, String titleId) { return Prefs.of(c).contains(Prefs.gameKey("gsr2_clarity", titleId)); }
+    static int clarity(Context c, String titleId) { return DlssTune.clamp(Prefs.of(c).getInt(Prefs.gameKey("gsr2_clarity", titleId), DlssTune.CLARITY_DEFAULT), DlssTune.CLARITY_NAMES.length, DlssTune.CLARITY_DEFAULT); }
+    static void clarity(Context c, String titleId, Integer v) {
+        if (v == null) Prefs.of(c).edit().remove(Prefs.gameKey("gsr2_clarity", titleId)).commit(); else Prefs.of(c).edit().putInt(Prefs.gameKey("gsr2_clarity", titleId), v).commit();
+        push(c, titleId);
+    }
+    static boolean ownDlssSharp(Context c, String titleId) { return Prefs.of(c).contains(Prefs.gameKey("dlss_sharp", titleId)); }
+    /** The index into DlssTune.SHARPS */
+    static int dlssSharp(Context c, String titleId) { return DlssTune.clamp(Prefs.of(c).getInt(Prefs.gameKey("dlss_sharp", titleId), DlssTune.SHARP_DEFAULT), DlssTune.SHARPS.length, DlssTune.SHARP_DEFAULT); }
+    static void dlssSharp(Context c, String titleId, Integer v) {
+        if (v == null) Prefs.of(c).edit().remove(Prefs.gameKey("dlss_sharp", titleId)).commit(); else Prefs.of(c).edit().putInt(Prefs.gameKey("dlss_sharp", titleId), v).commit();
+        push(c, titleId);
+    }
+
+    // A game on the DLSS stand-in: its Upscaler row is the stand-in's mode (DlssTune.MODE_NAMES), stored per game only (no main-screen default: no other game has the stand-in)
+    static boolean ownDlssMode(Context c, String titleId) { return Prefs.of(c).contains(Prefs.gameKey("dlss_mode", titleId)); }
+    static int dlssMode(Context c, String titleId) { return DlssTune.clamp(Prefs.of(c).getInt(Prefs.gameKey("dlss_mode", titleId), DlssTune.MODE_DEFAULT), DlssTune.MODE_NAMES.length, DlssTune.MODE_DEFAULT); }
+    static void dlssMode(Context c, String titleId, Integer v) {
+        if (v == null) Prefs.of(c).edit().remove(Prefs.gameKey("dlss_mode", titleId)).commit(); else Prefs.of(c).edit().putInt(Prefs.gameKey("dlss_mode", titleId), v).commit();
+        push(c, titleId);
+    }
+
     /**
      * The host's switches for a run (env.txt lines come after these and win). One choice for every scaling step: the game's internal upscaler (DM_VK_NDSR) and the
      * present's scaling of the window to the screen (only when the window is smaller): FSR 1 there too with the same sharpness (DM_VK_FSR; its RCAS pass also places and turns
@@ -57,6 +82,7 @@ final class GameUpscaler {
      */
     static List<String> lines(Context c, String titleId) {
         int m = mode(c, titleId); float s = sharp(c, titleId);
+        if (Prefs.dlssGame(titleId)) return DlssTune.lines(dlssMode(c, titleId), clarity(c, titleId), dlssSharp(c, titleId), m, s);   // the stand-in's row; the stored choice: the present alone
         return java.util.Arrays.asList("DM_VK_NDSR=" + NDSR[m], "DM_VK_NDSR_SHARP=" + s, "DM_VK_FSR=" + (m == MODE_FSR ? 1 : 0), "DM_VK_FSR_SHARP=" + s,
                                        "DM_VK_PRESENT_NEAREST=" + (NDSR[m] == 3 ? 1 : 0));
     }
@@ -82,8 +108,9 @@ final class GameUpscaler {
         return st != 0 || Prefs.of(c).getBoolean(k, false);
     }
 
-    /** The in-game panel's rows: the upscaler, and FSR's sharpness while FSR 1 is the choice; each applied at once (the same per-game choice as Game settings › Upscaler) */
+    /** The in-game panel's rows: the upscaler, and FSR's sharpness while FSR 1 is the choice; each applied at once (the same per-game choice as Game settings › Upscaler). A game on the DLSS stand-in gets dlssRows instead */
     static void rows(Context c, String titleId, LinearLayout box) {
+        if (Prefs.dlssGame(titleId)) { dlssRows(c, titleId, box); return; }
         TextView head = new TextView(c);
         head.setText("Upscaler");
         head.setPadding(0, 24, 0, 0);
@@ -100,5 +127,31 @@ final class GameUpscaler {
         Runnable shown = () -> { int v = mode(c, titleId) == MODE_FSR ? android.view.View.VISIBLE : android.view.View.GONE; l.setVisibility(v); s.setVisibility(v); };
         shown.run();
         g.setOnCheckedChangeListener((gr, id) -> { mode(c, titleId, id - 3100); shown.run(); });
+    }
+
+    /** A game on the DLSS stand-in: "Upscaler" (the stand-in's mode) with Motion clarity and Temporal sharpness under GSR 2, the sharpness alone ("FSR sharpness") under FSR 1. Each applied at once */
+    private static void dlssRows(Context c, String titleId, LinearLayout box) {
+        TextView head = new TextView(c);
+        head.setText("Upscaler");
+        head.setPadding(0, 24, 0, 0);
+        box.addView(head);
+        RadioGroup g = new RadioGroup(c);
+        for (int i = 0; i < DlssTune.MODE_NAMES.length; i++) { RadioButton b = new RadioButton(c); b.setText(DlssTune.MODE_NAMES[i]); b.setId(3300 + i); g.addView(b); if (i == dlssMode(c, titleId)) b.setChecked(true); }
+        box.addView(g);
+        TextView clHead = new TextView(c); box.addView(clHead);
+        android.view.View cl = StepSlider.view(c, "Motion clarity", DlssTune.clarityNames(), clarity(c, titleId), GameSettings.CLARITY_LEFT, GameSettings.CLARITY_RIGHT,
+                                               clHead::setText, i -> clarity(c, titleId, i));
+        box.addView(cl);
+        TextView shHead = new TextView(c); box.addView(shHead);
+        android.view.View sh = StepSlider.view(c, DlssTune.sharpTitle(dlssMode(c, titleId)), DlssTune.sharpNames(), dlssSharp(c, titleId), "Softer", "Sharper",
+                                               t -> shHead.setText(DlssTune.sharpTitle(dlssMode(c, titleId)) + t.substring(t.indexOf(':'))), i -> dlssSharp(c, titleId, i));
+        box.addView(sh);
+        Runnable shown = () -> {
+            int m = dlssMode(c, titleId), vc = DlssTune.showsClarity(m) ? android.view.View.VISIBLE : android.view.View.GONE, vs = DlssTune.showsSharp(m) ? android.view.View.VISIBLE : android.view.View.GONE;
+            clHead.setVisibility(vc); cl.setVisibility(vc); shHead.setVisibility(vs); sh.setVisibility(vs);
+            shHead.setText(StepSlider.title(DlssTune.sharpTitle(m), DlssTune.sharpNames(), dlssSharp(c, titleId)));
+        };
+        shown.run();
+        g.setOnCheckedChangeListener((gr, id) -> { dlssMode(c, titleId, id - 3300); shown.run(); });
     }
 }

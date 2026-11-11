@@ -149,7 +149,6 @@ static void prot_mark(uintptr_t a, size_t n) {   // async-signal-safe (the dirty
 static int g_sw_fail;
 static long sw_mprotect(uintptr_t a, size_t n, int prot) { long r = syscall(__NR_mprotect, a, n, prot); if (r) g_sw_fail = 1; return r; }
 static void *sw_mmap_fixed(uintptr_t a, size_t n) { long r = syscall(__NR_mmap, a, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0); if (r == -1 || r != (long)a) { g_sw_fail = 1; return MAP_FAILED; } plat_mem_name_guest((void *)r, n); return (void *)r; }   // (named as the guest block: it merges with its neighbours)
-static void *sw_mremap_to(void *from, size_t n, uintptr_t to) { long r = syscall(__NR_mremap, from, n, n, MREMAP_MAYMOVE | MREMAP_FIXED, to); if (r == -1) { g_sw_fail = 1; return MAP_FAILED; } return (void *)r; }
 static int prot_runs_text(uintptr_t lo, uintptr_t hi, prun *out, int max);
 #ifndef MAP_FIXED_NOREPLACE
 #define MAP_FIXED_NOREPLACE 0x100000
@@ -571,11 +570,18 @@ static void unplace(const seg_t *sp) {
     // reserved after an unmap with VK_MEMORY_UNMAP_RESERVE_BIT_EXT, as the extension specifies (the application owns the range from the unmap on), has no hole: the
     // mremap replaces that reservation. DM_VK_UNPLACE_REMAP is the experiment for a driver that does not (not yet tried on the phone)
     if (!s.fd_alias && t != MAP_FAILED) sw_hole_check(s.lo, n, waited && !elsewhere, "giving back pool memory");
-    if (t == MAP_FAILED || sw_mremap_to(t, n, s.lo) == MAP_FAILED) {
-        VRED_ONCE("giving back pool memory %#lx+%#zx: no anonymous pages with its bytes (errno %d): they are lost", (unsigned long)s.lo, n, errno);
-        if (t != MAP_FAILED) munmap(t, n);
+    if (t == MAP_FAILED) {
+        VRED_ONCE("giving back pool memory %#lx+%#zx: no anonymous pages with its bytes: they are lost", (unsigned long)s.lo, n);
         sw_mmap_fixed(s.lo, n);
-    } else plat_mem_name_guest((void *)s.lo, n);   // (its name in the maps; moved pages keep their own offset, so these do not merge with neighbours until the range is given back to the system)
+    } else {
+        void *dst = sw_mmap_fixed(s.lo, n);
+        if (dst == MAP_FAILED) {
+            VRED_ONCE("giving back pool memory %#lx+%#zx: fixed map failed (errno %d)", (unsigned long)s.lo, n, errno);
+        } else {
+            memcpy(dst, t, n);
+        }
+        munmap(t, n);
+    }
     if (s.fd_alias) seg_free(&s, waited, fence);
     if (elsewhere) {
         vk.vkUnmapMemory(V.dev, s.mem); seg_free(&s, waited, fence);
@@ -1089,25 +1095,57 @@ static int join(int k0, int k1, seglist *l) {
     nvn_dirty_unhold();
     prefault_line();
     if (V.bda) { VkBufferDeviceAddressInfo bai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = s.buf}; s.bda = vk.vkGetBufferDeviceAddress(V.dev, &bai); }
+    pthread_mutex_lock(&g_pmu);
+    int nrefs = 0;
+    for (int p = 0; p < g_npool; p++) {
+        seglist *sl = &g_pool[p].segs;
+        int hit = 0, w = 0;
+        for (int j = 0; j < sl->n; j++) {
+            int gone = 0;
+            for (int i = 0; i < cnt; i++) if (sl->lo[j] == old[i].lo) { gone = 1; hit = 1; break; }
+            if (!gone) sl->lo[w++] = sl->lo[j];
+        }
+        sl->n = w;
+        if (hit) { sl_add(sl, lo); nrefs++; }
+    }
+    pthread_mutex_unlock(&g_pmu);
+    s.refs = nrefs > 0 ? nrefs : 1;
     pthread_rwlock_wrlock(&g_rw); sg_insert(&s); pthread_rwlock_unlock(&g_rw);   // (the placed bytes are the same)
-    int w = 0; for (int j = 0; j < l->n; j++) { int gone = 0; for (int i = 0; i < cnt; i++) if (l->lo[j] == old[i].lo) gone = 1; if (!gone) l->lo[w++] = l->lo[j]; }
-    l->n = w; sl_add(l, lo);
+    if (l) {
+        int w = 0; for (int j = 0; j < l->n; j++) { int gone = 0; for (int i = 0; i < cnt; i++) if (l->lo[j] == old[i].lo) gone = 1; if (!gone) l->lo[w++] = l->lo[j]; }
+        l->n = w; sl_add(l, lo);
+    }
     free(old);
     return 1;
+}
+static int contiguous_segs_due(void) {
+    pthread_rwlock_rdlock(&g_rw);
+    int due = 0;
+    for (int i = 0; i < g_nsg - 1; i++) {
+        if (g_sg[i].hi == g_sg[i + 1].lo && !g_sg[i].fd_alias && !g_sg[i + 1].fd_alias) { due = 1; break; }
+    }
+    pthread_rwlock_unlock(&g_rw);
+    return due;
 }
 // At the start of a submission (vka_rp_sub_begin, the replay thread; nothing recorded is held back there): the joins the asks queued (Joining parts). The queue is
 // waited idle once for all of them. A pool being placed (lazy 2) keeps its joins for the next submission; one finalized or placed whole since drops them
 void vka_mem_join_due(void) {
-    if (!atomic_load_explicit(&g_join_n, memory_order_relaxed)) return;
-    pthread_mutex_lock(&g_pmu);
-    int any = 0;
-    for (int j = 0; j < g_njoin && !any; j++) for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id && g_pool[i].lazy == 1) { any = 1; break; }
-    if (!any) {   // all for pools gone, placed whole, or being placed: drop the first two kinds
-        int w = 0; for (int j = 0; j < g_njoin; j++) { int keep = 0; for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id && g_pool[i].lazy == 2) keep = 1; if (keep) g_join[w++] = g_join[j]; }
-        g_njoin = w; atomic_store(&g_join_n, w);
-        pthread_mutex_unlock(&g_pmu); return;
+    int has_join = atomic_load_explicit(&g_join_n, memory_order_relaxed);
+    int has_contig = contiguous_segs_due();
+    if (!has_join && !has_contig) return;
+    if (has_join) {
+        pthread_mutex_lock(&g_pmu);
+        int any = 0;
+        for (int j = 0; j < g_njoin && !any; j++) for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id && g_pool[i].lazy == 1) { any = 1; break; }
+        if (!any) {   // all for pools gone, placed whole, or being placed: drop the first two kinds
+            int w = 0; for (int j = 0; j < g_njoin; j++) { int keep = 0; for (int i = 0; i < g_npool; i++) if (g_pool[i].id == g_join[j].id && g_pool[i].lazy == 2) keep = 1; if (keep) g_join[w++] = g_join[j]; }
+            g_njoin = w; atomic_store(&g_join_n, w);
+            pthread_mutex_unlock(&g_pmu);
+            if (!has_contig) return;
+        } else {
+            pthread_mutex_unlock(&g_pmu);
+        }
     }
-    pthread_mutex_unlock(&g_pmu);
     uint64_t t0 = mono_ns();
     vka_up_flush();   // an open upload batch to the queue: it may name a part's buffer
     if (!vka_queue_idle()) return;   // (a GPU hang, or not idle in the hang time: tried again at the next submission)
@@ -1145,6 +1183,31 @@ void vka_mem_join_due(void) {
             VRED("memory pool %#lx+%#llx: %#lx+%#lx (%s) lies across %d of its parts, %#lx+%#lx, which are not joined (%s): lookups over the whole range fail (draws that need it in one piece are skipped)",
                  (unsigned long)pe.mem, (unsigned long long)pe.size, (unsigned long)q.a, (unsigned long)(q.e - q.a), q.why, c, (unsigned long)jlo, (unsigned long)(jhi - jlo),
                  shared ? "a part is shared with another pool" : jhi - jlo > join_cap() ? "more than DM_VK_PLACE_JOIN_MB" : (V.max_alloc && jhi - jlo > V.max_alloc) ? "more than one allocation can be" : "the join failed");
+    }
+    if (contiguous_segs_due()) {
+        pthread_mutex_lock(&g_pl);
+        for (int it = 0; it < 32 && g_nsg > 1; it++) {
+            int k0 = -1, k1 = -1;
+            for (int i = 0; i < g_nsg - 1; i++) {
+                if (g_sg[i].hi == g_sg[i + 1].lo && !g_sg[i].fd_alias && !g_sg[i + 1].fd_alias) {
+                    k0 = i; k1 = i + 1;
+                    while (k1 + 1 < g_nsg && g_sg[k1].hi == g_sg[k1 + 1].lo && !g_sg[k1 + 1].fd_alias
+                           && (g_sg[k1 + 1].hi - g_sg[k0].lo) <= join_cap()
+                           && (!V.max_alloc || (g_sg[k1 + 1].hi - g_sg[k0].lo) <= V.max_alloc)
+                           && (k1 + 1 - k0 < 32)) {
+                        k1++;
+                    }
+                    break;
+                }
+            }
+            if (k0 < 0) break;
+            uintptr_t clo = g_sg[k0].lo, chi = g_sg[k1].hi; int ccnt = k1 - k0 + 1;
+            if (!join(k0, k1, NULL)) break;
+            static uint64_t n_cjoin;
+            if (++n_cjoin <= 16 || !(n_cjoin & 63))
+                VLOG("placed memory coalesced: %d contiguous segments joined into one %#lx+%#lx (total: %llu)", ccnt, (unsigned long)clo, (unsigned long)(chi - clo), (unsigned long long)n_cjoin);
+        }
+        pthread_mutex_unlock(&g_pl);
     }
 }
 // The live memory pools (the frame capture's regions, vka_capture.c): at most max of them, the count returned
@@ -1286,6 +1349,11 @@ static void maps_tick(int *line_due) {
         if (covered < shed && nred_cover < 4) { nred_cover++;
             VRED("memory maps: %ld of %d, %ld over the target: placed memory's pieces cover only %ld of them (%ld maps in placed memory, %ld more in the guest block, %ld outside it)",
                  m.total, mx, shed, covered, m.placed, m.guest - m.placed, m.total - m.guest); }
+        if (covered < shed && (m.guest - m.placed) > 2000) {
+            nvn_dirty_release_all();
+            act = 1;
+            VLOG("memory maps: released dirty tracking protections across all pools to merge %ld guest anonymous maps", m.guest - m.placed);
+        }
     }
     uint64_t now = mono_ns();
     if (*line_due || act || step != last_step || now - last_line_ns >= 60000000000ull) {

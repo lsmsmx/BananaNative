@@ -53,6 +53,9 @@ typedef struct {
 typedef int (*vka_read_fn)(void *ctx, uint64_t addr, void *out, size_t n);
 
 #define VKA_WALK_REFUSE (-1)
+// An array of handles in a uniform buffer (TEX_UBO / SAMP_UBO, count > 1; BindlessToArray): element k is the handle at the array's base + 8k, as nvn_mtl.m fills it.
+// 1 (default) = so; 0 = every element from the base (the old walk; DM_VK_TEXU_ELEM=0, live, for A/B). Set by the replay (vka_draw.c walk_all)
+extern int vka_texu_elem;
 // Walks one stage's binding records (e->bind_count of them from b) for NVN stage nvn_stage. Writes at most max results to out and returns their count, or VKA_WALK_REFUSE with
 // *why set when the draw cannot run correctly. Storage buffers of global memory (SBUF, SBUF_UBO, UBO_PTR): with the library's ssbo_align (header; DMSH_VK_SSBO_ALIGN) they are
 // bound at their address rounded down to it, the range grown by the difference (the shader adds it back); with 0 (an older library) at the exact address, and one off the

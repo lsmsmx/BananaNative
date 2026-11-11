@@ -10,6 +10,7 @@ int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
 void nvn_dirty_hold(const void *addr, size_t len);                 // Unprotect (and stamp) every protected page of [addr, addr+len) and protect nothing more until nvn_dirty_unhold
 void nvn_dirty_unhold(void);                                      // (a placement swapping those pages, vka_mem.c place: the tracker's protections must not change under it)
+void nvn_dirty_release_all(void);                                  // Unprotect all pages of all live ranges back to PROT_READ | PROT_WRITE (allows OS to merge split VMAs)
 size_t nvn_dirty_block_at_least(size_t bytes);                     // Protection changes in blocks of at least bytes from now on (a power of two; only grows); the block size in force
 size_t nvn_dirty_block_bytes(void);                                // The block size in force (0 = by the page)
 uint64_t nvn_dirty_now(void);                                      // Current generation: take the content's stamp before nvn_dirty_protect and before reading it

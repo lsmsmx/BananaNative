@@ -148,4 +148,6 @@ final class Native {
     static native void drsSet(int minPct, int maxPct);
     /** Whether the running game has dispatched a neural upscaler network that the Upscaler can replace (vka_draw.c nxhost_ndsr_status): 1 yes, 0 not yet, -1 this host cannot say */
     static native int ndsrStatus();
+    /** The skipped-work warning (vka_exec.c nxhost_skip_status): "<percent> <causes>" once the replay skipped a large share of the game's draws for causes of the GPU driver, "" before or when it is off; SkipNotice reads it */
+    static native String skipStatus();
 }

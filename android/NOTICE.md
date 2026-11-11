@@ -73,6 +73,12 @@ ported to a compute shader in [`dm/gfx/vk_android/sgsr/ndsr_sgsr.comp`](../dm/gf
 
 The shader file itself carries Qualcomm's 2025 header of the file it was ported from (`sgsr1_shader_mobile_edge_direction.frag`, SPDX-License-Identifier: BSD-3-Clause). Thanks to them.
 
+The Vulkan replay's stand-in for NVN2's DLSS (`dm/gfx/vk_android/vka_dlss.c`) runs Qualcomm's [Snapdragon Game Super Resolution 2](https://github.com/SnapdragonStudios/snapdragon-gsr)
+(GSR2) 3-pass shaders, adapted to compute passes in [`dm/gfx/vk_android/gsr2`](../dm/gfx/vk_android/gsr2/LICENSE) and compiled into the host (`gsr2/vka_gsr2_spv.h`):
+Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved, under the BSD-3-Clause license, whose full text, conditions and disclaimer are in
+[`dm/gfx/vk_android/gsr2/LICENSE`](../dm/gfx/vk_android/gsr2/LICENSE) and apply to the shaders in source and binary form. Its FSR 1 mode uses AMD's FidelityFX FSR 1
+headers (MIT, [dm/third_party/fidelityfx-fsr1](../dm/third_party/fidelityfx-fsr1/LICENSE.txt)), as the present's FSR 1 does.
+
 `Lossless.dll` belongs to Lossless Scaling (proprietary, sold separately). It is never in this repository or in an APK: the user supplies their own copy, which the
 launcher finds on the phone or lets the user pick, and copies into the app's private files.
 

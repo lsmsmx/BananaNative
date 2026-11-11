@@ -1,0 +1,11 @@
+# What this game needs of an Android phone, for the launcher's readiness check (android/README.md "Readiness check"; the format in dm/games/README.md "Readiness rows").
+# A status row also marks the game as supported on Android: gradle.properties' nxGames builds every such profile into the APK (dm/tools/tests/test_android_games.py).
+
+# Playable on Android: on the OnePlus Pad 3 (Adreno 830) the user played from the intro through many battles to the hub area Dagsion with no significant issue, on
+# Turnip Gen8 V39 and on the stock Qualcomm 512.800 (the note, Android). NVN2's DLSS is drawn by a host stand-in, Snapdragon GSR2 (tune m2) by default with FSR 1 and
+# bilinear to pick (vka_dlss.c, the per-game Upscaler row)
+# Drivers (2026-11, the note, Android). Adreno 740 (AYN Thor) with its stock Qualcomm 512.676.53: the skinned characters' spikes are gone (no per-draw vertex input before
+# 512.800, vka_dev.c DM_VK_VIN_DYN), but the characters still draw unlit (black), and the dungeon runs at about 25 fps;
+# pick Turnip in Settings > GPU driver: purple-turnip T30 (Mesa 26.3) is correct there, with the dungeon at 29-30 fps and GPU about 19 ms (Turnip Gen8 V39, an A8xx
+# build, also works, at GPU 28.8 ms). Qualcomm 512.800 (Adreno 830) is correct. No readiness fact names a driver version, so this is no row
+status	playable

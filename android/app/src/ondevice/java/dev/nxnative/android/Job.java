@@ -30,7 +30,7 @@ import java.util.Locale;
 final class Job {
     static final int FORMAT = 2;   // 2: the shaders step writes the library too (vk_android_build.py's result cache); 1 had a library step of its own
     static final String[] STEPS = {"identify", "rewrite", "split", "shaders", "pack"};
-    static final String[] STEP_TEXT = {"Checking the dump", "Rewriting the game code", "Finding the shaders", "Translating shaders", "Finishing the pack"};
+    static final String[] STEP_TEXT = {"Checking the dump", "Rewriting the game's code", "Finding the shaders", "Translating shaders", "Finishing the pack"};
     /** Each step's share of the progress bar, roughly its time on the phone (ONDEVICE.md "Time and power"); the shaders' share is counted by shader */
     private static final int[] WEIGHT = {1, 5, 12, 78, 4};
     static final int REWRITE = 1, SHADERS = 3, PACK = 4;
@@ -451,7 +451,7 @@ final class Job {
     synchronized long shadersKept() {
         Profile p = Profile.of(titleId());
         long t = stepTotal(SHADERS);
-        return p == null || step(STEPS[SHADERS]).optString("stage").isEmpty() || t <= 0 ? 0 : Math.max(0, p.shaderTotal - t);
+        return p == null || step(STEPS[SHADERS]).optString("stage").isEmpty() ? 0 : Math.max(0, p.shaderTotal - t);
     }
 
     /** Seconds left for the shaders step, -1 while unknown */
@@ -471,7 +471,25 @@ final class Job {
         return String.format(Locale.getDefault(), "%,d of %,d · %,d left", shadersDone(), shadersTotal(), shadersLeft()) + (eta.isEmpty() ? "" : " · " + eta);
     }
 
-    /** The card's line under the bar: "37 % · 21,548 shaders left · about 35 min left · 70 unchanged kept" (the parts it knows) */
+    /** The shaders step's main text: delta update reuse, up-to-date state, or count during translation */
+    synchronized String shadersStepText() {
+        long done = shadersDone(), total = shadersTotal(), kept = shadersKept(), left = shadersLeft();
+        String eta = etaText(shadersEta());
+        if (total == 0 && (kept > 0 || "done".equals(stepState(STEPS[SHADERS])))) {
+            return "Shaders up to date: nothing to translate";
+        }
+        if (kept > 0) {
+            String base = String.format(Locale.getDefault(), "Translating %,d new shaders (the other %,d are reused)", total, kept);
+            if (done > 0) {
+                base += String.format(Locale.getDefault(), ": %,d of %,d · %,d left", done, total, left);
+            }
+            if (!eta.isEmpty()) base += " · " + eta;
+            return base;
+        }
+        return STEP_TEXT[SHADERS] + ": " + shadersCountText();
+    }
+
+    /** The card's line under the bar: "37 % · 21,548 shaders left · about 35 min left · the other 70 are reused" (the parts it knows) */
     synchronized String detailText() {
         boolean during = !"done".equals(stepState(STEPS[SHADERS])) && !step(STEPS[SHADERS]).optString("stage").isEmpty();
         return PrepareText.progressLine(Math.round(overall() * 100), during, shadersDone(), shadersTotal(), etaText(shadersEta()), shadersKept());
@@ -484,12 +502,17 @@ final class Job {
             String stage = step(STEPS[i]).optString("stage");
             if (stage.equals("library") || stage.equals("done")) return "Writing the shader library";
             if (stage.equals("check")) return "Checking the shader library";
-            return STEP_TEXT[i] + ": " + shadersCountText();
+            return shadersStepText();
+        }
+        if (i == REWRITE) {
+            long d = stepDone(i), t = stepTotal(i);
+            String part = step(STEPS[i]).optString("stage");
+            if (part.equals("code") && t > 0)
+                return STEP_TEXT[i] + " (a few minutes) (" + Math.min(100, d * 100 / t) + " %)";
+            return STEP_TEXT[i] + " (a few minutes)";
         }
         long d = stepDone(i), t = stepTotal(i);
         String part = step(STEPS[i]).optString("stage");   // shader_split.py's "progress: <done>/<total> <n>%" inside a large file
-        // the rewrite's "progress <n> 1000 code" (pack_android.py --in-process: the step's share of each module's rewrite): a percentage, not a count
-        if (part.equals("code") && t > 0) return STEP_TEXT[i] + String.format(Locale.getDefault(), " (%d %%)", Math.min(100, d * 100 / t));
         return PrepareText.stepCountText(STEP_TEXT[i], STEPS[i].equals("split"), d, t, part);   // the split counts files: "Finding the shaders: 1,203 of 1,890 files"
     }
 

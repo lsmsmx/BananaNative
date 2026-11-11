@@ -37,9 +37,10 @@ shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=layout
 shader_note	Ocarina of Time shaders
 
 # ---- Frame rate ----
-# Android: held to 30 fps by the host's frame limiter by default (the launcher's Frame rate cap and DM_FPS_LIMIT override it). Link's house runs 37-38 fps from cool and
-# 27-32 once hot, the phone 23 C warmer over a run; at 30 every frame is 33.3 ms and it warms 12 C (README.md "Profile"). Kokiri Forest is below 30 anyway
-fps_limit	30
+# Android: the host's frame limiter's default is 60 fps, the game's own top rate (the launcher's Frame rate cap, 60 / 45 / 40 / 30 / 20, and DM_FPS_LIMIT override it). Until
+# 2026-11-11 it was 30: Link's house ran 37-38 fps from cool and 27-32 once hot, the phone 23 C warmer over a run; at 30 every frame is 33.3 ms and it warms 12 C (README.md
+# "Profile"). The maintainer chose the game's own rate as the start; 30 is one tap away in the in-game panel
+fps_limit	60
 # The frame step (patches.py) in whole vsyncs decided by the host, also with no limit (the launcher's 60): left to the game's own controller, the game kept interval 1 at 25 fps on the
 # phone (0.4 of real time; its controller's frame costs, framework +0x148 / +0x150, said 60 fits). The limit above caps the step (hle_fpslock.c dm_fps_step_fold): 30 fps = 2 vsyncs a frame
 fps_target	60

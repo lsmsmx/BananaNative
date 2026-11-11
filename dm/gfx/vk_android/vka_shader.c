@@ -66,7 +66,9 @@ uint32_t vka_shader_sg_pin(int stage) { return stage >= 0 && stage < 8 ? g_sg_pi
 // arbitrary-index shuffle instruction: ir3 makes each OpGroupNonUniformShuffle a loop of rotates, one pass per distinct (index - lane) in the subgroup, and the translator's
 // LDSM / MOVM gathers take up to 24 (agl's upscaler network in DKB, 14a8aaf3e0a9edbd: 10.7 ms a dispatch on the Adreno 840, 2.0 ms with the module through workgroup
 // memory). Qualcomm's driver shuffles natively and runs the base module faster (1.7 ms against 1.9). DM_VK_SHUFFLE_LDS (restart): 1 = those modules, 0 = the base ones;
-// default 1 on VK_DRIVER_ID_MESA_TURNIP, 0 on other drivers. Needs DMSH_VK_SHARED_MAX bytes of shared memory (the library keeps the modules within it)
+// default 1 on VK_DRIVER_ID_MESA_TURNIP, 0 on other drivers. Needs DMSH_VK_SHARED_MAX bytes of shared memory (the library keeps the modules within it).
+// Those modules index workgroup memory by SubgroupId * SubgroupSize + lane. A shader whose subgroup operations run as one-invocation subgroups (single_lane) takes the
+// base module instead (cs_variant): the rewrite makes SubgroupSize 1 and the lane 0 but leaves SubgroupId, so every invocation of a subgroup would share one slot
 static int g_shuffle_lds = -1;
 static void shuffle_plan(void) {
     const char *ev = getenv("DM_VK_SHUFFLE_LDS");
@@ -76,9 +78,31 @@ static void shuffle_plan(void) {
     VLOG("compute subgroup shuffles: %s", g_shuffle_lds ? "through workgroup memory where the library has the module (DM_VK_SHUFFLE_LDS=0: the instruction)"
          : want ? "the instruction (the device's shared memory is under DMSH_VK_SHARED_MAX)" : "the instruction (DM_VK_SHUFFLE_LDS=1: through workgroup memory)");
 }
-VkShaderModule vka_shader_cs_module(vka_shader *s) {
+// DM_VK_ONE_LANE_BASE (restart; default 1): 1 = a one-lane compute shader takes the base module, and single_lane leaves a module that addresses whole subgroups as built;
+// 0 = neither (the shuffle module is rewritten like any other)
+static int g_one_lane_base = -1;
+static int one_lane_base(void) {
+    if (g_one_lane_base < 0) { const char *ev = getenv("DM_VK_ONE_LANE_BASE"); g_one_lane_base = !(ev && *ev && !atoi(ev)); }
+    return g_one_lane_base;
+}
+static int one_lane_forced(uint64_t key);
+static int runs_one_lane(uint64_t key, int stage) { return stage >= 0 && stage < 8 && (g_sg_one[stage] || one_lane_forced(key)); }   // single_lane rewrites its modules
+static int one_lane_pick_base(const vka_shader *s) { return (s->e->flags & DMSH_VK_F_SUBGROUP) && one_lane_base() && runs_one_lane(s->key, s->e->stage); }
+// The compute module variant a pipeline of s uses: DMSH_VK_MOD_SHUFFLE_LDS where the device takes it and the shader does not run as one lane, else the base
+static int cs_variant(const vka_shader *s) {
     if (g_shuffle_lds < 0) shuffle_plan();
-    VkShaderModule m = g_shuffle_lds && vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_SHUFFLE_LDS) ? vka_shader_module(s, DMSH_VK_MOD_SHUFFLE_LDS) : VK_NULL_HANDLE;
+    if (s->e->stage != DMSH_VK_STAGE_CS || !g_shuffle_lds || !vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_SHUFFLE_LDS)) return DMSH_VK_MOD_BASE;
+    if (!one_lane_pick_base(s)) return DMSH_VK_MOD_SHUFFLE_LDS;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t seen[32]; static int nseen; int fresh = 1;
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < nseen; i++) if (seen[i] == s->key) fresh = 0;
+    if (fresh && nseen < 32) seen[nseen++] = s->key; else fresh = 0;
+    pthread_mutex_unlock(&mu);
+    if (fresh) VLOG("shader %016llx: the base module (one-invocation subgroups; DM_VK_ONE_LANE_BASE)", (unsigned long long)s->key);
+    return DMSH_VK_MOD_BASE;
+}
+VkShaderModule vka_shader_cs_module(vka_shader *s) {
+    VkShaderModule m = cs_variant(s) == DMSH_VK_MOD_SHUFFLE_LDS ? vka_shader_module(s, DMSH_VK_MOD_SHUFFLE_LDS) : VK_NULL_HANDLE;
     return m ? m : s->mods[DMSH_VK_MOD_BASE];   // (that module not made: logged by vka_shader_module; the base one)
 }
 
@@ -284,15 +308,49 @@ static const char *refusal(const vka_shlib *L, const dmsh_vk_entry *e) {
 }
 // A module of a stage sg_plan runs as one lane (no subgroup operations there on this device, or a subgroup size the library is not right for that cannot be pinned) has them
 // rewritten as subgroups of one invocation (vka_spv_subgroup_single; Qualcomm's Adreno 840 driver has them in fragment, compute, task and mesh shaders, not in the vertex pipeline's). Logged once per shader key; a module that cannot be rewritten is used as it is, with a red line
+// Profile subgroup_one_lane (a workaround for Qualcomm's own driver): these shaders take the rewrite even where the device has the operations at the library's size, by
+// default on VK_DRIVER_ID_QUALCOMM_PROPRIETARY only, the driver the failure was seen on. Fire Emblem Fortune's Weave's light grid (compute 35d12d6f98fa05e2, 30x17x16
+// workgroups of 256: Maxwell warp OR-reductions as constant-lane shuffles, some in a branch only the reducing lane takes) lost the device at its first dispatch on the
+// Adreno 830's stock 512.800.77 driver (vkQueueSubmit -4); as one invocation each lane ORs its share into the shared words atomically, the same union. That holds for its
+// base module (native shuffles); its shuffle-through-memory module addresses whole subgroups, so it takes the base one (cs_variant). Other drivers (Turnip) run it as built.
+// DM_VK_ONE_LANE (restart; read once): 0 = the profile's keys off; 1 = the profile's keys on any driver; <key>[,<key>...] = those keys too, on any driver (where the profile's keys
+// are off, those keys only); 1,<key>[,<key>...] = both
+static uint64_t g_one_env[16]; static int g_one_nenv, g_one_mode;   // g_one_mode: 0 = the profile's keys by driver, 1 = on, -1 = off
+static void one_lane_env(void) {
+    const char *q = getenv("DM_VK_ONE_LANE");
+    if (q && !strcmp(q, "0")) g_one_mode = -1;
+    else {
+        if (q && q[0] == '1' && (!q[1] || q[1] == ',')) g_one_mode = 1, q += q[1] ? 2 : 1;
+        for (; q && *q && g_one_nenv < 16;) { char *e; uint64_t v = strtoull(q, &e, 16); if (e == q) break; if (v) g_one_env[g_one_nenv++] = v; q = *e ? e + 1 : e; }
+    }
+    int on = g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
+    if (DM_GAME_NSUBGROUP_ONE_LANE) VLOG("profile subgroup_one_lane (%d shader key%s): %s%s", DM_GAME_NSUBGROUP_ONE_LANE, DM_GAME_NSUBGROUP_ONE_LANE == 1 ? "" : "s",
+                                         g_one_mode < 0 ? "off (DM_VK_ONE_LANE=0)" : g_one_mode > 0 ? "on (DM_VK_ONE_LANE=1)" : on ? "on (Qualcomm's driver; DM_VK_ONE_LANE=0: off)" : "off (this driver; DM_VK_ONE_LANE=1: on)",
+                                         g_one_nenv ? ", plus DM_VK_ONE_LANE's keys" : "");
+    else if (g_one_nenv) VLOG("subgroup_one_lane: %d shader key%s from DM_VK_ONE_LANE", g_one_nenv, g_one_nenv == 1 ? "" : "s");
+}
+static int one_lane_forced(uint64_t key) {
+    static const uint64_t prof[] = DM_GAME_SUBGROUP_ONE_LANE; static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, one_lane_env);
+    for (int i = 0; i < g_one_nenv; i++) if (g_one_env[i] == key) return 1;
+    if (g_one_mode > 0 || (!g_one_mode && V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY))
+        for (int i = 0; i < DM_GAME_NSUBGROUP_ONE_LANE; i++) if (prof[i] == key) return 1;
+    return 0;
+}
 static void single_lane(uint64_t key, int stage, uint32_t **w, size_t *nb) {
-    if (stage < 0 || stage > 7 || !g_sg_one[stage]) return;   // sg_plan
+    if (!runs_one_lane(key, stage)) return;   // sg_plan, or the profile's subgroup_one_lane
+    int forced = one_lane_forced(key);
+    if (forced) VLOG("shader %016llx: subgroup operations as one-invocation subgroups (profile subgroup_one_lane / DM_VK_ONE_LANE)", (unsigned long long)key);
+    // A module that addresses whole subgroups (SubgroupId, NumSubgroups: the shuffle-through-memory modules' rows) is wrong as one-invocation subgroups, which leave those
+    // built-ins as the device has them: used as built, with a red line (cs_variant keeps one-lane compute shaders off those modules)
+    if (one_lane_base() && vka_spv_subgroup_rows(*w, *nb / 4)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("shader %016llx: subgroup operations not rewritten as one-invocation subgroups: it addresses whole subgroups (SubgroupId / NumSubgroups); used as built", (unsigned long long)key); return; }
     // A task or mesh workgroup uses its subgroup operations across the workgroup (output counts, compaction): one-lane subgroups give it wrong results. The Adreno 840's
     // driver has them in both stages at its fixed 64 (subgroupSupportedStages 0xf0), so this is a device the library was not made for
     if (stage >= DMSH_VK_STAGE_TS) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("%s shader %016llx: its subgroup operations run as one lane (the device's subgroups in this stage do not fit the library): its output is likely wrong", stage == DMSH_VK_STAGE_TS ? "task" : "mesh", (unsigned long long)key); }
     size_t on = 0; int ch = 0; char e[256] = ""; uint32_t *o = vka_spv_subgroup_single(*w, *nb / 4, &on, &ch, e, sizeof e);
     if (!o) { if (e[0]) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("shader %016llx: subgroup operations in a stage without them not rewritten: %s", (unsigned long long)key, e); } return; }
     static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("shader %016llx: subgroup operations rewritten as one-invocation subgroups (%s)", (unsigned long long)key,
-                                                            stage == DMSH_VK_STAGE_GS && V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? "Turnip's geometry stage (DM_VK_SUBGROUP_GS)" : V.subgroup_stages & g_stage_bit[stage] ? "the device's subgroup size in this stage is not the library's and cannot be pinned" : "the device has none in this stage");
+                                                            forced ? "profile subgroup_one_lane / DM_VK_ONE_LANE" : stage == DMSH_VK_STAGE_GS && V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? "Turnip's geometry stage (DM_VK_SUBGROUP_GS)" : V.subgroup_stages & g_stage_bit[stage] ? "the device's subgroup size in this stage is not the library's and cannot be pinned" : "the device has none in this stage");
     free(*w); *w = o; *nb = on * 4;
 }
 static VkShaderModule spv_module_(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, const char **why, char *err, size_t errn, uint8_t *fcomp) {
@@ -477,7 +535,7 @@ VkShaderModule vka_shader_fout_module(vka_shader *s, uint32_t umask, uint32_t sm
     return mod;
 }
 // A compute module with the float storage images at bindings of umask / smask retyped as uint / int images (vka_spvpatch.c vka_spv_img_retype), for integer textures bound
-// there: made once per pair of masks from the module the pipeline would use (vka_shader_cs_module's choice). VK_NULL_HANDLE when it cannot be made (logged): the caller
+// there: made once per pair of masks from the module the pipeline would use (cs_variant, as vka_shader_cs_module). VK_NULL_HANDLE when it cannot be made (logged): the caller
 // keeps the base pipeline, whose bound views read the bits as floats (vka_tex.c class_twin)
 struct vka_imgmod { struct vka_imgmod *next; uint64_t u, s; VkShaderModule mod; };
 VkShaderModule vka_shader_img_module(vka_shader *s, uint64_t umask, uint64_t smask) {
@@ -485,8 +543,7 @@ VkShaderModule vka_shader_img_module(vka_shader *s, uint64_t umask, uint64_t sma
     for (struct vka_imgmod *v = s->img; v; v = v->next) if (v->u == umask && v->s == smask) { VkShaderModule m = v->mod; pthread_mutex_unlock(&g_mu); return m; }
     pthread_mutex_unlock(&g_mu);
     VkShaderModule mod = VK_NULL_HANDLE; char err[256] = "";
-    if (g_shuffle_lds < 0) shuffle_plan();
-    int var = s->e->stage == DMSH_VK_STAGE_CS && g_shuffle_lds && vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_SHUFFLE_LDS) ? DMSH_VK_MOD_SHUFFLE_LDS : DMSH_VK_MOD_BASE;
+    int var = cs_variant(s);
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, var);
     size_t nb = 0; uint32_t *w = m ? vka_shlib_spirv(s->lib, m, &nb, err, sizeof err) : NULL;
     if (w && (s->e->flags & DMSH_VK_F_SUBGROUP)) single_lane(s->key, s->e->stage, &w, &nb);
@@ -632,7 +689,8 @@ int vka_shlib_check_all(const vka_shlib *L) {
         vka_shader *s = vka_shader_make(L, e->key);
         if (!s) { refused++; continue; }
         made++;
-        for (int v = 1; v <= DMSH_VK_MOD_SHUFFLE_LDS; v++) if (vka_shlib_module(L, e, v) && !vka_shader_module(s, v)) nolayout++;   // the variants through the compiler too (counted as failures)
+        for (int v = 1; v <= DMSH_VK_MOD_SHUFFLE_LDS; v++)   // the variants through the compiler too (counted as failures); not the shuffle module of a one-lane shader (cs_variant)
+            if (vka_shlib_module(L, e, v) && !(v == DMSH_VK_MOD_SHUFFLE_LDS && e->stage == DMSH_VK_STAGE_CS && one_lane_pick_base(s)) && !vka_shader_module(s, v)) nolayout++;
         vka_shader *sh[VKA_NSTAGE] = {0}; int st = vka_nvn_stage(e->stage); if (st < 0) { nolayout++; continue; } sh[st] = s;
         vka_layout lay;
         if (!vka_layout_of(sh, st == 5, &lay)) { nolayout++; continue; }

@@ -6,7 +6,7 @@
 //                     (the switch reads as unset). Switches that need a restart are named in the log line (g_restart)
 //   "capture <n>"     the next n frames, one log line each: draws, skipped draws, render passes, full barriers, clears / copies, submissions, recording ms, GPU ms
 //   "screenshot [p]"  the next presented game frame (the window texture, before the present's scaling) as a PNG, by default ctl-shot-<frame>.png beside the control file
-//   "stats"           one log line now: the last 60 frames' averages, the frame rate, placed memory, pipelines, the switches set live
+//   "stats"           log lines now: the last 60 frames' averages, the frame rate, placed memory, pipelines, the switches set live, and the images by content and by why they stay
 // Every answer is a log line starting "[vk] ctl:" (android/tools/nxctl.sh waits for them)
 #if defined(__ANDROID__)
 #include "vka.h"
@@ -60,7 +60,7 @@ double vka_env_slow(vka_envc *c, const char *key, double def) {
 }
 
 // Switches read once (at start, or when a device object is made): a live change is logged as taking effect at the next start
-static const char *const g_restart[] = {"DM_VK_VALIDATE", "DM_VK_DRIVER", "DM_VK_HOOKDIR", "DM_VK_PLACED", "DM_VK_PREFAULT", "DM_VK_PCACHE", "DM_VK_GUEST_FPCR", "DM_VK_SHLIB", "DM_VK_SHLIB_CHECK", "DM_VK_GS_CLAIM", "DM_VK_SUBGROUP_PIN", "DM_VK_GPL", "DM_VK_MESH", "DM_VK_SUBGROUP_GS", "DM_VK_SHUFFLE_LDS", "DM_VK_ADPF", "DM_VK_ADPF_PIPELINE", "DM_VK_NANSCAN",
+static const char *const g_restart[] = {"DM_VK_VALIDATE", "DM_VK_DRIVER", "DM_VK_HOOKDIR", "DM_VK_PLACED", "DM_VK_PREFAULT", "DM_VK_PCACHE", "DM_VK_GUEST_FPCR", "DM_VK_SHLIB", "DM_VK_SHLIB_CHECK", "DM_VK_GS_CLAIM", "DM_VK_SUBGROUP_PIN", "DM_VK_GPL", "DM_VK_MESH", "DM_VK_SUBGROUP_GS", "DM_VK_SHUFFLE_LDS", "DM_VK_ONE_LANE", "DM_VK_ONE_LANE_BASE", "DM_VK_ADPF", "DM_VK_ADPF_PIPELINE", "DM_VK_NANSCAN",
                                         "DM_VK_NANSCAN_STEP", "DM_VK_NANSCAN_DRAWS", "DM_VK_NANSCAN_SERIAL", "DM_VK_NANSCAN_FS", "DM_VK_WORKER",
                                         "DM_VK_WORKER_FRAMES", "DM_VK_TEST_HANG", "DM_LSFG_DLL", "DM_FPS", "NXHOST_VK_SELFTEST", "DM_CTL", "DM_VK_PREWARM", "DM_VK_PREWARM_MAX", "DM_VK_PREWARM_FILE", "DM_VK_LC_GLOBAL",
                                         "DM_VK_PSO_ASYNC", "DM_VK_TL_HOST", NULL};
@@ -148,6 +148,7 @@ static void stats_line(uint64_t f) {
     { char im[600]; vka_imem_stats(im, sizeof im); VLOG("ctl: %s", im); }
     { char bs[1000]; vka_tex_big_stats(bs, sizeof bs); if (bs[0]) VLOG("ctl: %s", bs); }
     { char ss[300]; vka_tex_soft_stats(ss, sizeof ss); VLOG("ctl: %s", ss); }
+    vka_tex_kind_log();
 }
 void vka_ctl_frame(uint64_t f) {   // mtl_set_frame: frame f begins
     snap(&g_rec[f % NREC], f);
@@ -198,11 +199,12 @@ static int shot_bpp(VkFormat f) {
     default: return 0;
     }
 }
-void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch) {   // present thread, before vkEndCommandBuffer
+void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, VkFormat fmt, int cx, int cy, int cw, int ch) {   // present thread, before vkEndCommandBuffer
     g_rec_shot.on = 0;
     if (!atomic_load_explicit(&g_shot_want, memory_order_relaxed) || !im || !im->inited) return;
     atomic_store(&g_shot_want, 0);
-    int bpp = shot_bpp(im->f.vk);
+    if (!fmt) fmt = im->f.vk;   // the window texture's format (vka_present.c present_fmt): the copy gives the bits, read in that format
+    int bpp = shot_bpp(fmt);
     if (!bpp || im->samples != 1 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) { VLOG("ctl: screenshot: the window texture's format %d is not one the writer takes (RGBA8, BGRA8, RGB10A2, RGBA16F)", im->f.vk); return; }
     if (cx < 0 || cy < 0 || cw <= 0 || ch <= 0 || (uint32_t)(cx + cw) > im->w || (uint32_t)(cy + ch) > im->h) { cx = cy = 0; cw = (int)im->w; ch = (int)im->h; }
     if (!shot_buf((VkDeviceSize)cw * ch * bpp)) { VLOG("ctl: screenshot: no host-visible buffer of %d x %d", cw, ch); return; }
@@ -211,7 +213,7 @@ void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw
     vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_sbuf, 1, &r);
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
     vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    g_rec_shot.on = 1; g_rec_shot.w = cw; g_rec_shot.h = ch; g_rec_shot.fmt = im->f.vk; g_rec_shot.flip = vka_origin_ll(); g_rec_shot.frame = vka_frame();
+    g_rec_shot.on = 1; g_rec_shot.w = cw; g_rec_shot.h = ch; g_rec_shot.fmt = fmt; g_rec_shot.flip = vka_origin_ll(); g_rec_shot.frame = vka_frame();
 }
 typedef struct { uint8_t *rgb; int w, h; char path[1100]; uint64_t frame; } shot_job;
 static void put32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }

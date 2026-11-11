@@ -278,6 +278,16 @@ static int init_once(void) {
     if (!vk.vkCmdPushDescriptorSetKHR) vk.vkCmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)vk.vkGetDeviceProcAddr(V.dev, "vkCmdPushDescriptorSet");   // core in 1.4
     if (!vk.vkCmdPushDescriptorSetKHR) V.push_desc = 0, V.max_push = 0;
     if (!vk.vkCmdSetVertexInputEXT) V.vin_dyn = 0;
+    { uint32_t dv = V.props.driverVersion; V.qcom_old = V.driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && (dv >> 22) == 512 && (dv >> 12 & 0x3ff) < 800; }
+    // VK_EXT_vertex_input_dynamic_state on Qualcomm's own driver before 512.800: the Adreno 740's 512.676.53 (AYN Thor) draws Fire Emblem Fortune's Weave's skinned
+    // characters as long spikes with the vertex input set per draw (vkCmdSetVertexInputEXT); 512.800 (Adreno 830), 512.863 and Turnip draw them correctly, and so
+    // does 512.676 with the vertex input in the pipeline (the path of a device without the extension), which it gets here. DM_VK_VIN_DYN (restart only): 0 off, 1 on
+    // wherever the device has it, unset as above
+    if (V.vin_dyn) {
+        const char *e = getenv("DM_VK_VIN_DYN");
+        if (e && *e) V.vin_dyn = strcmp(e, "0") != 0; else if (V.qcom_old) V.vin_dyn = 0;
+        if (!V.vin_dyn) VLOG("vertex input dynamic state: off (%s; DM_VK_VIN_DYN=1: on), the vertex input goes into the pipeline", e && *e ? "DM_VK_VIN_DYN=0" : "Qualcomm driver before 512.800");
+    }
     vka_enc_install();
     vka_gbar_install();   // on top of the encoder: sees every work command the replay records (vka_gbar.c)
     const VkPhysicalDeviceLimits *lim = &V.props.limits;

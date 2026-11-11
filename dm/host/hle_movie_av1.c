@@ -44,11 +44,16 @@ struct mav1 {
     int red;
 };
 #if PLAT_APPLE
+static int fp_dav1d(void) { return 0; }
 static int hw_av1(void) { const char *e = getenv("DM_AV1_DAV1D"); return !(e && *e && *e != '0') && VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1); }
 #elif PLAT_ANDROID
 static _Atomic int g_mc_av1 = -1;   // the phone has a hardware AV1 decoder: -1 not known yet (the first stream finds out), 0 no, 1 yes
-static int hw_av1(void) { const char *e = getenv("DM_AV1_DAV1D"); return !(e && *e && *e != '0') && atomic_load(&g_mc_av1) != 0; }
+// Profile av1_decoder dav1d (dm/games/README.md): this game's movies decode on dav1d frame-parallel (mav1_send), never on the phone's hardware decoder. Fire Emblem Fortune's
+// Weave's 2560x1440 movies on the Thor's c2.qti.av1.decoder: 22-23 fps with 521 of 1200 frames dropped (NR14_00), dav1d frame-parallel at 30 fps, 0 dropped in 1,500-1,800. DM_AV1_DAV1D_FP=1 / 0 overrides it
+static int fp_dav1d(void) { const char *e = getenv("DM_AV1_DAV1D_FP"); return e && *e ? *e != '0' : DM_GAME_AV1_DAV1D; }
+static int hw_av1(void) { const char *e = getenv("DM_AV1_DAV1D"); return !(e && *e && *e != '0') && atomic_load(&g_mc_av1) != 0 && !fp_dav1d(); }
 #else
+static int fp_dav1d(void) { return 0; }
 static int hw_av1(void) { return 0; }
 #endif
 mav1 *mav1_new(void) { mav1 *a = calloc(1, sizeof *a); if (!a) die("movie: AV1 decoder allocation failed"); a->soft = !hw_av1(); return a; }
@@ -530,4 +535,74 @@ void mav1_set_time(mav1 *a, int64_t ts) {   // the next temporal unit's time, wh
 #else
     (void)a; (void)ts;
 #endif
+}
+
+// ---- Frame-parallel dav1d (profile av1_decoder dav1d) ----
+// Fire Emblem Fortune's Weave's movies are single-tile 2560x1440, so inside one frame dav1d can only overlap parsing, reconstruction and the post-filters; one frame in flight left a decode waiting for
+// its whole picture. Frame-parallel decoding keeps up to max_frame_delay frames in flight: a picture leaves that many packets later, through the callback, with its packet's
+// timestamp (Dav1dData.m.timestamp). DM_DAV1D_THREADS (task threads, 1-16) and DM_DAV1D_FRAME_DELAY (frames in flight, 1-8); defaults from the Pad 3 A/B (NR14_00 at 50-70 Mbit/s):
+// 8 / 5 dropped 8-24 frames of 300 where 6 / 3 dropped 23-41 and 2 / 1 fell to 9-12 fps
+int mav1_async(const mav1 *a) { return a->soft && fp_dav1d(); }
+static int fp_env(const char *k, int def, int lo, int hi) { const char *e = getenv(k); if (!e || !*e) return def; int v = atoi(e); return v < lo ? lo : v > hi ? hi : v; }
+static void fp_threads(int *threads, int *delay) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    *threads = fp_env("DM_DAV1D_THREADS", n >= 8 ? 8 : n >= 6 ? 6 : n >= 4 ? 4 : 2, 1, 16);
+    *delay = fp_env("DM_DAV1D_FRAME_DELAY", *threads >= 8 ? 5 : *threads >= 4 ? 3 : 1, 1, 8);
+}
+static int fp_ready(mav1 *a) {
+    if (a->dav1d) return 1;
+    Dav1dSettings st; dav1d_default_settings(&st);
+    int thr, delay; fp_threads(&thr, &delay);
+    st.n_threads = thr; st.max_frame_delay = delay; st.logger.cookie = a; st.logger.callback = d_log;
+    if (dav1d_open(&a->dav1d, &st)) { a->dav1d = NULL; if (!a->red++) LOG("[RED] movie: dav1d could not be opened"); return 0; }
+    static int opens; if (opens++ < 64) LOG("[movie] AV1: dav1d %s decoding frame-parallel (profile av1_decoder dav1d / DM_AV1_DAV1D_FP), %d task threads, up to %d frames in flight (DM_DAV1D_THREADS / DM_DAV1D_FRAME_DELAY)",
+                                      dav1d_version(), thr, delay);
+    return 1;
+}
+// A dav1d picture to the callback: 8-bit 4:2:0 as its three planes (no copy), anything else as NV12 in the decoder's memory; then dropped (the callback copies what it keeps)
+static int fp_emit(mav1 *a, Dav1dPicture *p, mav1_emit emit, void *ctx) {
+    mav1_picture out; int ok = 1;
+    if (p->p.bpc == 8 && p->p.layout == DAV1D_PIXEL_LAYOUT_I420) {
+        unsigned mc = p->seq_hdr->mtrx; if (mc == DAV1D_MC_UNKNOWN) mc = p->p.h < 720 ? DAV1D_MC_BT601 : DAV1D_MC_BT709;
+        out = (mav1_picture){p->data[0], NULL, (size_t)p->stride[0], 0, p->p.w, p->p.h, mc == DAV1D_MC_BT709 ? 2 : mc == DAV1D_MC_BT2020_NCL || mc == DAV1D_MC_BT2020_CL ? 5 : 1,
+                             p->seq_hdr->color_range, 0, 0, p->data[1], p->data[2], (size_t)p->stride[1]};
+    } else if (!dav1d_nv12(a, p, &out)) { ok = 0; if (!a->red++) LOG("[RED] movie: no memory for a %dx%d AV1 picture", p->p.w, p->p.h); }
+    if (ok) emit(ctx, &out, p->m.timestamp);
+    dav1d_picture_unref(p);
+    return ok;
+}
+// One temporal unit in; the pictures that come out go to emit. A send that finds a picture waiting (EAGAIN) takes it and sends again. One get after the send: a second one in a
+// row would drain (wait for the next frame in flight), which only the end of the stream wants
+int mav1_send(mav1 *a, const uint8_t *data, size_t n, int64_t ts, mav1_emit emit, void *ctx) {
+    unlock_picture(a);
+    if (!fp_ready(a)) return -1;
+    Dav1dData d = {0}; uint8_t *buf = dav1d_data_create(&d, n);
+    if (!buf) return -1;
+    memcpy(buf, data, n); d.m.timestamp = ts;
+    int got = 0; Dav1dPicture p;
+    for (int tries = 0; d.sz && tries < 64; tries++) {
+        int r = dav1d_send_data(a->dav1d, &d);
+        if (!r) continue;
+        if (r != DAV1D_ERR(EAGAIN)) { dav1d_data_unref(&d); if (!a->red++) LOG("[RED] movie: dav1d refused a temporal unit (%d, first case)", r); return -1; }
+        memset(&p, 0, sizeof p); r = dav1d_get_picture(a->dav1d, &p);
+        if (!r) got += fp_emit(a, &p, emit, ctx);
+        else if (r != DAV1D_ERR(EAGAIN)) { dav1d_data_unref(&d); if (!a->red++) LOG("[RED] movie: dav1d decode error (%d, first case)", r); return -1; }
+    }
+    if (d.sz) { dav1d_data_unref(&d); if (!a->red++) LOG("[RED] movie: dav1d took no more data, a temporal unit dropped (first case)"); return -1; }
+    memset(&p, 0, sizeof p); int r = dav1d_get_picture(a->dav1d, &p);
+    if (!r) got += fp_emit(a, &p, emit, ctx);
+    else if (r != DAV1D_ERR(EAGAIN)) { if (!a->red++) LOG("[RED] movie: dav1d decode error (%d, first case)", r); return -1; }
+    return got;
+}
+int mav1_flush(mav1 *a, mav1_emit emit, void *ctx) {   // every picture still in flight, in order
+    unlock_picture(a);
+    if (!a->dav1d) return 0;
+    int got = 0; Dav1dPicture p;
+    for (int k = 0; k < 64; k++) {
+        memset(&p, 0, sizeof p); int r = dav1d_get_picture(a->dav1d, &p);
+        if (r == DAV1D_ERR(EAGAIN)) { if (k) break; continue; }   // the first get may not drain (a send came just before); the next one does
+        if (r) { if (!a->red++) LOG("[RED] movie: dav1d error draining the stream (%d, first case)", r); break; }
+        got += fp_emit(a, &p, emit, ctx);
+    }
+    return got;
 }

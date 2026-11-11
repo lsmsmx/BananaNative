@@ -175,7 +175,7 @@ final class BuildCheck {
         if (firstMod != null)
             return new Result(Kind.OTHER_BUILD, "The pack was made from another build of " + name + " (" + firstMod + " " + shortId(firstWant) + "…) than the one in the game "
                     + (Nup.isNup(game) ? ".nup" : "folder") + " (" + shortId(firstHave) + "…, " + Profile.versionName(parse(p.version))
-                    + "). Its code would crash with this game: Prepare again makes a pack from this dump.\n\nBuild IDs that differ: " + diff, diff.toString());
+                    + "). Its code would crash with this game: Prepare again rewrites the game's code from this dump (a few minutes; shaders are kept).\n\nBuild IDs that differ: " + diff, diff.toString());
         Profile prof = Profile.of(p.titleId);
         Map<Long, Map<String, String>> sup = prof == null ? Map.of() : prof.buildMap();
         if (!sup.isEmpty()) {

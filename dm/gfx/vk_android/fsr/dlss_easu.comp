@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// NVN2's DLSS stand-in (vka_dlss.c), FSR 1 mode, pass 2 of 3: AMD's EASU from the render-size work image to the output size. The game renders each frame with a
+// sub-pixel jitter (Halton(2,3), +-0.5 input pixels) that DLSS would resolve; vka_dlss.c moves EASU's sampling position by that jitter (con0.zw), so a still
+// edge lands on the same output pixels every frame instead of crawling (un-jitter, DM_VK_DLSS_UNJITTER)
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { uvec4 con0, con1, con2, con3; uvec2 size; } pc;
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(tex, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(tex, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(tex, p, 2); }
+#include "ffx_fsr1.h"
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(p, pc.size))) return;
+    AF3 c;
+    FsrEasuF(c, p, pc.con0, pc.con1, pc.con2, pc.con3);
+    imageStore(dst, ivec2(p), vec4(c, 1.0));
+}

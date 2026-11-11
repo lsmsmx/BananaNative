@@ -23,6 +23,9 @@ static uint64_t ubo_word(const vka_bstate *s, int st, int reg, unsigned off, uns
     if (!rd(ctx, s->ubo[st][reg].addr + off, &v, n)) return 0;
     return v;
 }
+int vka_texu_elem = 1;
+// Element k's byte offset past an array's base: a uniform buffer's array of 64-bit NVN handles that the shader indexes (BindlessToArray: the host fills element k from base + 8k)
+static unsigned ubo_elem(const dmsh_vk_bind *b, unsigned k) { return b->count > 1 && vka_texu_elem ? 8u * k : 0; }
 static int ubo_tex_id(const vka_bstate *s, uint32_t h) { int t = (int)(h & 0xfffff); return t ? t + s->tex_base : 0; }
 static int ubo_samp_id(const vka_bstate *s, uint32_t h) { int x = (int)(h >> 20); return x ? x + s->samp_base : 0; }
 
@@ -32,7 +35,7 @@ static int samp_of(const vka_bstate *s, int st, const dmsh_vk_bind *b, unsigned 
     case DMSH_VK_KIND_SAMP_TEX: return b->sreg >= 0 && b->sreg < VKA_NTEX ? (int)(s->tex[st][b->sreg] >> 20 & 0xfff) : 0;
     case DMSH_VK_KIND_SAMP: return b->sreg >= 0 && b->sreg < 128 ? (int)(s->samp[st][b->sreg] >> 20 & 0xfff) : 0;
     case DMSH_VK_KIND_SAMP_ID: return b->sreg > 0 ? b->sreg : 0;   // a constant of the shader (nvn_mtl.m NVN_RB_SAMPI): taken as it is
-    case DMSH_VK_KIND_SAMP_UBO: return ubo_samp_id(s, (uint32_t)ubo_word(s, st, b->sreg, b->soff, 4, rd, ctx));
+    case DMSH_VK_KIND_SAMP_UBO: return ubo_samp_id(s, (uint32_t)ubo_word(s, st, b->sreg, b->soff + ubo_elem(b, k), 4, rd, ctx));
     case DMSH_VK_KIND_SAMP_C2A: {   // the handle at c2 byte off + 8 k, ORed with the separate sampler word at soff (nvn_mtl.m NVN_RB_SAMPA)
         uint64_t sw = b->soff != 0xFFFF ? vka_c2_handle(s, st, b->soff) : 0;
         return (int)((vka_c2_handle(s, st, b->off + 8u * k) | sw) >> 20 & 0xfff); }
@@ -75,7 +78,7 @@ int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_
                 if (a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }   // the size is not known: to the end of the chunk
                 break; }
             case DMSH_VK_KIND_TEX: case DMSH_VK_KIND_TEX_UBO: case DMSH_VK_KIND_TEX_C2A: {
-                int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off, 4, rd, ctx)))
+                int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off + ubo_elem(b, k), 4, rd, ctx)))
                         : b->kind == DMSH_VK_KIND_TEX_C2A ? (int)(vka_c2_handle(s, st, b->off + 8u * k) & 0xfffff)
                         : noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
                 int sid = b->skind ? samp_of(s, st, b, k, rd, ctx) : 0;

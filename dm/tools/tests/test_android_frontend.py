@@ -41,6 +41,12 @@ class FrontendManifest(unittest.TestCase):
         self.assertIsNotNone(op)
         self.assertIn('pathPattern', op.group(1))
 
+    def test_category(self):
+        m = MANIFEST.read_text()
+        app = re.search(r'<application\s[^>]*>', m)
+        self.assertIsNotNone(app)
+        self.assertIn('android:appCategory="game"', app.group(0))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -510,3 +510,11 @@ JNIEXPORT void JNICALL Java_dev_nxnative_android_Native_drsSet(JNIEnv *env, jcla
 #pragma weak nxhost_ndsr_status
 int nxhost_ndsr_status(void);   // vka_draw.c
 JNIEXPORT jint JNICALL Java_dev_nxnative_android_Native_ndsrStatus(JNIEnv *env, jclass cls) { (void)env; (void)cls; return nxhost_ndsr_status ? nxhost_ndsr_status() : -1; }
+// The skipped-work notice (SkipNotice): "<percent> <causes>" once the replay's warning fired (DM_VK_SKIP_WARN), else ""
+#pragma weak nxhost_skip_status
+void nxhost_skip_status(char *buf, size_t n);   // vka_exec.c
+JNIEXPORT jstring JNICALL Java_dev_nxnative_android_Native_skipStatus(JNIEnv *env, jclass cls) {
+    (void)cls; char buf[256] = "";
+    if (nxhost_skip_status) nxhost_skip_status(buf, sizeof buf);
+    return (*env)->NewStringUTF(env, buf);
+}

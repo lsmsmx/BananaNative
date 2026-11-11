@@ -82,6 +82,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	$(B)/t_android_place
 	$(B)/t_android_ovl
 	$(B)/t_android_pace
+	$(B)/t_android_skipwarn
 	$(B)/t_android_gmem
 	$(B)/t_android_fpenv
 	$(B)/t_android_soft
@@ -371,7 +372,7 @@ coverage:
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
 # The Android host's pure parts (dm/host/android): resampler, channel map, SPS size, MediaCodec picture layouts; gamepad / touch / sensor mapping
-run: $(B)/t_android_av $(B)/t_android_input $(B)/t_android_shlib $(B)/t_android_spvpatch $(B)/t_android_imgmem $(B)/t_android_zshare $(B)/t_android_texlimit $(B)/t_android_livemap $(B)/t_android_mapbudget $(B)/t_android_pckeep $(B)/t_android_pwlist $(B)/t_android_fmtlist $(B)/t_android_place $(B)/t_android_ovl $(B)/t_android_pace $(B)/t_android_gmem $(B)/t_android_fpenv $(B)/t_android_soft $(B)/t_android_qsched $(B)/t_android_poolslot $(B)/t_android_tlsig $(B)/t_android_texown $(B)/t_android_gbar
+run: $(B)/t_android_av $(B)/t_android_input $(B)/t_android_shlib $(B)/t_android_spvpatch $(B)/t_android_imgmem $(B)/t_android_zshare $(B)/t_android_texlimit $(B)/t_android_livemap $(B)/t_android_mapbudget $(B)/t_android_pckeep $(B)/t_android_pwlist $(B)/t_android_fmtlist $(B)/t_android_place $(B)/t_android_ovl $(B)/t_android_pace $(B)/t_android_skipwarn $(B)/t_android_gmem $(B)/t_android_fpenv $(B)/t_android_soft $(B)/t_android_qsched $(B)/t_android_poolslot $(B)/t_android_tlsig $(B)/t_android_texown $(B)/t_android_gbar
 $(B)/t_android_av: t_android_av.c ../android/av_android.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. $(WEAK_HOST) -o $@ t_android_av.c
 $(B)/t_android_input: t_android_input.c ../android/input_map.c ../android/input_map.h ../../gfx/vk_android/vka_present_fit.h ../motion_fusion.h ../dm_input.h | $(B)
@@ -433,6 +434,9 @@ $(B)/t_android_gmem: t_android_gmem.c $(VKA)/vka_gmem.h ../../gfx/nvn/dmsh_abi.h
 # The pace line's parts (vka_pace.h)
 $(B)/t_android_pace: t_android_pace.c $(VKA)/vka_pace.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_pace.c -lm
+# The skipped-work warning's window logic (vka_skipwarn.h)
+$(B)/t_android_skipwarn: t_android_skipwarn.c $(VKA)/vka_skipwarn.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_skipwarn.c
 $(B)/t_android_fpenv: t_android_fpenv.c $(VKA)/vka_fpenv.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_fpenv.c
 # GPU waits across NVN queues on the Android replay (dm/gfx/vk_android/vka_qsched.h): parks, producers, the SDK's predicates, syncs, timeline signals, safety valves

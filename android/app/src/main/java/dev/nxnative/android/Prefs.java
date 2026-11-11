@@ -119,7 +119,7 @@ final class Prefs {
         return paceOf(of(c).getInt(gameKey("fps_cap", titleId), pl > 0 ? pl : of(c).getInt("fps_cap", -1)));
     }
     /** Game settings › Reset to defaults: every choice of the game's own back to the main screen's default (Extra environment's lines stay) */
-    static final String[] GAME_SETTINGS = {"window", "fps_cap", "gpu_driver", "gpu_ts", "pause_return", "ndsr_choice2", "ndsr_sharp", "drs2", "ram_saver", "decouple"};
+    static final String[] GAME_SETTINGS = {"window", "fps_cap", "gpu_driver", "gpu_ts", "pause_return", "ndsr_choice2", "ndsr_sharp", "drs2", "ram_saver", "decouple", "gsr2_clarity", "dlss_sharp", "dlss_mode"};
     static void resetGame(Context c, String titleId) {
         SharedPreferences.Editor e = of(c).edit();
         for (String k : GAME_SETTINGS) e.remove(gameKey(k, titleId));
@@ -129,6 +129,11 @@ final class Prefs {
     /** Dynamic resolution, for games whose profile has drs_ctl rows (the host steers them: probe.c drs_install): the range the render size moves in, as % of the window,
      *  always up to 100 %; {100, 100} is off: the full size and no upscaling. Stored as an index into DRS, the main screen's default then each game's own */
     static boolean drsGame(String titleId) { Profile p = Profile.of(titleId); return p != null && p.drs; }
+    /** A game whose DLSS runs on the host's GSR2 stand-in (game.tsv dlss_standin): its Upscaler row in Game settings and the in-game panel offers the stand-in's modes, with Motion clarity and Temporal sharpness (GameUpscaler, DlssTune) */
+    /** Whether this game's frame limit only paces the presents (game.tsv fps_limit_present): the cap screens add PRESENT_ONLY_NOTE */
+    static boolean presentOnly(String titleId) { Profile p = Profile.of(titleId); return p != null && p.presentOnly; }
+    static final String PRESENT_ONLY_NOTE = "Experimental for this game: the cap only limits how often the picture is shown, not the game itself. Expect bugs (for example the game running slower or faster).";
+    static boolean dlssGame(String titleId) { Profile p = Profile.of(titleId); return p != null && p.dlss; }
     static final int[][] DRS = {{100, 100}, {80, 100}, {70, 100}, {60, 100}, {50, 100}, {40, 100}, {30, 100}};   // 30 %: the game's rate table stops at 3x (640x360 at 1080p)
     static final String[] DRS_NAMES = {"Off", "80%", "70%", "60%", "50%", "40%", "30%"};   // the lowest render size, as % of the window (always up to 100 %)
     static final int DRS_DEFAULT = 5;   // 40-100 %

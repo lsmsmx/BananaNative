@@ -33,7 +33,7 @@ import game
 sys.path.insert(0, str(REPO / 'dm/gfx/tools'))
 import dmsh_chain
 
-REWRITER = ('patch_nso.py', 'nso.py', 'nso_code.py', 'nso_asm.py', 'nso_match.py', 'sdk_patches.py', 'ue_cvar.py', 'ue_malloc.py', 'ue_region.py', 'loader_census.py')
+REWRITER = ('patch_nso.py', 'nso.py', 'nso_code.py', 'nso_asm.py', 'nso_match.py', 'sdk_patches.py', 'ue_cvar.py', 'ue_malloc.py', 'fps_target.py', 'ue_region.py', 'loader_census.py')
 FORMAT = 1   # pack.tsv format; the launcher refuses another
 
 
@@ -302,6 +302,9 @@ def rewrite(py, srcs, out, jobs, g, in_process=False):
         todo[m] = (src, key)
     for m in todo: (out / f'{m}.android.key').unlink(missing_ok=True)   # every module to rewrite is unfinished from here on: no mix of old and new modules passes
     if in_process:
+        if not todo:
+            print('progress 1000 1000 code', flush=True)
+            return
         # Prepare's bar (the phone's rewrite step): each module a share of the step's 1000 by the size of its code, the rewriter's progress lines placed in it
         files = {m: rewriter_src(src, out, m) for m, (src, key) in todo.items()}
         size = {m: max(1, nso_text_size(f)) for m, f in files.items()}

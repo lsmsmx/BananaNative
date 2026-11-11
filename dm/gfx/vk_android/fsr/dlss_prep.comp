@@ -1,0 +1,14 @@
+#version 450
+// NVN2's DLSS stand-in (vka_dlss.c), FSR 1 mode, pass 1 of 3: the input colour's subrectangle (render size) into the replay's RGBA16F work image, tonemapped
+// c / (1 + max(c)) when pc.tm is set (the colour is the scene's linear HDR; dlss_rcas.comp undoes it), so EASU and RCAS work on a 0..1 picture
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D tex;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; ivec2 base; int tm; } pc;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+    vec3 c = max(texelFetch(tex, p + pc.base, 0).rgb, vec3(0.0));
+    if (pc.tm != 0) c /= max(max(c.r, c.g), c.b) + 1.0;
+    imageStore(dst, p, vec4(c, 1.0));
+}

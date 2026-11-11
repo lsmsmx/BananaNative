@@ -177,6 +177,20 @@ static void test_walk(void) {
         CHECK(r[12].what == VKA_R_SUPPORT, "support");
         CHECK(pool, "a pool record marks the draw as using set 1");
     }
+    // An array of handles in a uniform buffer (BindlessToArray, Fire Emblem Fortune's Weave's c[14][8 i + 0x340] cube maps): element k is the handle at the base + 8k, its sampler from the same word
+    {
+        uint32_t hs[3] = {21 | 31u << 20, 22 | 32u << 20, 23 | 33u << 20};
+        for (int k = 0; k < 3; k++) memcpy(g_mem + 0x40 + 8 * k, &hs[k], 4);
+        dmsh_vk_bind ab = {.kind = DMSH_VK_KIND_TEX_UBO, .desc = 1, .binding = 256, .count = 3, .reg = 0, .off = 0x40, .skind = DMSH_VK_KIND_SAMP_UBO, .sreg = 0, .soff = 0x40, .dim = 2};
+        dmsh_vk_entry ea = {.stage = DMSH_VK_STAGE_FS, .bind_count = 1};
+        int na = vka_walk(&s, 1, &ea, &ab, 0, 64, rd, NULL, r, 32, NULL, why, sizeof why);
+        CHECK(na == 3 && r[0].tid == 121 && r[0].sid == 231 && r[1].tid == 122 && r[1].sid == 232 && r[2].tid == 123 && r[2].sid == 233 && r[2].elem == 2,
+              "uniform buffer handle array: %d, %d/%d %d/%d %d/%d", na, r[0].tid, r[0].sid, r[1].tid, r[1].sid, r[2].tid, r[2].sid);
+        vka_texu_elem = 0;   // DM_VK_TEXU_ELEM=0: every element from the base, as before
+        na = vka_walk(&s, 1, &ea, &ab, 0, 64, rd, NULL, r, 32, NULL, why, sizeof why);
+        CHECK(na == 3 && r[1].tid == 121 && r[2].sid == 231, "DM_VK_TEXU_ELEM=0: %d/%d", r[1].tid, r[2].sid);
+        vka_texu_elem = 1;
+    }
     // A storage buffer off the device's alignment is refused (SHADERS.md open problem 2)
     dmsh_vk_bind un = {.kind = DMSH_VK_KIND_SBUF, .desc = 7, .binding = 256, .count = 1, .reg = 4};
     dmsh_vk_entry e1 = {.stage = DMSH_VK_STAGE_FS, .bind_count = 1};

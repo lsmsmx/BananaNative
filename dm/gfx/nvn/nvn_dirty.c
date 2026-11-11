@@ -315,6 +315,17 @@ size_t nvn_dirty_block_at_least(size_t bytes) {
 size_t nvn_dirty_block_bytes(void) { uintptr_t m = atomic_load(&g_bmask); return m ? (size_t)m + 1 : 0; }
 void nvn_dirty_hold(const void *addr, size_t len) { pthread_mutex_lock(&g_slot_mu); if (g_pg) prep_write((void *)addr, len); }
 void nvn_dirty_unhold(void) { pthread_mutex_unlock(&g_slot_mu); }
+void nvn_dirty_release_all(void) {
+    pthread_mutex_lock(&g_slot_mu);
+    int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) {
+        if (!live_at(i)) continue;
+        range_t *r = rg(i);
+        size_t np = (r->end - r->base) >> g_shift;
+        if (np > 0) release_pages(r, 0, np - 1, NULL);
+    }
+    pthread_mutex_unlock(&g_slot_mu);
+}
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
 int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;

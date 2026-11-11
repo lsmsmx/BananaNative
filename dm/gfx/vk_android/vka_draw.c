@@ -6,6 +6,7 @@
 // tessellation's patch size, texel buffers, viewport swizzles other than a y flip
 #if defined(__ANDROID__)
 #include "vka.h"
+#include "vka_skipwarn.h"
 #include "vka_gmem.h"
 #include "../nvn/nvn_mtl.h"
 #include "../../host/plat/plat.h"
@@ -27,9 +28,13 @@ static int g_prof_img;
 static int g_class_note, g_tex_peek_any;
 static int g_vin_skip = 1;             // DM_VK_VIN_SKIP (vin_build_kept)
 static int g_inst_on;   // DM_VK_INSTANCE (the instanced runs below)
+static int g_vattr_clear = 1;   // DM_VK_VATTR_CLEAR: a BindVertexAttribState replaces the whole attribute state, as the Metal backend does (S.nattr = b->n);
+                                // 0 = the old merge, where the attributes past its count keep the earlier binds' formats and offsets
 uint64_t vka_n_rp;   // render passes the draws opened (vka_exec.c replay statistics)
 static uint64_t g_draws, g_skipped, g_dispatches;
+static uint64_t g_skip_dev[VKS_N];   // the skips whose cause is the device or its driver (vka_skipwarn.h), also counted in g_skipped; read by vka_draw_skips
 static uint32_t g_claim_words;   // the draw's claim words (an upper bound of its primitives): 0 = its geometry shader takes no claim
+#define SKIPD(c, ...) do { g_skip_dev[c]++; SKIP(__VA_ARGS__); } while (0)   // (SKIP, counted as a device cause)
 #define SKIP(...) do { g_skipped++; static _Atomic int n_; if (atomic_fetch_add(&n_, 1) < 4) VRED(__VA_ARGS__); return; } while (0)
 
 // Whether draws and dispatches run. Without placed guest memory (an emulator's driver) the GPU sees no memory pool, so a game's draws would read nothing and only cost:
@@ -77,7 +82,14 @@ int vka_state_op(vka_dstate *d, uint32_t op, const void *a) {
         case 5: memcpy(&d->ds, b->bytes, sizeof d->ds); break;
         }
         break; }
-    case OP_BIND_VATTR: { const p_bind_vattr *b = a; d->s_vfmt = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) { memcpy(&d->attr[b->first], b->st, 4 * (size_t)b->n); if (b->first + b->n > d->nattr) d->nattr = b->first + b->n; } break; }
+    case OP_BIND_VATTR: { const p_bind_vattr *b = a; d->s_vfmt = vka_stamp();
+        // The bind replaces the attribute state, as the Metal backend does (S.nattr = b->n): shader inputs past its count read the zero buffer (vin_build).
+        // Merging kept the attributes past the count from earlier binds, so such an input read another mesh's format and offset from this mesh's stream.
+        if (b->first >= 0 && b->first + b->n <= 16) {
+            if (g_vattr_clear) { memset(d->attr, 0, sizeof d->attr); d->nattr = 0; }
+            memcpy(&d->attr[b->first], b->st, 4 * (size_t)b->n); if (b->first + b->n > d->nattr) d->nattr = b->first + b->n;
+        }
+        break; }
     case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; d->s_vfmt = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) { memcpy(&d->stream[b->first], b->st, 8 * (size_t)b->n); if (b->first + b->n > d->nstream) d->nstream = b->first + b->n; } break; }
     case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(op, a, &tmp); d->s_vbuf = vka_stamp(); if (b->first >= 0 && b->first + b->n <= 16) memcpy(&d->vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
     case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) { d->ubo_dirty[b->stage] |= 1u << b->index; d->b.ubo[b->stage][b->index] = (vka_range){b->addr, b->size}; } break; }
@@ -136,6 +148,7 @@ void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     drv_memo_reset();   // the last submission's scratch spans go with its fence
     g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_prof_img = VKA_ENV("DM_VK_PROF_IMG", 0); g_class_note = VKA_ENV("DM_VK_CLASS_NOTE", 0); g_tex_peek_any = VKA_ENV("DM_VK_TEX_PEEK_ANY", 0) || getenv("DM_VK_TEX_PEEK") != NULL; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
     g_vin_skip = VKA_ENV("DM_VK_VIN_SKIP", 1);
+    g_vattr_clear = VKA_ENV("DM_VK_VATTR_CLEAR", 1);
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
     g_cur_dp[g_slot] = 0;
     vka_pso_save(0);
@@ -1259,7 +1272,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                 } else if (tid && !v) { static _Atomic int nm; if (atomic_fetch_add(&nm, 1) < 8) { char why[320]; vka_tex_id_desc(tid, why, sizeof why);
                     VRED("shader %016llx binding %u: texture ID %d has no view of shape %#x%s: it reads as unbound (%s)", (unsigned long long)sh->key, r[i].binding, tid, r[i].dim, storage ? " (storage)" : "", why); } }
                 if (!v && !V.null_desc) v = placeholder(r[i].dim, storage);
-                if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", r[i].dim); return 0; }
+                if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", r[i].dim); g_skip_dev[VKS_FEATURE]++; return 0; }
             }
             if (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLER) {
                 s = r[i].sid ? vka_samp_id_rec(r[i].sid) : VK_NULL_HANDLE;
@@ -1270,7 +1283,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             break; }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
             if (r[i].what != VKA_R_NULL) VRED_ONCE("texel buffers are not on Vulkan yet (shader %016llx binding %u): bound as null", (unsigned long long)sh->key, r[i].binding);
-            if (!V.null_desc) { VRED_ONCE("a texel buffer binding and no null descriptors: the draw is skipped"); return 0; }
+            if (!V.null_desc) { VRED_ONCE("a texel buffer binding and no null descriptors: the draw is skipped"); g_skip_dev[VKS_FEATURE]++; return 0; }
             g_w.bv[k] = VK_NULL_HANDLE; w->pTexelBufferView = &g_w.bv[k];
             break;
         default: VRED_ONCE("descriptor type %u in a binding record", r[i].desc); return 0;
@@ -1283,6 +1296,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
 static struct { int n[VKA_NSTAGE], pool[VKA_NSTAGE]; char why[VKA_NSTAGE][200]; vka_res r[VKA_NSTAGE][512]; } g_wk;
 static void walk_all(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
     uint64_t t0_ = g_prof ? cntvct() : 0;
+    vka_texu_elem = VKA_ENV("DM_VK_TEXU_ELEM", 1);   // see vka_bind.h (live, A/B)
     for (int st = 0; st < VKA_NSTAGE; st++) {
         vka_shader *s = sh[st]; g_wk.n[st] = 0; g_wk.pool[st] = 0; if (!s) continue;
         g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, s->lib->h->ssbo_align, V.sb_align, rd_cb, NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
@@ -1945,13 +1959,13 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     const int mesh = dw && dw->prim == NVN_PRIM_MESH;
     int eq_relax = 0;   // mesh_cut: EQUAL drawn as LEQUAL
     if (mesh) {
-        if (!V.mesh) SKIP("mesh draw (nvnCommandBufferDrawMeshTasks) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0): skipped");
+        if (!V.mesh) SKIPD(VKS_MESH, "mesh draw (nvnCommandBufferDrawMeshTasks) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0): skipped");
         // The program whose task and mesh shaders run: the fragment stage's when it has a mesh shader (a program's stages are bound together), else the one bound at the
         // mesh stage bit. Task and mesh come from the same program (a program's task shader feeds its own mesh shader)
         const prog_t *mp = d->bst[7];
         { vka_shader *m = NULL; unsigned b2 = 0; if (d->bst[1] && d->bst[1] != mp && resolve(d->bst[1], 7, &m, &b2) && (m || (b2 & 1u << 7))) mp = d->bst[1]; }
         if (!resolve(mp, 6, &sh[6], &bad) || !resolve(mp, 7, &sh[7], &bad) || !resolve(d->bst[1], 1, &sh[1], &bad)) SKIP("mesh draw skipped: no shader library");
-        if (bad) { g_skipped++; return; }   // a refused or missing shader (logged when it was made)
+        if (bad) { g_skipped++; g_skip_dev[VKS_SHADER]++; return; }   // a refused or missing shader (logged when it was made)
         if (!sh[7]) SKIP("mesh draw with no mesh shader bound: skipped");
         // Diagnostics: DM_VK_MESH_LOG=1 logs each (task, mesh, pixel) shader triple once with its first draw's workgroups; DM_VK_MESH_SKIP=<mesh key>,... skips the mesh
         // draws of those mesh shaders (a wrong mesh draw found by taking draws away in a replay)
@@ -1976,7 +1990,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         if (d->tf_on) VRED_ONCE("transform feedback with a mesh draw: drawn without capture");
     } else {
         for (int st = 0; st < 5; st++) if (!resolve(d->bst[st], st, &sh[st], &bad)) SKIP("draw skipped: no shader library");
-        if (bad) { g_skipped++; return; }   // a refused or missing shader (logged when it was made)
+        if (bad) { g_skipped++; g_skip_dev[VKS_SHADER]++; return; }   // a refused or missing shader (logged when it was made)
         if (!sh[0]) SKIP("draw with no vertex shader bound: skipped");
         if (sh[1] && (sh[1]->e->flags & DMSH_VK_F_MESH_PRIM)) SKIP("pixel shader %016llx reads per-primitive mesh outputs and is drawn with a vertex shader: skipped", (unsigned long long)sh[1]->key);
         if (d->rast_discard && d->tf_on) SKIP("transform feedback is not on Vulkan yet (F_TF): the draw is skipped");
@@ -2093,7 +2107,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
     if (!mesh) vin_build_kept(d, sh[0], &k);
     PT(4);
     VkPipeline p = vka_gfx_pipeline(sh, &lay, &k);
-    if (!p) { g_skipped++; return; }
+    if (!p) { g_skipped++; g_skip_dev[VKS_PIPELINE]++; return; }   // the driver refused it (logged when it was made)
     // DM_VK_INSTANCE: a direct indexed draw of one instance with only vertex and pixel shaders, their base modules and no retyped inputs may join the open run (its
     // instanced pipeline stays bound) or start one (decided at the sets, below)
     VkBuffer i_ib = VK_NULL_HANDLE; VkDeviceSize i_io = 0; VkIndexType i_it = VK_INDEX_TYPE_UINT16;
@@ -2271,11 +2285,11 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
             VkBuffer b; VkDeviceSize o;
             if (!vka_mdx_args(ind, &b, &o)) SKIP("indirect mesh draw record at %#llx not in placed guest RAM, or its {count, 1, 1} copy not made: skipped", (unsigned long long)ind);
             if (vk.vkCmdDrawMeshTasksIndirectEXT) vk.vkCmdDrawMeshTasksIndirectEXT(g_cb, b, o, 1, 12);
-            else SKIP("vkCmdDrawMeshTasksIndirectEXT not available: skipped");
+            else SKIPD(VKS_FEATURE, "vkCmdDrawMeshTasksIndirectEXT not available: skipped");
         } else {
             static uint32_t largest; if ((uint32_t)dw->count > largest) { largest = (uint32_t)dw->count; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VLOG("mesh draw: largest so far %u workgroups (task %016llx mesh %016llx)", largest, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key); }
             uint32_t maxg = sh[6] ? V.task_groups : V.mesh_groups;
-            if ((uint32_t)dw->count > maxg) SKIP("mesh draw of %d workgroups: more than the device's %u in one dimension; skipped", dw->count, maxg);
+            if ((uint32_t)dw->count > maxg) SKIPD(VKS_FEATURE, "mesh draw of %d workgroups: more than the device's %u in one dimension; skipped", dw->count, maxg);
             vk.vkCmdDrawMeshTasksEXT(g_cb, (uint32_t)dw->count, 1, 1);
         }
     } else if (expand) {   // quads or a line loop: the indices made here, 32-bit, in scratch memory
@@ -2302,7 +2316,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
         VkBuffer ib; VkDeviceSize io; VkIndexType it = di->itype == 0 ? VK_INDEX_TYPE_UINT8 : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
         if (it == VK_INDEX_TYPE_UINT8 && !V.idx8) {   // 8-bit indices on a device without them: widened on the CPU
-            if (ind) SKIP("an indirect draw of 8-bit indices on a device without them: skipped");
+            if (ind) SKIPD(VKS_FEATURE, "an indirect draw of 8-bit indices on a device without them: skipped");
             uint32_t *src = read_indices(di->ibuf, 0, (uint32_t)di->count); vka_span s;
             if (!src || !vka_scratch(2 * (VkDeviceSize)di->count + 4, 4, &s)) { free(src); SKIP("8-bit indices at %#llx not readable: skipped", (unsigned long long)di->ibuf); }
             for (int i = 0; i < di->count; i++) ((uint16_t *)s.ptr)[i] = (uint16_t)src[i];
@@ -2699,7 +2713,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     vka_rp_end();
     vka_shader *sh[VKA_NSTAGE] = {0}; unsigned bad = 0;
     if (!resolve(d->cprog, 5, &sh[5], &bad)) SKIP("dispatch skipped: no shader library");
-    if (bad) { g_skipped++; return; }
+    if (bad) { g_skipped++; g_skip_dev[VKS_SHADER]++; return; }
     if (!sh[5]) SKIP("dispatch with no compute shader bound: skipped");
     if (VKA_ENV("DM_VK_SKIP_NDVE", 1) && vka_is_ndve_key(sh[5]->key)) {
         if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
@@ -2710,7 +2724,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     vka_layout lay; if (!vka_layout_of(sh, 1, &lay)) SKIP("dispatch skipped: no pipeline layout");
     VkPipeline p = vka_cs_pipeline(sh[5], &lay);
     if (vka_nan_on()) vka_tex_watch_dispatch(sh[5]->key);
-    if (!p) { g_skipped++; return; }
+    if (!p) { g_skipped++; g_skip_dev[VKS_PIPELINE]++; return; }
     d->b.dispatch[0] = (uint32_t)dp->x; d->b.dispatch[1] = (uint32_t)dp->y; d->b.dispatch[2] = (uint32_t)dp->z; d->b.nvn2 = (uint32_t)vka_nvn2();
     VkBuffer ib = VK_NULL_HANDLE; VkDeviceSize io = 0;
     if (dp->ind && (!vka_addr(dp->ind, 12, &ib, &io, NULL) || (io & 3))) SKIP("indirect dispatch arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)dp->ind);
@@ -2847,5 +2861,10 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
 }
 void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines) {
     if (draws) *draws = g_draws; if (skipped) *skipped = g_skipped; if (dispatches) *dispatches = g_dispatches; if (pipelines) *pipelines = 0;
+}
+// The device-caused skips by cause, the draws and dispatches that ran and every other skip (vka_skipwarn.h), for the skipped-work warning (vka_exec.c mtl_set_frame)
+void vka_draw_skips(uint64_t dev[VKS_N], uint64_t *work, uint64_t *other) {
+    uint64_t t = 0; for (int i = 0; i < VKS_N; i++) { dev[i] = g_skip_dev[i]; t += dev[i]; }
+    *work = g_draws + g_dispatches; *other = g_skipped > t ? g_skipped - t : 0;
 }
 #endif

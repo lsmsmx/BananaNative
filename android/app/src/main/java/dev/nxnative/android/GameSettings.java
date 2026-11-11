@@ -36,16 +36,28 @@ final class GameSettings {
             fixed.view.setClickable(false);
             fixed.view.setAlpha(0.6f);
             Ui.add(box, fixed.view, 0);
-        } else Ui.add(box, new Ui.Setting(a, "⏱️", "Frame rate cap", v -> cap(a, g, again)).value(capLabel(a, id)).chevron(a).view, 0);
+        } else {
+            Ui.add(box, new Ui.Setting(a, "⏱️", "Frame rate cap", v -> cap(a, g, again)).value(capLabel(a, id)).chevron(a).view, 0);
+            if (Prefs.limited(id) && Prefs.presentOnly(id)) box.addView(Ui.small(a, Prefs.PRESENT_ONLY_NOTE));   // fps_limit_present: the limit paces the presents only
+        }
         if (Prefs.paced(id)) {   // the game's speed follows its measured frame rate (fps_decouple sead); off: as on the console. The in-game panel changes it live
             Ui.Setting full = new Ui.Setting(a, "🏃", "Full game speed at low frame rates", null).toggle(a, Prefs.decouple(a, id), (b, on) -> Prefs.decouple(a, id, on));
             full.value("The game keeps its normal speed when its frame rate drops or is limited. Off: it slows down with the frame rate, as on the console");
             Ui.add(box, full.view, 0);
         }
         Ui.add(box, new Ui.Setting(a, "📐", "Display", v -> display(a, g, again)).value(Prefs.DISPLAY_NAMES[Prefs.stretch(a, id) ? 1 : 0]).chevron(a).view, 0);
-        Ui.add(box, new Ui.Setting(a, "🔍", "Upscaler", v -> upscaler(a, g, again)).value(dflt(GameUpscaler.ownMode(a, id), GameUpscaler.MODES[GameUpscaler.mode(a, id)])).chevron(a).view, 0);
-        if (GameUpscaler.mode(a, id) == GameUpscaler.MODE_FSR)   // only with FSR 1 chosen
-            Ui.add(box, new Ui.Setting(a, "✨", "FSR sharpness", v -> sharpness(a, g, again)).value(dflt(GameUpscaler.ownSharp(a, id), GameUpscaler.sharpName(a, id))).chevron(a).view, 0);
+        if (Prefs.dlssGame(id)) {   // a game on the DLSS stand-in (game.tsv dlss_standin): its Upscaler is the stand-in (GSR2's sliders under GSR 2, the sharpness under FSR 1)
+            int dm = GameUpscaler.dlssMode(a, id);
+            Ui.add(box, new Ui.Setting(a, "🔍", "Upscaler", v -> dlssMode(a, g, again)).value(dflt(GameUpscaler.ownDlssMode(a, id), DlssTune.MODE_NAMES[dm])).chevron(a).view, 0);
+            if (DlssTune.showsClarity(dm))
+                Ui.add(box, new Ui.Setting(a, "🌀", "Motion clarity", v -> clarity(a, g, again)).value(dflt(GameUpscaler.ownClarity(a, id), DlssTune.clarityName(GameUpscaler.clarity(a, id)))).chevron(a).view, 0);
+            if (DlssTune.showsSharp(dm))
+                Ui.add(box, new Ui.Setting(a, "🔆", DlssTune.sharpTitle(dm), v -> dlssSharp(a, g, again)).value(dflt(GameUpscaler.ownDlssSharp(a, id), DlssTune.sharpName(GameUpscaler.dlssSharp(a, id)))).chevron(a).view, 0);
+        } else {
+            Ui.add(box, new Ui.Setting(a, "🔍", "Upscaler", v -> upscaler(a, g, again)).value(dflt(GameUpscaler.ownMode(a, id), GameUpscaler.MODES[GameUpscaler.mode(a, id)])).chevron(a).view, 0);
+            if (GameUpscaler.mode(a, id) == GameUpscaler.MODE_FSR)   // only with FSR 1 chosen
+                Ui.add(box, new Ui.Setting(a, "✨", "FSR sharpness", v -> sharpness(a, g, again)).value(dflt(GameUpscaler.ownSharp(a, id), GameUpscaler.sharpName(a, id))).chevron(a).view, 0);
+        }
         if (Prefs.drsGame(id))
             Ui.add(box, new Ui.Setting(a, "📐", "Dynamic resolution", v -> drs(a, g, again)).value(dflt(Prefs.ownDrs(a, id), Prefs.DRS_NAMES[Prefs.drs(a, id)])).chevron(a).view, 0);
         Ui.add(box, new Ui.Setting(a, "🎮", "GPU driver", v -> driver(a, g, again)).value(driverLabel(a, id)).chevron(a).view, 0);
@@ -278,6 +290,21 @@ final class GameSettings {
     private static void sharpness(MainActivity a, Game g, Runnable done) {   // FSR's RCAS sharpening (GameUpscaler, DM_VK_NDSR_SHARP)
         choose(a, "FSR sharpness · " + g.name, GameUpscaler.SHARP_NAMES, GameUpscaler.sharpName(GameUpscaler.sharp(a)), GameUpscaler.ownSharp(a, g.titleId),
                GameUpscaler.sharpIndex(GameUpscaler.sharp(a, g.titleId)), v -> GameUpscaler.sharp(a, g.titleId, v == null ? null : GameUpscaler.SHARPS[v]), done);
+    }
+
+    private static void dlssMode(MainActivity a, Game g, Runnable done) {   // the DLSS stand-in's mode (GameUpscaler.dlssMode, DM_VK_DLSS); the in-game panel changes it live
+        choose(a, "Upscaler · " + g.name, DlssTune.MODE_NAMES, DlssTune.MODE_NAMES[DlssTune.MODE_DEFAULT], GameUpscaler.ownDlssMode(a, g.titleId), GameUpscaler.dlssMode(a, g.titleId),
+               v -> GameUpscaler.dlssMode(a, g.titleId, v), done);
+    }
+
+    static final String CLARITY_LEFT = "Steady", CLARITY_RIGHT = "Clear";   // the Motion clarity slider's ends: more history (steadier) / less ghosting
+    private static void clarity(MainActivity a, Game g, Runnable done) {   // the GSR2 stand-in's clarity step (DlssTune, DM_VK_GSR2_CLARITY); the in-game panel changes it live
+        StepSlider.dialog(a, "Motion clarity", " · " + g.name, DlssTune.clarityNames(), GameUpscaler.clarity(a, g.titleId), CLARITY_LEFT, CLARITY_RIGHT,
+                          DlssTune.clarityName(DlssTune.CLARITY_DEFAULT), GameUpscaler.ownClarity(a, g.titleId), v -> GameUpscaler.clarity(a, g.titleId, v), done);
+    }
+    private static void dlssSharp(MainActivity a, Game g, Runnable done) {   // the DLSS stand-in's RCAS (DlssTune, DM_VK_DLSS_SHARP; GSR 2's and FSR 1's); the in-game panel changes it live
+        StepSlider.dialog(a, DlssTune.sharpTitle(GameUpscaler.dlssMode(a, g.titleId)), " · " + g.name, DlssTune.sharpNames(), GameUpscaler.dlssSharp(a, g.titleId), "Softer", "Sharper",
+                          DlssTune.sharpName(DlssTune.SHARP_DEFAULT), GameUpscaler.ownDlssSharp(a, g.titleId), v -> GameUpscaler.dlssSharp(a, g.titleId, v), done);
     }
 
     private static void drs(MainActivity a, Game g, Runnable done) {   // the render size's range (Prefs.DRS), from the next start; the in-game panel changes it live

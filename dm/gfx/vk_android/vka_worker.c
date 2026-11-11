@@ -35,7 +35,7 @@ void vka_worker_waits(uint64_t *room_ns, uint64_t *sub_ns) { if (room_ns) *room_
 uint64_t vka_worker_sub_cpu(void) { return atomic_load(&g_sub_cpu_all); }   // a recording time far above it: the replay thread was blocked in the submission, not busy
 static uint64_t thread_cpu_ns(void) { struct timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 
-enum { J_SUB = 1, J_PRESENT, J_FORGET, J_WAIT };
+enum { J_SUB = 1, J_PRESENT, J_FORGET, J_WAIT, J_PROG_FORGET };
 typedef struct {
     int kind;
     uint64_t serial, fence, frame; int origin_ll;   // J_SUB: the queue, its window origin, the fence reserved for it, the game's frame when it submitted; J_WAIT: the queue, the fence it waits for
@@ -332,6 +332,9 @@ static void *worker_main(void *arg) {
         } else if (j.kind == J_FORGET) {
             if (qon) { qs_force_all(&g_qs, QS_WHY_FORGET); qs_publish(); }
             vka_rp_queue_forget(j.serial);
+        } else if (j.kind == J_PROG_FORGET) {   // the program's address (job_t.serial); a park still open is released first, as for a queue finalized
+            if (qon) { qs_force_all(&g_qs, QS_WHY_PROG); qs_publish(); }
+            vka_rp_prog_forget((const prog_t *)(uintptr_t)j.serial);
         }
         uint64_t t2 = wns(); g_busy_ns += t2 - t1; if (j.kind == J_SUB) { g_sub_ns += t2 - t1; atomic_fetch_add_explicit(&g_sub_all, t2 - t1, memory_order_relaxed); atomic_fetch_add_explicit(&g_sub_cpu_all, thread_cpu_ns() - c1, memory_order_relaxed); }
         if (j.kind == J_PRESENT && j.ticket % 300 == 0) {
@@ -394,6 +397,7 @@ static void fence_syncs(const uint8_t *p, uint64_t fence, int depth, job_t *j, i
 void mtl_queue_activate(uint64_t serial) { if (up()) g_pend_serial = serial; else { uint64_t f = vka_fp_host(NULL); vka_rp_queue_activate(serial); vka_fp_back(f); } }
 void mtl_set_queue_origin_lower_left(int on) { if (up()) g_pend_origin = on != 0; else vka_rp_set_queue_origin(on); }
 void mtl_queue_forget(uint64_t serial) { if (up()) { job_t j = {J_FORGET}; j.serial = serial; push(&j); } else { uint64_t f = vka_fp_host(NULL); vka_rp_queue_forget(serial); vka_fp_back(f); } }
+void mtl_prog_forget(const prog_t *p) { if (up()) { job_t j = {J_PROG_FORGET}; j.serial = (uint64_t)(uintptr_t)p; push(&j); } else { uint64_t f = vka_fp_host(NULL); vka_rp_prog_forget(p); vka_fp_back(f); } }
 void mtl_sub_begin(void) {
     if (!up()) { uint64_t f = vka_fp_host(NULL); vka_rp_sub_begin(); vka_fp_back(f); return; }
     g_in_sub = 1; g_cur.nh = 0;

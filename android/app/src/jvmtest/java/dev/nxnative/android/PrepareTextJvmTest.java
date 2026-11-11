@@ -125,8 +125,10 @@ public final class PrepareTextJvmTest {
         // The progress line never says "0 of 0"
         check(PrepareText.progressLine(18, false, 0, 0, "", 0).equals("18 %"), "no total: no shader count: " + PrepareText.progressLine(18, false, 0, 0, "", 0));
         check(PrepareText.progressLine(5, false, 0, 22852, "", 0).equals("5 %  ·  22,852 shaders to make"), PrepareText.progressLine(5, false, 0, 22852, "", 0));
-        check(PrepareText.progressLine(37, true, 1304, 22852, "about 35 min left", 70).equals("37 %  ·  21,548 shaders left  ·  about 35 min left  ·  70 unchanged kept"),
+        check(PrepareText.progressLine(37, true, 1304, 22852, "about 35 min left", 70).equals("37 %  ·  21,548 shaders left  ·  about 35 min left  ·  the other 70 are reused"),
                 PrepareText.progressLine(37, true, 1304, 22852, "about 35 min left", 70));
+        check(PrepareText.progressLine(100, false, 0, 0, "", 22852).equals("100 %  ·  shaders up to date: nothing to translate"),
+                PrepareText.progressLine(100, false, 0, 0, "", 22852));
         check(PrepareText.progressLine(40, false, 1234, 22852, "about 1 min left", 0).equals("40 %  ·  1,234 of 22,852 shaders"), "outside the step: no time left");
 
         // The split's count is of files, not shaders (the card read "Finding the shaders 186,583" while the game has 42,898 shaders); the other steps keep theirs

@@ -52,8 +52,9 @@ real PC — please report how it goes.
    folder.)
 
 **Phone only** ([guide](docs/guides/getting-started.md)): copy the game folder to the phone, tap **Add game**, then
-**Prepare**. It runs in the background and can be paused; keep the phone on the charger. This takes about an hour. A
-computer is recommended for Mario Kart World (`0400C3F00006E000`).
+**Prepare**. It runs in the background and can be paused; keep the phone on the charger. The first Prepare takes
+about 20–45 minutes (mostly translating shaders). Prepare is incremental: later runs reuse existing shaders and
+only rewrite code when its key changes (a few minutes). A computer is recommended for Mario Kart World (`0400C3F00006E000`).
 
 ## Problems
 

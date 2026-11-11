@@ -69,9 +69,14 @@ target_compile_options(zstddec PRIVATE -O2 -w -fvisibility=hidden)
 file(GLOB DAV1D_C CONFIGURE_DEPENDS ${TP}/dav1d/src/*.c ${TP}/dav1d/config/tmpl/*.c)
 list(FILTER DAV1D_C EXCLUDE REGEX "_tmpl\\.c$")
 list(APPEND DAV1D_C ${TP}/dav1d/src/arm/cpu.c)
-add_library(dav1d STATIC ${DAV1D_C})
-target_include_directories(dav1d PRIVATE ${TP}/dav1d ${TP}/dav1d/include ${TP}/dav1d/config)
+# and its arm64 assembly (the NEON / dotprod / i8mm / SVE kernels, picked at run time by src/arm/cpu.c), with dav1d_config/config.h ahead of the vendored config, whose non-Apple
+# block turns the assembly off: C only, a 2560x1440 AV1 frame of Fire Emblem Fortune's Weave's heaviest movie (NR14_00, 50-73 Mbit/s) took 18-21 ms of the submitting thread on the Pad 3
+file(GLOB DAV1D_S CONFIGURE_DEPENDS ${TP}/dav1d/src/arm/64/*.S)
+list(FILTER DAV1D_S EXCLUDE REGEX "(_tmpl|/util)\\.S$")
+add_library(dav1d STATIC ${DAV1D_C} ${DAV1D_S})
+target_include_directories(dav1d PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dav1d_config ${TP}/dav1d ${TP}/dav1d/include ${TP}/dav1d/config)
 target_compile_options(dav1d PRIVATE -O2 -w -fvisibility=hidden)
+target_compile_definitions(dav1d PRIVATE _GNU_SOURCE)
 
 # One host: target <tgt> with the profile of <game> compiled in. The game profile header, as dm/host/Makefile makes it (game.py header), goes into gen/<game>
 function(nxhost_add tgt game)

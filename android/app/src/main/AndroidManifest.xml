@@ -21,6 +21,7 @@
         android:extractNativeLibs="false"
         android:allowNativeHeapPointerTagging="false"
         android:largeHeap="true"
+        android:appCategory="game"
         android:hasFragileUserData="true">
         <activity
             android:name=".MainActivity"
@@ -62,7 +63,7 @@
                 <data android:pathPattern=".*\\.nup" />
             </intent-filter>
         </activity-alias>
-        <!-- The game runs in a process of its own: the host starts once per process and ends it when it stops, the launcher stays -->
+        <!-- The game runs in a process of its own: the host starts once per process and ends it when it stops, the launcher stays. sensorLandscape is for a phone: GameActivity.fitOrientation drops the request on a large screen (GameOrientation), where it would letterbox the window -->
         <activity
             android:name=".GameActivity"
             android:exported="false"

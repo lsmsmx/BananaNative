@@ -9,6 +9,7 @@
 #include "../nvn/nvn_timestamp.h"
 #include "vka_present_rot.h"
 #include "vka_qsched.h"
+#include "vka_skipwarn.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,9 +91,29 @@ static _Atomic uint64_t g_fstart[64], g_fstart_f[64];   // when the replay began
 static uint64_t g_job_frame; static int g_job_frame_set;   // the frame of the submission the worker replays (vka_exec_sub_frame)
 void vka_exec_sub_frame(uint64_t f) { g_job_frame = f; g_job_frame_set = 1; }
 uint64_t vka_frame_start_ns(uint64_t f) { unsigned k = f % 64; return atomic_load(&g_fstart_f[k]) == f ? atomic_load(&g_fstart[k]) : 0; }   // now_ns; 0 = not known (vka_perf.c)
+// The skipped-work warning (vka_skipwarn.h, DM_VK_SKIP_WARN): once per run, when the replay skipped over the threshold's share of the draws and dispatches in two windows of
+// VKS_WINDOW frames in a row for causes of the device (refused pipelines and shaders, a missing feature), the [RED] line below and nxhost_skip_status (the launcher's notice)
+static vkskip g_skipw; static _Atomic int g_skipw_pct;
+extern void vka_draw_skips(uint64_t dev[VKS_N], uint64_t *work, uint64_t *other);
+static void skipwarn_frame(uint64_t f) {
+    static int th = -1; if (th < 0) th = VKA_ENV("DM_VK_SKIP_WARN", VKS_DEFAULT_PCT);
+    if (th <= 0 || g_skipw.fired) return;
+    uint64_t dev[VKS_N], work, other; vka_draw_skips(dev, &work, &other);
+    if (!vkskip_step(&g_skipw, f, work, dev, other, th)) return;
+    int mesh = !strncmp(g_skipw.causes, vks_name[VKS_MESH], strlen(vks_name[VKS_MESH]));   // (the largest cause: this device has no mesh shading, which no driver choice here changes)
+    VRED("%d %% of draws skipped over the last %d frames (causes: %s): %s", g_skipw.pct, VKS_WINDOW, g_skipw.causes,
+         mesh ? "this GPU has no mesh shading, so some models are missing" : "the GPU driver may not suit this game");
+    atomic_store_explicit(&g_skipw_pct, g_skipw.pct, memory_order_release);
+}
+// The launcher's notice (Native.skipStatus): "<percent> <causes>" once the warning fired, "" before; the buffer ends with a NUL
+__attribute__((visibility("default"))) void nxhost_skip_status(char *buf, size_t n) {
+    int p = atomic_load_explicit(&g_skipw_pct, memory_order_acquire);
+    if (n) { if (p > 0) snprintf(buf, n, "%d %s", p, g_skipw.causes); else buf[0] = 0; }
+}
 void mtl_set_frame(uint64_t f) {
     g_frame = f; vka_ctl_frame(f);
     { if (atomic_load_explicit(&vka_synclog_n, memory_order_relaxed) > 0) VLOG("sync frame %llu begins at %.2f ms", (unsigned long long)f, (now_ns() % 1000000000000ull) / 1e6); }
+    skipwarn_frame(f);
     static uint64_t f0, d0, rp0, b0, ub0, s0, r0, o0, pc0, ch0;
     int on = VKA_ENV("DM_VK_STATS", 1) != 0;
     if (on && f - f0 >= 300) {
@@ -129,6 +150,21 @@ void vka_rp_queue_activate(uint64_t serial) {
 void vka_rp_queue_forget(uint64_t serial) {
     for (int i = 0; i < g_nqs; i++) if (g_qs[i].serial == serial) { g_qs[i] = g_qs[--g_nqs]; break; }
     if (S.serial == serial) memset(&S, 0, sizeof S);
+}
+// A finalized program leaves the bindings of every queue (upstream nxnative 1440a736, there for Metal): NVN reads a program only when it is bound, so a game may finalize one that a
+// queue still has bound and reuse its memory. Fire Emblem Fortune's Weave does this when its title screen hands over to the opening demo; a binding left in place made the next draw
+// read the program's stages from the reused memory. In submission order (the replay worker's job queue), so lists submitted before the finalize still draw with it
+static int prog_unbind(vka_dstate *d, const prog_t *p) {
+    int n = 0;
+    if (d->cprog == p) d->cprog = NULL, n++;
+    for (int st = 0; st < VKA_NSTAGE; st++) if (d->bst[st] == p) d->bst[st] = NULL, n++;
+    if (n) d->bind_gen++;
+    return n;
+}
+void vka_rp_prog_forget(const prog_t *p) {
+    int active = prog_unbind(&S.d, p) > 0, inactive = 0;
+    for (int i = 0; i < g_nqs; i++) if (g_qs[i].serial != S.serial && prog_unbind(&g_qs[i].d, p)) inactive++;
+    if (active || inactive) { static unsigned n; if (!n++ || !(n & (n - 1))) VLOG("finalized program %p dropped from queue bindings (active queue %d, inactive queues %d; %u times so far)", (const void *)p, active, inactive, n); }
 }
 
 static void post(pop o) {
@@ -994,6 +1030,50 @@ static void copy_t2t(const p_copy_t2t *c) {
     vka_barrier(g_cb);
 }
 
+// NVN2's DLSS (OP_DLSS, hle_nvn.c "NVN2's DLSS"): the network has no Vulkan counterpart, so the replay writes the output texture itself, so the game's post chain reads a
+// picture (Fire Emblem Fortune's Weave's 3D was black with the evaluation dropped). DM_VK_DLSS (live) picks how: 3 = Snapdragon GSR2 3-pass (the default), 2 = FSR 1 with
+// the jitter taken out, both in vka_dlss.c; 1 = a bilinear blit of the input subrectangle to the output size (also what 2 and 3 fall back to); 0 leaves the output unwritten (A/B)
+static void dlss_eval(const p_dlss *o) {
+    static uint64_t n;
+    int mode = VKA_ENV("DM_VK_DLSS", 3);
+    if (mode <= 0) return;
+    const tex_t *ct = o->tex[DLSS_COLOR], *ot = o->tex[DLSS_OUTPUT];
+    if (!ct || !ot) { VRED_ONCE("DLSS evaluation without an input colour or an output texture: skipped"); return; }
+    vka_img *s = vka_tex_get(ct, g_cb), *d = vka_tex_get(ot, g_cb);
+    if (!s || !d) return;
+    if ((s->aspect & VK_IMAGE_ASPECT_COLOR_BIT) == 0 || (d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) == 0 || d->f.bw > 1 || d->samples > 1) {
+        VRED_ONCE("DLSS stand-in: formats %#x → %#x: no colour input or an output a blit cannot write (compressed, depth or multisampled): the output stays unwritten", ct->d.format, ot->d.format); return; }
+    vka_tex_own(d, g_cb);
+    uint32_t sl = 0, dl = 0; if (!vka_img_lv(s, &sl) || !vka_img_lv(d, &dl)) return;
+    int iw = o->iw > 0 ? o->iw : (int)s->w, ih = o->ih > 0 ? o->ih : (int)s->h, ow = o->ow > 0 ? o->ow : (int)d->w, oh = o->oh > 0 ? o->oh : (int)d->h;
+    int sx = o->base[DLSS_COLOR][0], sy = o->base[DLSS_COLOR][1], dx = o->base[DLSS_OUTPUT][0], dy = o->base[DLSS_OUTPUT][1];
+    if (sx < 0 || sy < 0 || dx < 0 || dy < 0 || sx + iw > (int)s->w || sy + ih > (int)s->h || dx + ow > (int)d->w || dy + oh > (int)d->h) {
+        VRED_ONCE("DLSS stand-in: rectangles past the textures (input %d,%d %dx%d of %ux%u, output %d,%d %dx%d of %ux%u): clamped", sx, sy, iw, ih, s->w, s->h, dx, dy, ow, oh, d->w, d->h);
+        if (sx < 0) sx = 0;
+        if (sy < 0) sy = 0;
+        if (dx < 0) dx = 0;
+        if (dy < 0) dy = 0;
+        if (sx + iw > (int)s->w) iw = (int)s->w - sx;
+        if (sy + ih > (int)s->h) ih = (int)s->h - sy;
+        if (dx + ow > (int)d->w) ow = (int)d->w - dx;
+        if (dy + oh > (int)d->h) oh = (int)d->h - dy;
+        if (iw <= 0 || ih <= 0 || ow <= 0 || oh <= 0) return;
+    }
+    if (mode >= 2 && vka_dlss_run(g_cb, o, mode, s, sl, sx, sy, iw, ih, d, dl, dx, dy, ow, oh)) { vka_img_written(d); g_stat_ops++; return; }
+    if ((s->f.kind && s->f.kind < 3) || s->f.kind != d->f.kind || s->f.bw > 1 || s->samples > 1) {
+        VRED_ONCE("DLSS stand-in: formats %#x → %#x cannot be blitted (integer, compressed or multisampled): the output stays unwritten", ct->d.format, ot->d.format); return; }
+    VkImageBlit r = {{VK_IMAGE_ASPECT_COLOR_BIT, sl, 0, 1}, {{sx, sy, 0}, {sx + iw, sy + ih, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, dl, 0, 1}, {{dx, dy, 0}, {dx + ow, dy + oh, 1}}};
+    VkFormatProperties fp; vk.vkGetPhysicalDeviceFormatProperties(V.pd, s->f.vk, &fp);
+    VkFilter fl = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    vk.vkCmdBlitImage(g_cb, s->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r, fl);
+    vka_img_written(d); g_stat_ops++;
+    vka_barrier(g_cb);
+    n++;
+    if (n == 1 || (!(n & (n - 1)) && n <= 4096))
+        VLOG("DLSS stand-in (%s): %dx%d at %d,%d of %#x %ux%u → %dx%d at %d,%d of %#x %ux%u, reset %u, jitter %.3f %.3f (%llu evaluations)", fl == VK_FILTER_LINEAR ? "bilinear" : "nearest",
+             iw, ih, sx, sy, ct->d.format, s->w, s->h, ow, oh, dx, dy, ot->d.format, d->w, d->h, o->reset, o->jitter[0], o->jitter[1], (unsigned long long)n);
+}
+
 static void not_yet(uint32_t op) {
     g_stat_skipped++;
     VRED_ONCE("DrawTexture (op %u) is not on Vulkan yet: skipped from now on", op);
@@ -1258,6 +1338,7 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
         case OP_COPY_B2T: if (g_cb) copy_bt(a, 1); break;
         case OP_COPY_T2B: mdx_write(); if (g_cb) { vka_rw_pre(g_cb); copy_bt(a, 0); vka_rw_point(g_cb, 't', 0, 0, 0); } break;
         case OP_COPY_T2T: if (g_cb) copy_t2t(a); break;
+        case OP_DLSS: if (!S.rc_skip && g_cb) dlss_eval(a); break;
         case OP_BARRIER: if (g_cb && !bar_kept) { int32_t bits; memcpy(&bits, a, 4); if (!vka_gbar_game(g_cb, (uint32_t)bits)) vka_barrier(g_cb); } break;   // (vka_gbar.c: between dispatches, a compute-to-compute barrier at the next one)
         case OP_DRAW: if (S.rc_skip) vka_rtlog_skip(&S.rt, S.has_rt, &S.d, "skipped by a render condition");
                       if (!S.rc_skip && g_cb) { p_draw t; const p_draw *d = draw_rec(a, h.size, &t); g_stat_draws++; mdx_before_draw(p, d); uint64_t sk = 0; if (g_oq_count) vka_draw_stats(NULL, &sk, NULL, NULL);

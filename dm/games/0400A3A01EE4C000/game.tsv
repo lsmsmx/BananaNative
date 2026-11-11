@@ -44,3 +44,7 @@ res_levels	76a489f3bd3642fa5e18bd83d32c98ba	0x2849658	34	0x2804ff0:8	0x2805160:8
 # ---- Shader split (shader_split.py) ----
 shader_groups	/motor_asset_re/=rdb
 shader_note	Pokemon Pokopia shaders
+# Frame rate cap (issue #143): the game has no frame limiter the host can set, so the host's limiter (a wait before each present) offers the cap; 60 changes nothing.
+# Whether the game's logic follows a lower rate (time steps) or slows down (frame counts) is not checked: fps_limit_present tells players so beside the cap
+fps_limit	60
+fps_limit_present	1

@@ -38,7 +38,7 @@ final class PackCheck {
      */
     static String blocking(Context c, Pack p, File game) {
         String m = p.unfinishedModule();
-        if (m != null) return "The pack's game code is unfinished (" + m + ".android.key is missing: an update of the pack was stopped part way). Prepare again finishes it.";
+        if (m != null) return "The pack's game code is unfinished (" + m + ".android.key is missing: an update of the pack was stopped part way). Prepare again finishes it (a few minutes; shaders are kept).";
         Job j = rewriting(c, p.dir, game, p.titleId);
         if (j != null) return "The pack's game code is being rewritten (" + j.name() + ": " + j.statusText(false) + "). Let preparing finish first.";
         return build(p, game);
