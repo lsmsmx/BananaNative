@@ -1506,10 +1506,10 @@ static void sets_memo_store(const sets_key *k, int any_pool) {
     m->ok = 1;
 }
 // The set-0 writes as descriptors in the descriptor buffer (DM_VK_DESC_BUF): each at its binding's offset plus its array element, then one
-// vkCmdSetDescriptorBufferOffsetsEXT for the set. A buffer write needs its buffer's device address; a full region, or a write kind the buffer path
-// does not carry, takes the push path instead (the whole set is written there, never half here).
+// vkCmdSetDescriptorBufferOffsetsEXT for the set. A buffer without a device address takes the zero / sink buffer and a texel buffer a null one, as
+// the push path binds them; a full region skips the draw (logged) rather than binding half a set.
 static int db_push(VkPipelineBindPoint bp, const vka_layout *lay, int any_pool) {
-    if (!V.db || !lay->db_layout || !lay->db_n) return sets_push(bp, lay, any_pool);
+    if (!V.db || !lay->db_layout || !lay->db_n) return sets_push(lay, bp, any_pool);
     VkDeviceSize base = vka_db_alloc(lay->db_size);
     uint8_t *dstp = base == UINT64_MAX ? NULL : vka_db_ptr(base);
     if (!dstp) { VRED_ONCE("descriptor buffer: a submission's region is full: this draw is skipped (raise the region, vka_dev.c DB_REGION)"); return 0; }
@@ -1520,7 +1520,7 @@ static int db_push(VkPipelineBindPoint bp, const vka_layout *lay, int any_pool) 
         if (off == UINT32_MAX) continue;
         VkDescriptorAddressInfoEXT ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT, .format = VK_FORMAT_UNDEFINED};
         VkDescriptorGetInfoEXT gi = {VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT, .type = w->descriptorType};
-        VkBufferView nullv = VK_NULL_HANDLE;
+        VkDescriptorAddressInfoEXT tz = {VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT};   // the null texel buffer these bindings hold (no view on Vulkan here)
         uint32_t sz = 0;
         switch (w->descriptorType) {
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
@@ -1535,8 +1535,8 @@ static int db_push(VkPipelineBindPoint bp, const vka_layout *lay, int any_pool) 
         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: gi.data.pSampledImage = w->pImageInfo; sz = V.dbprops.sampledImageDescriptorSize; break;
         case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: gi.data.pStorageImage = w->pImageInfo; sz = V.dbprops.storageImageDescriptorSize; break;
         case VK_DESCRIPTOR_TYPE_SAMPLER: gi.data.pSampler = w->pImageInfo ? &w->pImageInfo->sampler : NULL; sz = V.dbprops.samplerDescriptorSize; break;
-        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: gi.data.pUniformTexelBuffer = &nullv; sz = V.dbprops.uniformTexelBufferDescriptorSize; break;
-        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: gi.data.pStorageTexelBuffer = &nullv; sz = V.dbprops.storageTexelBufferDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: gi.data.pUniformTexelBuffer = &tz; sz = V.dbprops.uniformTexelBufferDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: gi.data.pStorageTexelBuffer = &tz; sz = V.dbprops.storageTexelBufferDescriptorSize; break;
         default: continue;
         }
         vk.vkGetDescriptorEXT(V.dev, &gi, sz, dstp + off + (uint64_t)w->dstArrayElement * sz);
