@@ -1,6 +1,6 @@
-# libnxhost.so: the Horizon host (dm/host) and the parts of dm/gfx that are not Metal, for Android arm64-v8a, API 33+ (android/PORTING.md).
+# libnxhost.so: the Horizon host (dm/host) and the parts of dm/gfx that are not Metal, for Android arm64-v8a, API 31+ (android/PORTING.md).
 # Configure with the NDK's toolchain file and a game profile (there is no default game, as in dm/host/Makefile):
-#   cmake -S android/host -B <build> -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=33 -DGAME=<title ID>
+#   cmake -S android/host -B <build> -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=31 -DGAME=<title ID>
 #   cmake --build <build>
 # The launcher APK builds one host per game instead: -DNX_GAMES=<title ID>,<title ID>,… makes libnxhost_<title ID>.so for each (the same sources, each with its own
 # profile header), and no plain nxhost or nxreplay (android/app/src/main/cpp/CMakeLists.txt links a libnxlaunch_<title ID>.so to each)

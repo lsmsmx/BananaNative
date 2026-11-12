@@ -52,7 +52,7 @@ Say what was not checked too.
 
 - **Agree on the scope first.** Open an issue before writing a change that adds a device class or a GPU vendor, adds a second implementation of an existing path, or runs to more than about 1,000 lines. A large PR built on an older `android` can rarely be reviewed or merged, however well it was tested.
 - **One concern per PR.** A launcher feature, a host change and one game's fixes are separate PRs, each on the current `android`.
-- **Supported phones** are the ones the [README](README.md) names: Android 13 or later, a Snapdragon (Adreno) GPU, and at least 12 GB of RAM. Supporting other GPUs or smaller phones is the maintainer's decision, so ask in an issue first: it adds code paths that every later change has to keep working and that few contributors can test.
+- **Supported phones** are the ones the [README](README.md) names: Android 12 or later, a Snapdragon (Adreno) GPU, and at least 12 GB of RAM. Supporting other GPUs or smaller phones is the maintainer's decision, so ask in an issue first: it adds code paths that every later change has to keep working and that few contributors can test.
 
 ## How changes get in
 

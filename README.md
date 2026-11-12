@@ -27,7 +27,7 @@ frame rate, and ships so that people can test it and help. Ocarina of Time: only
 
 ## What you need
 
-- An Android 13+ phone with a Snapdragon (Adreno) GPU and at least 12 GB of RAM, 16 GB for Mario Kart World
+- An Android 12+ phone with a Snapdragon (Adreno) GPU and at least 12 GB of RAM, 16 GB for Mario Kart World
   (`0400C3F00006E000`). Tested on a Snapdragon 8 Elite Gen 5 with 16 GB, with the phone's own Qualcomm (system) driver
   and Turnip.
 - Your own dump of the game, as a folder (or a `.nup` file of one): `base/`, and `updates/<version>/` and `dlc/` if you

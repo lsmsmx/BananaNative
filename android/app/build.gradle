@@ -118,7 +118,7 @@ android {
     defaultConfig {
         applicationId nxLive ? 'dev.bananative.android' : nxPlay ? 'dev.nxnative.android.play' : nxApp ? "dev.nxnative.android.$nxApp" : 'dev.nxnative.android'
         resValue 'string', 'app_name', nxPlay || nxLive ? 'Banana Native' : nxApp ? nxLabel : 'Banana Native test'
-        minSdk 33
+        minSdk 31
         targetSdk 35
         versionCode nxVersionCode
         versionName nxVersion

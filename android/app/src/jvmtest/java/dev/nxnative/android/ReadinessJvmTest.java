@@ -81,8 +81,8 @@ public final class ReadinessJvmTest {
         check(find(l, "Memory").status == Readiness.Status.FAIL && Readiness.of(l, Readiness.Status.WARNING).isEmpty(), "the degraded row of a failed fact is left out");
 
         // No Vulkan facts (no answer, or a host that cannot report): one warning, nothing called missing; the launcher's own facts still checked
-        l = Readiness.evaluate(Readiness.merge(null, 15, 32), game);
-        check(Readiness.of(l, Readiness.Status.FAIL).size() == 1 && find(l, "Android 13 or newer").status == Readiness.Status.FAIL && find(l, "GPU features").status == Readiness.Status.WARNING, "no facts: " + l);
+        l = Readiness.evaluate(Readiness.merge(null, 15, 30), game);   // (SDK 30: below the app's 31, so the one required fact that fails here is the version)
+        check(Readiness.of(l, Readiness.Status.FAIL).size() == 1 && find(l, "Android 12 or newer").status == Readiness.Status.FAIL && find(l, "GPU features").status == Readiness.Status.WARNING, "no facts: " + l);
         l = Readiness.evaluate(Readiness.merge("unchecked=the GPU check did not answer in 8 s\n", 15, 36), game);
         check(!Readiness.any(l, Readiness.Status.FAIL) && find(l, "GPU features").message.contains("did not answer"), "a timeout is no failure: " + l);
         // The driver answered and failed: one failure
