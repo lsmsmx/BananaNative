@@ -5,7 +5,7 @@ This guide sets up a game with the phone alone. A Windows PC or a Mac prepares a
 
 ## What you need
 
-- Android 13 or newer, a 64-bit phone with a Snapdragon (Adreno) GPU and at least 12 GB of RAM, 16 GB for Mario Kart
+- Android 12 or newer, a 64-bit phone with a Snapdragon (Adreno) GPU and at least 12 GB of RAM, 16 GB for Mario Kart
   World (`0400C3F00006E000`). Tested on a Snapdragon 8 Elite Gen 5 (Adreno 840) with 16 GB.
 - Tested only with the phone's own Qualcomm (system) GPU driver and the latest Turnip; other drivers may not work
   ([GPU drivers](gpu-drivers.md)).

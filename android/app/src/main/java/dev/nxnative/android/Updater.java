@@ -10,6 +10,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageInstaller;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
@@ -490,12 +491,14 @@ final class Updater {
         if (receiverOn) return;
         receiverOn = true;
         app.registerReceiver(new BroadcastReceiver() {
-            @Override public void onReceive(Context c, Intent i) {
+            @Override @SuppressWarnings("deprecation") public void onReceive(Context c, Intent i) {
                 int st = i.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
                 String msg = i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
                 Activity a = front.get();
                 if (st == PackageInstaller.STATUS_PENDING_USER_ACTION) {
-                    Intent confirm = i.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class);
+                    Intent confirm = Build.VERSION.SDK_INT >= 33
+                            ? i.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class)   // (the typed overload is API 33+)
+                            : (Intent) i.getParcelableExtra(Intent.EXTRA_INTENT);
                     if (confirm == null) return;
                     if (a != null && !gone(a)) a.startActivity(confirm);
                     else c.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
@@ -507,6 +510,6 @@ final class Updater {
                         msg(a, "Update not installed", msg != null ? msg : "The installer answered status " + st + ".");
                 }
             }
-        }, new IntentFilter(app.getPackageName() + ACTION), Context.RECEIVER_NOT_EXPORTED);
+        }, new IntentFilter(app.getPackageName() + ACTION), Build.VERSION.SDK_INT >= 33 ? Context.RECEIVER_NOT_EXPORTED : 0);   // (the flag is API 33+; below it, 0 is the only value the framework takes)
     }
 }

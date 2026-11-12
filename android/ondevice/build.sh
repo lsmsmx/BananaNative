@@ -16,7 +16,7 @@ mkdir -p $W; W=${W:A}
 NDK=${ANDROID_NDK_HOME:-$(ls -d ~/Library/Android/sdk/ndk/* 2>/dev/null | sort -V | tail -1)}
 [ -d "$NDK/toolchains/llvm/prebuilt" ] || { echo "[RED] no Android NDK (set ANDROID_NDK_HOME)"; exit 1; }
 BIN=$(ls -d $NDK/toolchains/llvm/prebuilt/*/bin | head -1)
-CC="$BIN/clang --target=aarch64-linux-android33"
+CC="$BIN/clang --target=aarch64-linux-android31"
 PYV=3.14.6
 fetch() {   # fetch <url> <sha256>
   local f=$W/dl/${1:t}; mkdir -p $W/dl
@@ -38,7 +38,7 @@ cp -R $P/lib/python3.14 $S/python/lib/
 rm -rf $S/python/lib/python3.14/{test,idlelib,tkinter,turtledemo,ensurepip,lib2to3} $S/python/lib/python3.14/lib-dynload/_ctypes_test.$SFX $S/python/lib/python3.14/lib-dynload/*test*.$SFX
 SP=$S/python/lib/python3.14/site-packages; mkdir -p $SP
 # Capstone 5.0.7: the C library (AArch64 only: the rewriter disassembles nothing else) by CMake, the Python package as published (it loads capstone/lib/libcapstone.so with ctypes)
-cmake -S $W/src/capstone-5.0.7/src -B $W/build/capstone -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-33 \
+cmake -S $W/src/capstone-5.0.7/src -B $W/build/capstone -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-31 \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCAPSTONE_ARCHITECTURE_DEFAULT=OFF -DCAPSTONE_ARM64_SUPPORT=ON -DCAPSTONE_BUILD_TESTS=OFF -DCAPSTONE_BUILD_CSTOOL=OFF \
   -DCAPSTONE_INSTALL=OFF -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384" > $W/build/capstone.log
 ninja -C $W/build/capstone >> $W/build/capstone.log
