@@ -1505,6 +1505,46 @@ static void sets_memo_store(const sets_key *k, int any_pool) {
     }
     m->ok = 1;
 }
+// The set-0 writes as descriptors in the descriptor buffer (DM_VK_DESC_BUF): each at its binding's offset plus its array element, then one
+// vkCmdSetDescriptorBufferOffsetsEXT for the set. A buffer write needs its buffer's device address; a full region, or a write kind the buffer path
+// does not carry, takes the push path instead (the whole set is written there, never half here).
+static int db_push(VkPipelineBindPoint bp, const vka_layout *lay, int any_pool) {
+    if (!V.db || !lay->db_layout || !lay->db_n) return sets_push(bp, lay, any_pool);
+    VkDeviceSize base = vka_db_alloc(lay->db_size);
+    uint8_t *dstp = base == UINT64_MAX ? NULL : vka_db_ptr(base);
+    if (!dstp) { VRED_ONCE("descriptor buffer: a submission's region is full: this draw is skipped (raise the region, vka_dev.c DB_REGION)"); return 0; }
+    for (uint32_t i = 0; i < g_w.n; i++) {
+        const VkWriteDescriptorSet *w = &g_w.w[i];
+        uint32_t off = UINT32_MAX;
+        for (uint32_t j = 0; j < lay->db_n; j++) if (lay->db_off[j].binding == w->dstBinding) { off = lay->db_off[j].off; break; }
+        if (off == UINT32_MAX) continue;
+        VkDescriptorAddressInfoEXT ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_ADDRESS_INFO_EXT, .format = VK_FORMAT_UNDEFINED};
+        VkDescriptorGetInfoEXT gi = {VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT, .type = w->descriptorType};
+        VkBufferView nullv = VK_NULL_HANDLE;
+        uint32_t sz = 0;
+        switch (w->descriptorType) {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+            int storage = w->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            VkDeviceAddress a = w->pBufferInfo && w->pBufferInfo->buffer ? vka_db_buffer_address(w->pBufferInfo->buffer) : 0;
+            if (!a) { ai.address = vka_db_buffer_address(storage ? g_sink.buf : g_zero.buf); ai.range = 65536; }   // (an unbound slot: the sink / zero buffer, as the push path binds)
+            else { ai.address = a + w->pBufferInfo->offset; ai.range = w->pBufferInfo->range ? w->pBufferInfo->range : 65536; }
+            if (storage) { gi.data.pStorageBuffer = &ai; sz = V.dbprops.storageBufferDescriptorSize; }
+            else { gi.data.pUniformBuffer = &ai; sz = V.dbprops.uniformBufferDescriptorSize; }
+            break; }
+        case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: gi.data.pCombinedImageSampler = w->pImageInfo; sz = V.dbprops.combinedImageSamplerDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: gi.data.pSampledImage = w->pImageInfo; sz = V.dbprops.sampledImageDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: gi.data.pStorageImage = w->pImageInfo; sz = V.dbprops.storageImageDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_SAMPLER: gi.data.pSampler = w->pImageInfo ? &w->pImageInfo->sampler : NULL; sz = V.dbprops.samplerDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: gi.data.pUniformTexelBuffer = &nullv; sz = V.dbprops.uniformTexelBufferDescriptorSize; break;
+        case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER: gi.data.pStorageTexelBuffer = &nullv; sz = V.dbprops.storageTexelBufferDescriptorSize; break;
+        default: continue;
+        }
+        vk.vkGetDescriptorEXT(V.dev, &gi, sz, dstp + off + (uint64_t)w->dstArrayElement * sz);
+    }
+    uint32_t idx = 0; VkDeviceSize o = base;
+    vk.vkCmdSetDescriptorBufferOffsetsEXT(g_cb, bp, lay->db_layout, 0, 1, &idx, &o);
+    return 1;
+}
 static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, VkPipelineBindPoint bp, c0_at *c0) {
     int keep = VKA_ENV("DM_VK_SETS_MEMO", 1) && sets_keepable(sh, bp);
     sets_key k; if (keep) sets_key_of(d, sh, lay, &k);   // (before the build: what it resolves must not change it)
@@ -1513,7 +1553,7 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
         for (int i = 0, w = sets_memo_ways(); i < w; i++) if (sets_memo_same(&k, &g_sm[i])) {   // g_w as that draw left it: the same writes
             g_sm_hit++;
             if (g_sets_dry) { g_dry_pool = g_sm[i].any; return 1; }
-            return sets_push(lay, bp, g_sm[i].any);
+            return db_push(bp, lay, g_sm[i].any);
         }
     }
     g_w.n = 0;
@@ -1539,7 +1579,7 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
     }
     if (keep) sets_memo_store(&k, any_pool);
     if (g_sets_dry) { g_dry_pool = any_pool; return 1; }   // DM_VK_INSTANCE: the writes only (sets_push binds them)
-    return sets_push(lay, bp, any_pool);
+    return db_push(bp, lay, any_pool);
 }
 // Images first used by a draw (from the walk, walk_all), or remade with storage use (vka_tex.c img_storage_upgrade): dry = only whether there is one
 static int make_images(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], int dry) {

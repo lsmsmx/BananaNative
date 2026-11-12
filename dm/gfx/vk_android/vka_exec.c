@@ -489,12 +489,14 @@ void vka_rp_sub_begin(void) {
         vk.vkResetFences(V.dev, 1, &g_slot[k].vf); g_slot[k].vf_on = 0;
         if (g_slot_ts[k]) gpu_slot_done(k);   // its GPU times are there (its timeline fence may come later)
     } else if (g_slot[k].fence) vka_wait_done(g_slot[k].fence, UINT64_MAX);
+    vka_db_start(k);   // the descriptor buffer's region for this submission (DM_VK_DESC_BUF): waits for the region's last user
     uint64_t done = vka_done();
     for (unsigned i = 0; i < NSLOT; i++) if (g_slot_ts[i] && g_slot[i].fence <= done) gpu_slot_done(i);
     g_cb = g_slot[k].cb;
     vk.vkResetCommandBuffer(g_cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vk.vkBeginCommandBuffer(g_cb, &bi);
+    vka_db_bind(g_cb);   // the descriptor buffer, once per command buffer (DM_VK_DESC_BUF)
     vka_gbar_cb(g_cb);   // the game's barriers between dispatches (vka_gbar.c) follow this command buffer
     if (ts_init()) {
         qf.reset(g_cb, g_qp, k * QPS, QPS); qf.write(g_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_qp, k * QPS);
@@ -541,6 +543,7 @@ static void part_begin(const void *a) {
     vk.vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vk.vkBeginCommandBuffer(cb, &bi);
+    vka_db_bind(cb);   // (a part is a command buffer of its own: its descriptor-buffer binding again, DM_VK_DESC_BUF)
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_qp, pa.q);
 }
 // The parts of the submission in progress the GPU has finished, read without waiting at each new part: a part that ran long is logged while the submission is still being
@@ -644,6 +647,7 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) { uint64_t t0 = now_ns(), f = sub_
 uint64_t vka_rp_sub_commit_sig(uint64_t reserved, uint64_t signal) { uint64_t t0 = now_ns(), f = sub_commit(reserved, 1, signal); g_t_commit += now_ns() - t0; return f; }
 static uint64_t sub_commit(uint64_t reserved, int has_sig, uint64_t signal) {
     uint64_t fence = reserved ? reserved : vka_fence_next(); g_cur_fence = 0;
+    vka_db_set_fence(fence);   // the descriptor buffer's region for this submission lives until that fence (DM_VK_DESC_BUF)
     if (!has_sig) signal = fence;
     if (g_rc_rec) { g_rc_subf[g_n_sub % 64].sub = g_n_sub; g_rc_subf[g_n_sub % 64].fence = fence; g_rc_rec = 0; }   // (rc_sub_done)
     vka_draw_peek_commit(fence);   // DM_VK_SB_PEEK: this submission's storage buffers, read again once it has completed

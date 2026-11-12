@@ -231,7 +231,7 @@ static int init_once(void) {
     if (!vk.vkMapMemory2KHR) vk.vkMapMemory2KHR = (PFN_vkMapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkMapMemory2");   // core in 1.4
     if (!vk.vkUnmapMemory2KHR) vk.vkUnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkUnmapMemory2");
     // Descriptor buffers need the extension, its feature, bufferDeviceAddress (the buffer descriptors are written as addresses) and the five entry points
-    V.db = want_db && fdb.descriptorBuffer && f12.bufferDeviceAddress && vk.vkCmdBindDescriptorBuffersEXT && vk.vkCmdSetDescriptorBufferOffsetsEXT
+    V.db = want_db && x_push && fdb.descriptorBuffer && f12.bufferDeviceAddress && vk.vkCmdBindDescriptorBuffersEXT && vk.vkCmdSetDescriptorBufferOffsetsEXT
            && vk.vkGetDescriptorEXT && vk.vkGetDescriptorSetLayoutSizeEXT && vk.vkGetDescriptorSetLayoutBindingOffsetEXT;
     if (!vk.vkMapMemory2KHR || !vk.vkUnmapMemory2KHR) V.placed = V.placed_range = 0;
     // A driver that has the placed map but does not advertise it (Qualcomm 512.863 on the Adreno 740: the strings and vkMapMemory2 are in the driver, the extension is
@@ -804,7 +804,7 @@ static int sblk_idle(const sblk *b, uint64_t done, uint64_t udone) { return b->f
 // One host-visible buffer, one region per submission slot of the replay's ring (vka_exec.c): a submission's descriptors are read by the GPU until
 // its fence, so a region is written again only after the fence its slot's last submission carried (vka_db_start waits for it). The descriptors are
 // plain words in it, made with vkGetDescriptorEXT (vka_draw.c bind_sets). Nothing here runs unless V.db.
-enum { DB_REGION = 1 << 20, DB_SLOTS = 8 };
+enum { DB_REGION = 4 << 20, DB_SLOTS = 8 };   // 4 MiB a submission's region (a heavy frame's sets take ~1 MiB), 32 MiB in all
 static VkBuffer g_dbb; static VkDeviceMemory g_dbm; static void *g_dbp; static VkDeviceAddress g_dba;
 static unsigned g_dbslot; static VkDeviceSize g_dbcur; static int g_dbstate; static uint64_t g_dbfence[DB_SLOTS];
 static int db_ready(void) {
@@ -847,6 +847,7 @@ void vka_db_bind(VkCommandBuffer cb) {
     VkDescriptorBufferBindingInfoEXT bi = {VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT, .address = g_dba, .usage = VK_BUFFER_USAGE_DESCRIPTOR_BUFFER_BIT_EXT};
     vk.vkCmdBindDescriptorBuffersEXT(cb, 1, &bi);
 }
+uint8_t *vka_db_ptr(VkDeviceSize off) { return db_ready() && off < (VkDeviceSize)DB_REGION * DB_SLOTS ? (uint8_t *)g_dbp + off : NULL; }
 VkDeviceAddress vka_db_buffer_address(VkBuffer b) {
     static struct { VkBuffer b; VkDeviceAddress a; } c[256];
     uint32_t i = (uint32_t)(((uintptr_t)b >> 4) & 255);
