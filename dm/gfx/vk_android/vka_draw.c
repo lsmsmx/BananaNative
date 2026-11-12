@@ -1407,23 +1407,26 @@ static int push_same(VkPipelineBindPoint bp, VkPipelineLayout layout) {
 }
 static int g_sets_dry, g_dry_pool;   // DM_VK_INSTANCE: bind_sets only builds the writes (g_w) when g_sets_dry is set, and sets_push binds them later
 // The writes of g_w bound: pushed (only what changed since the last push) or as a set, and the texture pool set
+// The pipeline layout a draw's calls must name: the pipeline was made against the descriptor-buffer one when DM_VK_DESC_BUF is on (vka_pso.c lay_pl),
+// and binding a pool set, a push descriptor set or push constants with the other layout object is undefined (it crashed the driver)
+static VkPipelineLayout pl_of(const vka_layout *lay) { return V.db && lay->db_layout ? lay->db_layout : lay->layout; }
 static int sets_push(const vka_layout *lay, VkPipelineBindPoint bp, int any_pool) {
     uint64_t t2_ = g_prof ? cntvct() : 0;
     if (lay->push) { int ps = g_w.n ? push_same(bp, lay->layout) : 1;
-                     if (ps == 0) vk.vkCmdPushDescriptorSetKHR(g_cb, bp, lay->layout, 0, g_w.n, g_w.w);
-                     else if (ps == 2) vk.vkCmdPushDescriptorSetKHR(g_cb, bp, lay->layout, 0, g_dwn, g_dw); }
+                     if (ps == 0) vk.vkCmdPushDescriptorSetKHR(g_cb, bp, pl_of(lay), 0, g_w.n, g_w.w);
+                     else if (ps == 2) vk.vkCmdPushDescriptorSetKHR(g_cb, bp, pl_of(lay), 0, g_dwn, g_dw); }
     else {
         g_pd[bp == VK_PIPELINE_BIND_POINT_COMPUTE].n = 0;   // set 0 bound as a set: the last push is no longer what the draws see
         VkDescriptorSet set = set_alloc(lay->set0); if (!set) return 0;
         for (uint32_t i = 0; i < g_w.n; i++) g_w.w[i].dstSet = set;
         if (g_w.n) vk.vkUpdateDescriptorSets(V.dev, g_w.n, g_w.w, 0, NULL);
-        vk.vkCmdBindDescriptorSets(g_cb, bp, lay->layout, 0, 1, &set, 0, NULL);
+        vk.vkCmdBindDescriptorSets(g_cb, bp, pl_of(lay), 0, 1, &set, 0, NULL);
     }
     if (g_prof) g_ps[2] += cntvct() - t2_;
     if (any_pool) vka_tex_pfb_draw();   // (its pool reads are reported: this submission copies the bitmap out, vka_tex.c "Texture pool reads")
     if (any_pool) {   // set 1 the pool, and in the same call set 2 the pool reads' bitmap when they are reported (vka_tex.c "Texture pool reads")
         VkDescriptorSet ps[2] = {vka_bindless_set(), vka_pfb_set()};
-        if (ps[0]) vk.vkCmdBindDescriptorSets(g_cb, bp, lay->layout, 1, ps[1] ? 2 : 1, ps, 0, NULL); else VRED_ONCE("a shader reads the texture pool and there is no pool set");
+        if (ps[0]) vk.vkCmdBindDescriptorSets(g_cb, bp, pl_of(lay), 1, ps[1] ? 2 : 1, ps, 0, NULL); else VRED_ONCE("a shader reads the texture pool and there is no pool set");
     }
     return 1;
 }
