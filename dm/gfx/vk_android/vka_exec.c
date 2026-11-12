@@ -543,7 +543,8 @@ static void part_begin(const void *a) {
     vk.vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vk.vkBeginCommandBuffer(cb, &bi);
-    vka_db_bind(cb);   // (a part is a command buffer of its own: its descriptor-buffer binding again, DM_VK_DESC_BUF)
+    // Its descriptor-buffer binding (DM_VK_DESC_BUF) is not made here: this runs on the encoder thread, vkCmdBindDescriptorBuffersEXT is a recorded call, and the
+    // replay thread is the ring's one producer (recording from here would race its g_ph and take the ring apart). chunk() binds it after the switch
     if (pa.q != UINT32_MAX) qf.write(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_qp, pa.q);
 }
 // The parts of the submission in progress the GPU has finished, read without waiting at each new part: a part that ran long is logged while the submission is still being
@@ -582,6 +583,7 @@ static void chunk(void) {
     // With the encoder the part's end, its submit and the next part's reset and begin are made on its thread, in order with the calls before: the replay thread goes on
     if (vka_enc_call(part_submit, &pe, sizeof pe)) { vka_enc_call(part_begin, &pb, sizeof pb); vka_enc_switch(next); }
     else { part_submit(&pe); part_begin(&pb); }
+    vka_db_bind(next);   // the part's descriptor-buffer binding (DM_VK_DESC_BUF): here, not in part_begin, so that the ring's producer is this thread alone (the calls before it, part_submit and part_begin, are handed to the encoder first, so it lands after its begin either way)
     vka_qtrace(QT_PART, S.serial, g_cur_fence, 0, part, 0, 0, 0, NULL);
     g_cb = next; vka_gbar_cb(g_cb);
     vka_draw_cb_switch(g_cb); vka_gp_part(g_cb);
