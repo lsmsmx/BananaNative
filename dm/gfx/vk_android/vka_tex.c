@@ -2682,9 +2682,12 @@ static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
 int vka_tex_id_in_pass_rec(int id, uint8_t dim) {
     if (!g_nfb || id <= 0) return 0;
     if (id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1)) {
-        const vmemo *m = vm_slot(id, dim);
-        if (m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && m->im)
-            return in_fb(m->im) ? (m->im->f.kind >= 3 ? 2 : 1) : 0;
+        const vmemo *s = vm_set(id, dim);   // (each way: the memo is VM_WAYS-wide since e73c7304; upstream's vm_slot was its one-entry name before that refactor)
+        for (int w = 0; w < VM_WAYS; w++) {
+            const vmemo *m = &s[w];
+            if (m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && m->im)
+                return in_fb(m->im) ? (m->im->f.kind >= 3 ? 2 : 1) : 0;
+        }
     }
     return vka_tex_id_in_pass(id);
 }
