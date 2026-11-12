@@ -476,6 +476,7 @@ void vka_db_start(unsigned slot);                    // a submission begins on i
 void vka_db_set_fence(uint64_t fence);               // the fence the submission being recorded will signal
 VkDeviceSize vka_db_alloc(VkDeviceSize n);            // an offset in the slot's region; UINT64_MAX = full
 void vka_db_bind(VkCommandBuffer cb);                // vkCmdBindDescriptorBuffersEXT, once per command buffer
+uint8_t *vka_db_ptr(VkDeviceSize off);               // the mapped descriptor buffer at that offset, NULL out of range
 VkDeviceAddress vka_db_buffer_address(VkBuffer b);    // cached vkGetBufferDeviceAddress (the buffer descriptors name one)
 
 // ---------- Pipelines (vka_pso.c) ----------
