@@ -187,7 +187,9 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-    lint { abortOnError false; checkReleaseBuilds false }
+    // checkReleaseBuilds: assembleRelease (the apk task) then runs lintVital, the only check that sees a Java call above minSdk (NewApi) - the
+    // InputStream.readAllBytes class that reached an Android 12 user; the NDK target checks native symbols only. Not fatal yet: it reports into the build log
+    lint { abortOnError false; checkReleaseBuilds true }
 }
 
 // The log digest's tables (ExitWatch's notice, LogDigest.java): dm/tools/log_rules.tsv and log_noise.tsv, the files dm/tools/log_digest.py reads, copied at every build
