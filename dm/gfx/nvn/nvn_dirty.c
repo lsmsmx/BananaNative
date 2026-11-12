@@ -35,7 +35,7 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // Ranges are rounded to host pages (16 KB) but guest memory pools are only 4 KB aligned: adjacent pools share their first / last pages, so one address can fall in several registered ranges.
 // So: "is this texture tracked" looks for a range that holds its whole span; a fault / host pre-write unprotects and stamps every range covering that page; pool destruction identifies its range by the pool's exact start mem.
 // (Previously the first range containing the address was always taken: two SMBW ASTC 6x5 textures whose pool's first page is shared with a small preceding pool were judged untracked and re-uploaded on every use, about 6 MB per frame)
-typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; uint8_t *ever; size_t cap; _Atomic int live, red; } range_t;   // red: a write protection in it failed (logged once)
+typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; uint8_t *ever; size_t cap; _Atomic int live, red; _Atomic uint64_t gmax; _Atomic uintptr_t last; } range_t;   // red: a write protection in it failed (logged once); gmax: the newest page generation in the range, so a query can say "nothing written since" without walking; last: that page's index, so it can say "something was" without walking too
 static _Atomic(range_t *) g_blk[NBLK];
 static inline range_t *rg(int i) { return &atomic_load_explicit(&g_blk[i >> BLK_SHIFT], memory_order_acquire)[i & (BLK - 1)]; }
 static _Atomic int g_nr;
@@ -106,7 +106,10 @@ static void block_bounds(const range_t *r, uintptr_t *p, uintptr_t *q) {
     *p = (a - r->base) >> g_shift; *q = (b - r->base) >> g_shift;
 }
 static void stamp_page(range_t *r, uintptr_t p) {
-    atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
+    { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[p], g);
+      uint64_t cur = atomic_load(&r->gmax);   // (a max, not a store: two writers may reach the two stores out of order)
+      while (g > cur && !atomic_compare_exchange_weak(&r->gmax, &cur, g)) {}
+      atomic_store_explicit(&r->last, p, memory_order_relaxed); }   // the newest write's page, as the query's hint (a stale read only costs the walk, never an answer)
     // Publish completion after the generation: a checker may have cached "clean" using the incremented clock before the generation store. Both fault and host-write paths
     // must invalidate that cached clock, as the page stays writable until the next upload protects it again.
     atomic_fetch_add(&g_now, 1);
@@ -215,7 +218,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     } else {
         memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset(ever, 0, np);
     }
-    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->ever = ever; atomic_store(&r->red, 0);
+    r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->ever = ever; atomic_store(&r->red, 0); atomic_store(&r->gmax, 0); atomic_store(&r->last, ~(uintptr_t)0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
@@ -329,7 +332,12 @@ int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_
     range_t *r = (range_t *)span; uintptr_t a0 = (uintptr_t)addr;   // the kept handle still holds the span (a slot reused by another pool over the same memory is as good): no scan
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a0 < r->base || a0 + len > r->end) r = find_span(a0, len);
     if (!r) return 1;   // When untracked, conservatively treat as dirty: better to upload more than to show stale content
+    if (atomic_load_explicit(&r->gmax, memory_order_acquire) <= stamp) return 0;   // (no page of it written since: the walk below was 65k loads for an 8192² image)
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    // The newest write in the range, in one load: on the phone the walk was up to 81922 loads for a big image whose newest write sat near its end, and the sweep over the
+    // tracked textures did it for every one of them (12 ms a frame in a long session). A stale hint only falls through to the walk
+    uintptr_t li = atomic_load_explicit(&r->last, memory_order_relaxed);
+    if (li >= p && li <= q && atomic_load(&r->gen[li]) > stamp) return 1;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
@@ -340,6 +348,7 @@ int nvn_dirty_bounds_since(const void *span, const void *addr, size_t len, uint6
     range_t *r = (range_t *)span; uintptr_t a = (uintptr_t)addr;
     if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
     if (!r) return 1;
+    if (atomic_load_explicit(&r->gmax, memory_order_acquire) <= stamp) return 0;   // (nothing in it written since: see nvn_dirty_since_span)
     uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift, f = UINTPTR_MAX, l = 0;
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) { if (f == UINTPTR_MAX) f = i; l = i; }
     if (f == UINTPTR_MAX) return 0;

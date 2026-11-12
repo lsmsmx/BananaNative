@@ -16,6 +16,8 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#include <sched.h>
+#include <errno.h>
 
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
 void dm_guest_thread_join(void *tt);
@@ -28,7 +30,19 @@ void dm_pcmout_wait(void *k, int ms);
 
 // P_SIZE: bytes of the game's AudioRendererParameter copied before the two fields are changed. SDK 16's struct is 0x38 bytes; SDK 8's (Link's Awakening) has one more word,
 // its revision at +0x38: copying only 0x38 left the revision uninitialized and the SDK rejected it (CheckValidRevision, Result 0x499). The SDK reads only its own size of the copy
-enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF = 4 };
+enum { P_DEVICE = 0x2c, P_MODE = 0x30, P_SIZE = 0x40, WORK_PAGE = 0x1000, FRAME_MAX = 1024, NBUF_MAX = 16 };
+// DM_AUDIO_BUFS (default 8): how many 5 ms blocks the render thread keeps in flight. Each block is slack against the render (or the sound card) being late: at 4 that is
+// 20 ms, which a cycle of 25-320 ms walks straight through (hle_audren.c's own DM_AUDIO_RENDER_STALL_MS lines on the phone), at 8 it is 40. It costs that much audio latency
+static int aud_bufs(void) { const char *e = getenv("DM_AUDIO_BUFS"); int n = e ? atoi(e) : 8; if (n < 2) n = 2; if (n > NBUF_MAX) n = NBUF_MAX; return n; }
+// DM_AUDIO_AFF=<mask> (default 0, off; 128 = the last core): pins this render thread, so the game's own threads cannot crowd it off a core. The replay thread has the same
+// kind of switch (DM_VK_AFF_REPLAY, vka_worker.c); this one is for the thread an AudioOut underrun is counted against
+static void aud_affinity(void) {
+    const char *e = getenv("DM_AUDIO_AFF"); unsigned m = e ? (unsigned)strtoul(e, NULL, 0) : 0;
+    if (!m) return;
+    cpu_set_t cs; CPU_ZERO(&cs); for (int c = 0; c < CPU_SETSIZE && c < 32; c++) if (m >> c & 1) CPU_SET(c, &cs);
+    if (sched_setaffinity(0, sizeof cs, &cs)) LOG("[RED] audren: DM_AUDIO_AFF=%#x refused (errno %d)", m, errno);
+    else LOG("audren: render thread pinned to the cores of %#x", m);
+}
 static void *gsym(const char *n) { void *p = guest_sym(n); if (!p) die("audren: missing SDK symbol %s", n); return p; }
 static void cpu_manual(uint8_t *dst, const uint8_t *src) { memcpy(dst, src, P_SIZE); *(int32_t *)(dst + P_DEVICE) = 1; *(int32_t *)(dst + P_MODE) = 1; }
 
@@ -93,24 +107,35 @@ static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_
 static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
 
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
+// DM_AUDIO_RENDER_STALL_MS (default 25, 0 off): a cycle of this thread longer than that is logged with its two parts -- the wait for the output to hand a block back, and
+// the render with the append. The thread is host-created, so the audio watchdog's stall dump cannot show it ("priority 9" is in no dump); and "nothing appended for 50 ms",
+// which is what an AudioOut underrun looks like from hle_audio.c, is exactly a cycle of this length, with these two numbers saying which half of it it was
+static uint64_t render_stall_ms(void) { const char *e = getenv("DM_AUDIO_RENDER_STALL_MS"); return e ? (uint64_t)atoi(e) : 25; }
 static void render_main(void *arg) {
     (void)arg;
     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
     void *out = dm_pcmout_open(2);
-    static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
-    for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+    static int16_t data[NBUF_MAX][FRAME_MAX * 2]; static gbuf bufs[NBUF_MAX]; gbuf *free_list[NBUF_MAX]; int nb = aud_bufs(), nfree = nb;
+    for (int i = 0; i < nb; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+    aud_affinity();
     dm_pcmout_start(out);
-    LOG("audren: render thread started (%d buffers in flight, paced by the output)", NBUF);
+    LOG("audren: render thread started (%d buffers in flight, paced by the output; DM_AUDIO_BUFS)", nb);
+    uint64_t lim_ms = render_stall_ms(), tlast = now_ns(); int nstall = 0;
     while (atomic_load(&g_open)) {
+        struct timespec ct0; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct0);   // this thread's own CPU time: a cycle that took 300 ms of wall time with 5 ms of it on the CPU
+        uint64_t tw0 = now_ns(), wait_ns = 0; int waited = 0;
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
             if (b) { free_list[nfree++] = b; break; }
+            uint64_t w0 = now_ns(); waited++;
             dm_pcmout_wait(out, 10);
+            wait_ns += now_ns() - w0;
             if (!atomic_load(&g_open)) break;
         }
         if (!nfree) break;
         const int16_t *src; int got;
         uint32_t h = atomic_load(&g_cq_head);
+        uint64_t t1 = now_ns();
         if (h != atomic_load(&g_cq_tail)) { src = g_cq[h % CQ]; got = g_cq_n[h % CQ]; atomic_store(&g_cq_head, h + 1); cq_popped(); }   // play queued catch-up output first
         else { g_frame_n = 0; exec(g_handle[0], g_handle[1]); src = g_frame; got = g_frame_n; }   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
         int n = got ? got : 240;
@@ -118,6 +143,14 @@ static void render_main(void *arg) {
         if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
         b->size = (uint64_t)n * 4;
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
+        {   uint64_t t2 = now_ns(), cycle = t2 - tlast; tlast = t2;
+            struct timespec ct1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ct1);
+            double cpu_ms = ((double)(ct1.tv_sec - ct0.tv_sec) * 1e3 + (double)(ct1.tv_nsec - ct0.tv_nsec) / 1e6);
+            if (lim_ms && cycle > lim_ms * 1000000ull && nstall++ < 24)
+                LOG("audren: %.1f ms between frames (%.0f frames so far): %.1f ms waiting for the output to hand a block back (%d wait(s) of up to 10 ms), "
+                    "the render and the append %.1f ms, of the cycle %.1f ms on this thread's CPU -- a cycle this long is what an underrun looks like from the output's side",
+                    cycle / 1e6, (double)g_frames, wait_ns / 1e6, waited, (t2 - t1) / 1e6, cpu_ms);
+        }
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
     cq_popped();   // an update waiting for queue space (catch-up pacing) sees g_open cleared

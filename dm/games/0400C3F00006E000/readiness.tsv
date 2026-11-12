@@ -5,8 +5,11 @@
 # Playable on the tested 16 GB phone (the user's check, 2026-11-08); Supported on the player pages
 status	playable
 
-# Memory: plays on the 16 GB phone (14.66 GiB totalMem; earlier builds were stopped there by the low-memory killer about 20 s in, the note); nothing less has run it
-required	ram_gib	14	Memory: the game needs a 16 GB phone (14 GiB reported); 12 GB phones run out of memory
+# Memory: the row was "required 14" from the 16 GB phone it was brought up on (14.66 GiB totalMem; builds of that time were stopped by the low-memory killer about
+# 20 s in). Since guest memory lives in files (DM_GUEST_FILE, host hle_svc.c) the phone's own RAM is no longer what limits it: the 10.9 GiB phone plays for hours at
+# 4-6 GB resident, and it was that phone the required row stopped at every launch with "Missing: Memory". Degraded at 10 GiB: a phone under it is told it runs with
+# less and may be stopped, one over it sees nothing
+degraded	ram_gib	10	Memory: the game keeps 4-6 GB in use with its guest memory in files (DM_GUEST_FILE); a phone reporting less may be stopped by Android when memory runs short
 
 # The shader library: 168 compute shaders take 49,152 bytes of shared memory (shader_facts.tsv), more than Vulkan's minimum of 16 KiB. The tested phone reports 32,768
 # (Adreno 840, Qualcomm 718a07726a) and the game still reaches its first frames there, so the row is degraded, not required: what those dispatches do above the limit

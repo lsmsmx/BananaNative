@@ -204,8 +204,14 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn, int s
     g_mnt[g_nmnt].txn_root = -1;
     atomic_store(&g_mnt[g_nmnt].poison, 0);
     atomic_store(&g_mnt[g_nmnt].first_write_ns, 0);
-    if (!strcmp(name, "rom") && getenv("DM_ROMFS_OVERLAY"))
-        strlcpy(g_mnt[g_nmnt].overlay, getenv("DM_ROMFS_OVERLAY"), sizeof g_mnt[0].overlay);
+    // The mods overlay (DM_ROMFS_OVERLAY) goes on the mounts that carry the game's own files: "rom" (the Switch 1 SDK's MountRom) and "content" (the Switch 2 one). It used
+    // to be attached only to "rom", so on Mario Kart World -- which mounts its data as content: -- the switch did nothing at all; a path that cannot be found says so
+    if ((!strcmp(name, "rom") || !strcmp(name, "content")) && getenv("DM_ROMFS_OVERLAY") && *getenv("DM_ROMFS_OVERLAY")) {
+        const char *ov = getenv("DM_ROMFS_OVERLAY"); strlcpy(g_mnt[g_nmnt].overlay, ov, sizeof g_mnt[0].overlay);
+        size_t k = strcspn(ov, ":");
+        if (*ov != '/') LOG("[RED] DM_ROMFS_OVERLAY=%s: not an absolute path, and the game's files are read by absolute path: this overlay finds nothing", ov);
+        else { char first[1100]; if (k < sizeof first) { memcpy(first, ov, k); first[k] = 0; if (access(first, R_OK)) LOG("[RED] DM_ROMFS_OVERLAY=%s: %s cannot be read: this overlay finds nothing", ov, first); } }
+    }
     // The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only -- saves still read, every write fails, commits are no-ops, the committed version is untouched, and the front end is told
     // (each of these three failures used to call die: with the phone's storage full the game exited as soon as it mounted its saves)
     int txn_err = 0, k = 0;

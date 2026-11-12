@@ -1,0 +1,138 @@
+name: build-apk
+
+# Builds the Android APK for Mario Kart World (0400C3F00006E000) and uploads it
+# as a workflow artifact. No game code or game data is in the repo or the APK:
+# the pack is still made on the phone from the user's own dump.
+#
+# Two upstream assumptions are patched for a Linux runner below:
+#   * android/ondevice/build.sh hard-codes the NDK's darwin-x86_64 llvm-strip
+#   * it calls `shasum`, which GitHub's Ubuntu image does not ship
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ android ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/28.2.13676358
+      # 120 s instead of the default 10 s: the runner's route to services.gradle.org
+      # and Maven Central is the flakiest part of this job
+      GRADLE_OPTS: -Dorg.gradle.internal.http.connectionTimeout=120000 -Dorg.gradle.internal.http.socketTimeout=120000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf "$ANDROID_SDK_ROOT/emulator" "$ANDROID_SDK_ROOT/system-images" || true
+          df -h /
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: .NET 10 (NativeAOT translator)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # The wrapper downloads its Gradle distribution on first use, and that
+      # download is a single request with a 10 s socket timeout: on a bad runner
+      # day it times out and the whole job dies before a line of code runs
+      # ("Downloading gradle-8.14.3-bin.zip failed: timeout (10000ms)").
+      # This action fetches the version the wrapper names itself, caches it
+      # between runs, and the two timeouts below give the network room.
+      - name: Gradle (cached, with the wrapper's version)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+          cache-read-only: false
+
+      - name: Install SDK packages
+        run: |
+          # Not android-actions/setup-android: it insists on installing the
+          # legacy "tools" package, which current SDK images no longer publish
+          # ("Failed to find package 'tools'"), and the whole job dies there.
+          # The runner image already has cmdline-tools, so drive sdkmanager.
+          SDKM=$(ls "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | tail -1)
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null 2>&1 || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0" \
+                  "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "--- ndk ---"; ls "$ANDROID_SDK_ROOT/ndk"
+          echo "--- cmake ---"; ls "$ANDROID_SDK_ROOT/cmake"
+
+      - name: DNS for the package mirrors
+        run: |
+          # This runner's resolver has failed for archive.ubuntu.com, security.ubuntu.com and
+          # azure.archive.ubuntu.com while packages.microsoft.com resolved (2026-11-11), and it
+          # stayed broken across reruns. When the first look-up fails, pin public resolvers and
+          # print both states; the apt step below retries either way.
+          cat /etc/resolv.conf || true
+          if ! getent hosts archive.ubuntu.com; then
+            echo "resolver failed for archive.ubuntu.com: pinning 1.1.1.1 / 8.8.8.8"
+            sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+            cat /etc/resolv.conf
+            getent hosts archive.ubuntu.com || echo "[RED] still no resolution for archive.ubuntu.com"
+          fi
+
+      - name: Build deps, shasum shim, Linux port of build.sh
+        run: |
+          # apt in three tries, with its own HTTP timeouts and IPv4 forced: a resolver hiccup on the
+          # runner used to stall 5 s per host, per index and per package and then end the job (exit
+          # 100) after ten minutes of "Temporary failure resolving"
+          ok=""
+          for i in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::ForceIPv4=true update \
+               && sudo apt-get install -y -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::ForceIPv4=true \
+                    zsh ninja-build cmake git curl zlib1g-dev; then ok=1; break; fi
+            echo "apt attempt $i failed (transient DNS?); retrying in 10 s"; sleep 10
+          done
+          [ -n "$ok" ] || { echo "apt-get failed after 3 attempts"; exit 1; }
+          cmake --version; ninja --version; zsh --version
+          sudo tee /usr/local/bin/shasum > /dev/null <<'EOF'
+          #!/bin/sh
+          [ "$1" = "-a" ] && [ "$2" = "256" ] && shift 2
+          exec sha256sum "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/shasum
+          sed -i 's|\$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin/llvm-strip|\$BIN/llvm-strip|' \
+            android/ondevice/build.sh
+          grep -n llvm-strip android/ondevice/build.sh
+
+      - name: Packer stage (CPython, capstone, lz4, translator, SPIRV-Tools)
+        run: zsh android/ondevice/build.sh "$RUNNER_TEMP/packer"
+
+      - name: APK (Mario Kart World)
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > android/app/local.properties
+          cd android/app
+          ./gradlew --no-daemon \
+            -PnxPackStage="$RUNNER_TEMP/packer/stage" \
+            -PnxGames=0400C3F00006E000 \
+            -PnxApp=mkw \
+            apk
+          ls -la out/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxnative-android-mkw
+          path: android/app/out/*.apk
+          if-no-files-found: error

@@ -49,7 +49,9 @@
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdSetDepthBias) X(vkCmdSetDepthBiasEnable) \
     X(vkCmdSetRasterizerDiscardEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants) X(vkCmdSetLineWidth) \
     X(vkCmdPushDescriptorSetKHR) X(vkCmdSetVertexInputEXT) X(vkCmdPushConstants) X(vkCmdDrawMeshTasksEXT) X(vkCmdDrawMeshTasksIndirectEXT) \
-    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount)
+    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) \
+    X(vkCmdBindDescriptorBuffersEXT) X(vkCmdSetDescriptorBufferOffsetsEXT) X(vkGetDescriptorEXT) X(vkGetDescriptorSetLayoutSizeEXT) \
+    X(vkGetDescriptorSetLayoutBindingOffsetEXT)
 #define VKA_DECL(f) PFN_##f f;
 typedef struct { PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr; VKA_GLOBAL_FNS(VKA_DECL) VKA_INSTANCE_FNS(VKA_DECL) VKA_DEVICE_FNS(VKA_DECL) } vka_fns;
 extern vka_fns vk;   // a missing optional entry point is NULL
@@ -78,6 +80,7 @@ void vka_gpu_floor(void);               // mtl_sub_begin: DM_VK_GPU_FLOOR's GPU 
 void vka_ctl_sub(void);                 // mtl_sub_begin: live switches queued since the last frame are applied
 void vka_ctl_frame(uint64_t f);         // mtl_set_frame: per-frame counters for "capture" and "stats"
 void vka_exec_counts(uint64_t *ops, uint64_t *subs, uint64_t *rec_ns);   // vka_exec.c: clears / copies, submissions, recording time so far
+void vka_rec_prof_line(char *b, size_t n);   // DM_VK_REC_PROF: the record walk by record kind since the last call, for the pace line
 
 // ---------- Device (vka_dev.c) ----------
 typedef struct {
@@ -91,6 +94,8 @@ typedef struct {
     int imageless;   // imagelessFramebuffer (Vulkan 1.2): classic render passes need it (DM_VK_CLASSIC_RP)
     int draw_count;                                 // drawIndirectCount (Vulkan 1.2): an indirect-count multi-draw's count read by the GPU (vka_draw.c vka_mdi_gpu)
     int push_desc, vin_dyn, null_desc, idx8, divisor, logic_op, dual_src, geom, tess, depth_clamp, fill_lines, depth_bias_clamp, multi_vp, a2c;
+    int db;                                         // VK_EXT_descriptor_buffer (DM_VK_DESC_BUF=1): set 0 written as descriptors in a buffer, bound by offset (vka_pso.c, vka_draw.c)
+    VkPhysicalDeviceDescriptorBufferPropertiesEXT dbprops;   // its descriptor sizes (combined image sampler, sampled image, sampler, uniform / storage buffer)
     int vstores, fstores;   // vertexPipelineStoresAndAtomics, fragmentStoresAndAtomics: texture-use feedback of the pool (vka_tex.c "Texture pool reads") writes from those stages
     // NVN2 task and mesh programs (VK_EXT_mesh_shader: mesh = meshShader, task = taskShader too; DM_VK_MESH=0 leaves it off): their shaders are refused without it (vka_shader.c refusal)
     // and their draws skipped. mesh_inv / task_inv: the largest workgroup (maxMeshWorkGroupInvocations / maxTaskWorkGroupInvocations); mesh_out_v / mesh_out_p: the most vertices /
@@ -296,6 +301,9 @@ typedef struct vka_img {
     struct vka_img *zold;    // the zero-shared image it left while a holder had it (vka_tex.c img_own): destroyed once holds drop to 0
     // Large images (DM_VK_BIGIMG_MB, vka_tex.c "Large images"): draws that bound it for sampling, other textures found over its storage (the first serials)
     uint32_t nsamp, novl; uint64_t ovl[4];
+    // The video decoder pools' generation at which this image was last asked whether its storage is one of theirs (dm_codec_is_video_mem, a lock and a 64-slot scan), so
+    // the question is asked once per pool-set change and not for every image of every submission (vka_tex_prepare; measured at ~6 ms a frame on the phone)
+    uint32_t vchk;
     // A soft texture's image (vka_soft.h, profile tex_soft): base 1, its finest level left out; soft_saved: the storage bytes that level takes (the stats' soft line)
     uint8_t soft; uint64_t soft_saved;
     // The texture cache's own bookkeeping (vka_tex.c "Live images"): its place in the live list + 1 (0: not in it), the next live image in its storage address's chain,
@@ -376,10 +384,12 @@ int vka_swap_rb(void);
 VkImageView vka_tex_id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout);   // texture ID id as a view of shape dim (DMSH_VK_DIM_*); VK_NULL_HANDLE = none fits
 void vka_tex_id_desc(int id, char *b, size_t n);   // texture ID id described for a [RED] line
 void vka_tex_id_peek(int id, char *b, size_t n);   // the same with its storage address and its image's (DM_VK_TEX_PEEK)
+void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw, uint64_t *sweep);   // vka_tex_prepare's phases, cumulative ns (the pace line)
 void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n);   // the open pass's attachments and their levels (n 0: none), for vka_tex_id_view
 int vka_tex_id_in_pass(int id);   // texture ID id's image is an attachment of the open pass (1 = colour, 2 = depth / stencil, 0 = neither)
 int vka_tex_id_in_pass_rec(int id, uint8_t dim);
 int vka_tex_id_target(int id);                      // the NVN target texture ID id stands for (its view's), -1 = not registered
+int vka_tex_id_target_rec(int id);                  // the same, memoized for the recording thread (the frame path asks it for every binding with no view of the shape it wants)
 int vka_tex_id_pending(int id);                     // texture ID id is registered and its image is not made yet (its first use records commands)
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout);   // the same on the recording thread, through a memo (DM_VK_TEX_MEMO)
 VkFormat vka_tex_id_vkfmt(int id);   // the format texture ID id is viewed in, not its (possibly shared) image's (vka_tex.c)
@@ -389,6 +399,12 @@ int vka_tex_id_storage_pending(int id);            // texture ID id's image exis
 int vka_tex_id_class(int id);                       // the numeric class of texture ID id's view format: 1 uint, 2 sint, 0 other
 int vka_tex_id_class_rec(int id);                   // the same, memoized for the recording thread (by the ID's registration version)
 VkSampler vka_samp_id_rec(int id);
+void vka_tex_memo_stats(uint64_t *hit, uint64_t *other, uint64_t *ver, uint64_t *infb, uint64_t *gen);   // the view memo's answers and its misses by reason (the pace line)
+uint64_t vka_samp_memo_stats(uint64_t *hit, uint64_t *try_n);   // the sampler memo's lookups and its answers (the same line)
+uint64_t vka_tex_gen(void);                        // the view memo's global generation (map_del / map_del_im)
+uint32_t vka_tex_ver(int id);                      // texture ID id's registration version, as the view memo keys it
+uint32_t vka_samp_ver(int id);                      // sampler ID id's version, as the sampler memo keys it
+uint64_t vka_tex_fb_gen(void);                      // the open pass's attachment set (vka_tex_feedback)
 VkSampler vka_samp_id(int id);                      // sampler ID id; VK_NULL_HANDLE = not registered
 VkSampler vka_samp_default(void);                   // the sampler an unbound sampler slot reads with (nearest, clamp to edge)
 
@@ -463,7 +479,10 @@ int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out);   // host-vis
 
 // ---------- Pipelines (vka_pso.c) ----------
 #include "vka_gkey.h"   // vka_gkey: what a graphics pipeline is made from beyond its shaders and layout (Vulkan-free: the prewarm list's unit test reads it)
-typedef struct { VkPipelineLayout layout; VkDescriptorSetLayout set0; int push; uint32_t ndesc; } vka_layout;
+typedef struct { uint16_t binding; uint32_t off; } vka_db_off;   // a set-0 binding and its offset in the descriptor-buffer layout
+typedef struct { VkPipelineLayout layout; VkDescriptorSetLayout set0; int push; uint32_t ndesc;
+                 VkPipelineLayout db_layout; VkDescriptorSetLayout db_set0; VkDeviceSize db_size;   // VK_EXT_descriptor_buffer (DM_VK_DESC_BUF): the same bindings, set 0 in a buffer
+                 uint32_t db_n; vka_db_off *db_off; } vka_layout;   // db_n/db_off: each binding's offset in db_set0 (vkGetDescriptorSetLayoutBindingOffsetEXT)
 int vka_layout_of(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out);   // the set-0 layout of these stages' records with the pools' set 1
 VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k);
 VkPipeline vka_cs_pipeline(vka_shader *cs, const vka_layout *lay);

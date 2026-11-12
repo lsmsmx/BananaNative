@@ -9,7 +9,7 @@
 #include <stdint.h>
 
 #define VKTL_MIB (1ull << 20)
-enum { VKTL_KEEP_FRAMES = 2,      // an image used in the current or the previous frame stays
+enum { VKTL_KEEP_FRAMES = 2,      // an image used this frame or the last stays (the minimum; DM_VK_IMG_KEEP_FRAMES raises it, see vktl_evictable)
        VKTL_GPU_FRAMES = 120 };   // an image whose content is only the GPU's (rendered, not uploaded) stays this long unused, and goes after every image that can be uploaded again
 #define VKTL_FLOOR (512 * VKTL_MIB)
 
@@ -58,9 +58,16 @@ static inline uint64_t vktl_target(uint64_t limit) { return limit - limit / 16; 
 
 // Whether an image may be evicted now: not held from outside the recording thread, not a playing video's, its last submission done, unused for VKTL_KEEP_FRAMES frames
 // (VKTL_GPU_FRAMES when its content is the GPU's). last_frame 0 = never used (kept: it was just made)
-static inline int vktl_evictable(uint64_t cur_frame, uint64_t last_frame, int holds, int gpu_owned, int video_playing, int fence_pending) {
+// keep_frames: how many frames an image used recently is kept whatever the limit says (VKTL_KEEP_FRAMES at least; DM_VK_IMG_KEEP_FRAMES, live, sets it). With a limit
+// under the working set every image that is in use is a candidate and the cache evicts what the next frames need, then uploads it again (the phone's log: 76 prunes,
+// "evicted 524 images unused for 3+ frames", a frame with 488 uploads of 81 MB and 41,706 major page faults) -- a stall far worse than the memory it saved
+static inline int vktl_evictable2(uint64_t cur_frame, uint64_t last_frame, int holds, int gpu_owned, int video_playing, int fence_pending, unsigned keep_frames) {
     if (holds || video_playing || fence_pending || !last_frame || cur_frame <= last_frame) return 0;
-    return cur_frame - last_frame >= (uint64_t)(gpu_owned ? VKTL_GPU_FRAMES : VKTL_KEEP_FRAMES);
+    if (gpu_owned) return cur_frame - last_frame >= (uint64_t)VKTL_GPU_FRAMES;   // (content only the GPU has: kept longer, and gone after every image that can be uploaded again)
+    return cur_frame - last_frame >= (uint64_t)(keep_frames ? keep_frames : VKTL_KEEP_FRAMES);
+}
+static inline int vktl_evictable(uint64_t cur_frame, uint64_t last_frame, int holds, int gpu_owned, int video_playing, int fence_pending) {
+    return vktl_evictable2(cur_frame, last_frame, holds, gpu_owned, video_playing, fence_pending, VKTL_KEEP_FRAMES);
 }
 // Eviction order: images that can be uploaded again before GPU-only ones, then least recently used first (qsort-style: < 0 = a goes first)
 static inline int vktl_order(int gpu_a, uint64_t last_a, int gpu_b, uint64_t last_b) {

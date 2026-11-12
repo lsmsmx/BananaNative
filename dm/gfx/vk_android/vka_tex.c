@@ -27,6 +27,7 @@
 
 __attribute__((weak)) int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) { (void)mem; (void)size; (void)stride; return 0; }
 __attribute__((weak)) uint64_t dm_codec_video_gen(const void *mem) { (void)mem; return 0; }
+__attribute__((weak)) uint32_t dm_codec_pool_gen(void) { return 1; }   // 1, not 0: an image's vchk starts 0, so a build without hle_codec_video.c asks once and never again
 __attribute__((weak)) uint64_t dm_codec_video_epoch(void) { return 1; }    // (no codec: no video pool, ever)
 __attribute__((weak)) uint64_t dm_codec_video_writes(void) { return 0; }
 __attribute__((weak)) int dm_movie_playing(void) { return 0; }
@@ -214,6 +215,8 @@ void vka_tex_alias_stats(char *b, size_t n) {
 static _Atomic uint32_t g_tgen, *g_tver, *g_sver;   // the recording thread's view memo: see unref_locked
 static smap_ent *map_get(uint64_t s) { return vksm_get(&g_smap, s); }
 static void map_put(uint64_t s, vka_img *im) { vksm_put(&g_smap, s, im); }   // (no memory for a new key: the texture has no entry, so its next lookup makes its image again; the old image goes when its refs do)
+typedef struct { tex_t t; view_t v; uint8_t has_v, img; uint64_t pgen; } treg_ent;   // pgen: the texture's pool's Initialize serial at registration (nvn_pool_live)
+static treg_ent *g_treg; static int g_ntreg;   // indexed by host texture ID
 static void map_del(uint64_t s) { if (vksm_del(&g_smap, s)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }   // a tombstone (never a valid serial)
 static void map_del_im(vka_img *im) { if (im && vksm_del_im(&g_smap, im)) atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release); }
 static int cpuw_take(uint64_t s, int add) {   // add: insert; else: remove and say whether it was there
@@ -954,6 +957,26 @@ static uint8_t *unmapped_content(const tex_t *t) {
                                                               (unsigned long long)u, (unsigned long long)((t->L.size + 4095) >> 12), (const void *)t->mem);
     return c;
 }
+// DM_GUEST_FILE: the guest's pages are a file's, and the kernel evicts them under pressure -- the phone's logs show thousands of major faults inside one frame, and a
+// texture upload reads a whole range at once, so each missing page is a random 4 KB read faulted one at a time; asking for the range first lets the kernel read it ahead in
+// one go. The threshold was 1 MiB, which skipped every texture a game streams in small pieces (the phone's freeze: draw-idx 302 us a draw against 13 us normally, with 1547
+// major faults in the frame -- the draws were resolving new textures whose storage had been evicted); 64 KiB is the smallest read-ahead worth a syscall
+int dm_guest_file_backed(void);
+// MADV_WILLNEED on the whole range first: the kernel starts the read-ahead and returns, so the caller's own copy faults pages that are already on their way. A second pass
+// with MADV_POPULATE_READ waits until every page is in memory -- synchronous, but it turns "40 faults at 4 KB, each a storage round trip" into one request the kernel can
+// merge, which is what a 341 MB target or a sequence of small textures being resolved in one draw needs. DM_GUEST_PREFAULT=0 keeps the asynchronous form only;
+// MADV_POPULATE_READ is Linux 5.14 (the phone is on 4.9, where madvise returns EINVAL and the call is simply not made again)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+static void guest_prefetch(const void *p, uint64_t n) {
+    if (!p || n < (16u << 10) || !dm_guest_file_backed()) return;
+    void *a = (void *)((uintptr_t)p & ~(uintptr_t)0xFFF); size_t len = (size_t)n + 0x1000;
+    madvise(a, len, MADV_WILLNEED);
+    static int pop = -1;
+    if (pop < 0) { const char *e = getenv("DM_GUEST_PREFAULT"); pop = !(e && *e == '0'); }
+    if (pop && madvise(a, len, MADV_POPULATE_READ) && pop) { pop = 0; VLOG("guest pre-fault: MADV_POPULATE_READ is not supported here (errno %d): the read-ahead only", errno); }
+}
 static uint64_t ft_hash(uintptr_t lo, uintptr_t hi) {
     const uint8_t *p = (const uint8_t *)lo; size_t n = hi - lo, i = 0; uint64_t h = 0x9e3779b97f4a7c15ull ^ n, w;
     for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h ^= w * 0x87c37b91114253d5ull; h = ((h << 31) | (h >> 33)) * 0x4cf5ad432745937full; }
@@ -997,6 +1020,7 @@ static int img_edges_clean(vka_img *im) {
     return 1;
 }
 static void upload_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // stamp, protect, then read (nvn_mtl.m pkg_upload): a write during the copy is seen at the next check
+    guest_prefetch(t->mem, t->L.size);
     im->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);
     img_edges_take(im);
     if (vka_nan_on()) im->hash = mem_hash(t->mem, t->L.size);
@@ -1007,6 +1031,7 @@ static void upload_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   
         if (!im->snap) im->snap = malloc(256); if (im->snap) memcpy(im->snap, t->mem, t->L.size < 256 ? t->L.size : 256); }
 }
 static void upload_fill(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // the same without tracking (ST_FILL)
+    guest_prefetch(t->mem, t->L.size);
     uint8_t *c = im->vpool ? NULL : gw_content(t->mem, t->L.size, &im->gw_seen);
     if (!c && !im->vpool) c = unmapped_content(t);
     if (c) { tex_t tc = *t; tc.mem = c; upload(im, &tc, cb); free(c); g_gw_over++; } else upload(im, t, cb);
@@ -1260,8 +1285,6 @@ static void sparse_bind(vka_img *im, VkCommandBuffer cb, int all) {
 }
 static void dirty(int **list, int *n, int *cap, uint8_t **flag, int nslots, int id);
 static int *g_tdirty, g_ntd, g_tdcap; static uint8_t *g_tdflag;
-typedef struct { tex_t t; view_t v; uint8_t has_v, img; uint64_t pgen; } treg_ent;   // pgen: the texture's pool's Initialize serial at registration (nvn_pool_live)
-static treg_ent *g_treg; static int g_ntreg;   // indexed by host texture ID
 // The image made again from texture level base (caller holds g_tmu): the old image, its memory and views go when the GPU is done with them, and the texture IDs that name it
 // are written again at this submission (vka_tex_prepare); then everything is uploaded
 static uint64_t g_rebase;
@@ -1614,16 +1637,18 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
     uint64_t imgs = g_img_bytes + vka_imem_zbytes();
     int env = VKA_ENV("DM_VK_IMG_LIMIT_MB", 0);
     vktl_in in = {.img_bytes = imgs, .psi_some10 = -1};
+    // Memory pressure (vktl_pressure_limit): "some avg10=" of /proc/pressure/memory; DM_VK_IMG_PSI=0 leaves it out.
+    // Read even when DM_VK_IMG_LIMIT_MB is set: a fixed limit that ignores pressure never yields, so the kernel
+    // takes the guest's pages instead and the replay faults them all back (a 12 GB phone at 2560: 10-13 fps)
+    if (VKA_ENV("DM_VK_IMG_PSI", 1)) {
+        int pf = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC);
+        if (pf >= 0) { char pb[256]; ssize_t pn = read(pf, pb, sizeof pb - 1); close(pf);
+                       if (pn > 0) { pb[pn] = 0; const char *a = strstr(pb, "some avg10="); if (a) in.psi_some10 = strtod(a + 11, NULL); } }
+    }
     if (env <= 0) {
         int fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC);
         if (fd >= 0) { char buf[2048]; ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
                        if (n > 0) { buf[n] = 0; in.mem_total = meminfo_kb(buf, "MemTotal:") << 10; in.mem_avail = meminfo_kb(buf, "MemAvailable:") << 10; } }
-        // Memory pressure (vktl_pressure_limit): "some avg10=" of /proc/pressure/memory; DM_VK_IMG_PSI=0 leaves it out
-        if (VKA_ENV("DM_VK_IMG_PSI", 1)) {
-            int pf = open("/proc/pressure/memory", O_RDONLY | O_CLOEXEC);
-            if (pf >= 0) { char pb[256]; ssize_t pn = read(pf, pb, sizeof pb - 1); close(pf);
-                           if (pn > 0) { pb[pn] = 0; const char *a = strstr(pb, "some avg10="); if (a) in.psi_some10 = strtod(a + 11, NULL); } }
-        }
         uint32_t heap = V.local_type < V.memp.memoryTypeCount ? V.memp.memoryTypes[V.local_type].heapIndex : 0;
         if (heap < V.memp.memoryHeapCount) in.heap_size = V.memp.memoryHeaps[heap].size;
         static PFN_vkGetPhysicalDeviceMemoryProperties2 gmp2;
@@ -1635,7 +1660,8 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
         }
     }
     uint64_t lim = env > 0 ? (uint64_t)env << 20 : vktl_limit(&in), old = g_img_lim;
-    int pressed = env <= 0 && in.psi_some10 >= VKTL_PSI_HOLD;
+    if (env > 0 && in.psi_some10 > 0) lim = vktl_pressure_limit(lim, imgs, in.psi_some10);   // (a fixed limit yields under pressure too)
+    int pressed = in.psi_some10 >= VKTL_PSI_HOLD;
     if (pressed != g_psi_pressed) {
         static _Atomic int np;
         if (atomic_fetch_add(&np, 1) < 32) VLOG("image cache: memory pressure %.1f %% (some avg10): %s, limit %llu MiB, images %.0f MiB", in.psi_some10 < 0 ? 0 : in.psi_some10,
@@ -1678,7 +1704,8 @@ static void vka_tex_prune_locked(void) {
     for (int i = 0; i < g_nlive; i++) {
         vka_img *im = g_live[i];
         if (pool_keep && im->pool_frame == cur_frame) continue;
-        if (vktl_evictable(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, im->last_fence && done_fence < im->last_fence))
+        if (vktl_evictable2(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, im->last_fence && done_fence < im->last_fence,
+                            (unsigned)VKA_ENV("DM_VK_IMG_KEEP_FRAMES", 2)))
             c[nc++] = (prune_ent){im, im->last_frame, im->gpu_owned != 0};
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
@@ -2422,8 +2449,12 @@ static VkComponentSwizzle swz1(int n) { return n >= 0 && n <= 5 ? (VkComponentSw
 // levels below (nvn_mtl.m fb_prepare, "Mip-chain pass sampling the level it renders" in docs/reference/rendering.md). DKB fills its environment cube's mip chain level by level,
 // each drawn from the one above through a view of the whole chain; sampling the attached level is a feedback loop Vulkan leaves undefined (on Adreno: NaN texels, which bloom
 // spread into white blotches and black speckles over the whole level)
-static vka_img *g_fb_im[9]; static uint32_t g_fb_lv[9]; static int g_nfb;
-void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n) { g_nfb = n > 9 ? 9 : n; for (int i = 0; i < g_nfb; i++) { g_fb_im[i] = ims[i]; g_fb_lv[i] = levels[i]; } }
+static vka_img *g_fb_im[9]; static uint32_t g_fb_lv[9]; static int g_nfb; static _Atomic uint32_t g_fbgen;
+void vka_tex_feedback(vka_img *const *ims, const uint32_t *levels, int n) {
+    g_nfb = n > 9 ? 9 : n; for (int i = 0; i < g_nfb; i++) { g_fb_im[i] = ims[i]; g_fb_lv[i] = levels[i]; }
+    atomic_fetch_add_explicit(&g_fbgen, 1, memory_order_release);   // (a view of a pass's own attachment differs: vka_draw.c's sets memo reads vka_tex_fb_gen)
+}
+uint64_t vka_tex_fb_gen(void) { return atomic_load_explicit(&g_fbgen, memory_order_acquire); }
 static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int storage, VkFormat ovr) {
     vka_fmt f; const view_t *v = e->has_v ? &e->v : NULL;
     if (!vka_fmt_of(v && v->set_format ? v->format : e->t.d.format, &f)) f = im->f;
@@ -2495,7 +2526,7 @@ static int img_storage_upgrade(vka_img *im, VkCommandBuffer cb, VkFormat need) {
     n->img = oi; n->m = od; n->views = ov; n->bytes = ob; g_img_bytes -= ob;
     if (im->holds) { n->zold = im->zold; im->zold = n; }
     else vka_after(vka_fence_last() + 1, img_destroy, n);
-    // Views made of the old image are gone with it: the recording memo (g_tgen) and the registered pool slots that name the image are made again
+    // Views made of the old image are gone with it: the memo's entries for the IDs that name this serial (their registration version) and the registered pool slots are made again
     atomic_fetch_add_explicit(&g_tgen, 1, memory_order_release);
     int named = 0;
     for (int id = 1; id < g_ntreg; id++) { smap_ent *e = g_treg[id].t.serial ? map_get(g_treg[id].t.serial) : NULL; if (e && e->im == im) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); named++; } }
@@ -2633,8 +2664,18 @@ int vka_tex_id_in_pass(int id) {
     return r;
 }
 typedef struct { int id; uint8_t dim; uint32_t ver, gen; vka_img *im; VkImageView v; } vmemo;
-static vmemo g_vm[2048]; static struct { int id; uint32_t ver; VkSampler s; } g_sm[512];
-static inline vmemo *vm_slot(int id, uint8_t dim) { return &g_vm[((unsigned)id * 7u + dim) & 2047]; }
+// Four ways per set: the hindex ((id * 7 + dim) & 2047: 7 is invertible mod 2048, so two IDs meet only 2048 apart) put every ID of the game's live ones in one of ~3 piles per
+// slot -- a direct-mapped entry was evicted by the next ID of its band, and the memo missed for the whole game's work rather than for its own (Mario Kart World: 6210 live
+// images). Empty ways are filled first, then the set's oldest is replaced in turn
+enum { VM_SETS = 2048, VM_WAYS = 4 };
+enum { SM_SETS = 512, SM_WAYS = 4 };   // the sampler memo: the same four-way treatment, for the same reason ("id & 511" piles every ID 512 apart on one entry)
+static vmemo g_vm[VM_SETS * VM_WAYS]; static uint8_t g_vm_next[VM_SETS];
+static struct { int id; uint32_t ver; VkSampler s; } g_sm[SM_SETS * SM_WAYS]; static uint8_t g_sm_next[SM_SETS];
+static _Atomic uint64_t g_sm_hit, g_sm_try;
+static inline vmemo *vm_set(int id, uint8_t dim) { return &g_vm[(size_t)(((unsigned)id * 7u + dim) & (VM_SETS - 1)) * VM_WAYS]; }
+// The memo's answers and, when it had none, why (vka_tex_memo_stats, the pace line): no way holds the ID at all / the ID's registration version moved (it was registered
+// again, its texture mapping dropped, or its image remade for storage use) / the image is the open pass's own attachment (a view of it differs). Counted on the recording thread
+static _Atomic uint64_t g_vm_hit, g_vm_other, g_vm_ver, g_vm_infb, g_vm_gen;
 static inline int vm_hit(const vmemo *m, int id, uint8_t dim) {
     return m->id == id && m->dim == dim && g_tver && m->ver == atomic_load_explicit(&g_tver[id], memory_order_acquire) && m->gen == atomic_load_explicit(&g_tgen, memory_order_acquire) && !in_fb(m->im);
 }
@@ -2651,30 +2692,69 @@ int vka_tex_id_in_pass_rec(int id, uint8_t dim) {
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout) {
     if (layout) *layout = VK_IMAGE_LAYOUT_GENERAL;
     if (storage || id <= 0 || id >= (1 << 20) || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return id_view(id, cb, dim, storage, NULL, VK_FORMAT_UNDEFINED);
-    vmemo *m = vm_slot(id, dim);
-    if (vm_hit(m, id, dim)) {
-        if (m->im) { m->im->last_frame = vka_frame(); m->im->last_fence = vka_fence_last(); }
-        return m->v;
+    vmemo *s = vm_set(id, dim);
+    for (int w = 0; w < VM_WAYS; w++) if (vm_hit(&s[w], id, dim)) {
+        atomic_fetch_add_explicit(&g_vm_hit, 1, memory_order_relaxed);
+        if (s[w].im) { s[w].im->last_frame = vka_frame(); s[w].im->last_fence = vka_fence_last(); }
+        return s[w].v;
     }
     uint32_t gen = atomic_load_explicit(&g_tgen, memory_order_acquire), ver = g_tver ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0;
+    {   // why: a way of the set for this ID but for another reason, else none is (the set holds other IDs)
+        int why = 0;
+        for (int w = 0; w < VM_WAYS; w++) if (s[w].id == id && s[w].dim == dim) {
+            why = s[w].ver != ver ? 1 : in_fb(s[w].im) ? 2 : 3; break;
+        }
+        if (why == 0) atomic_fetch_add_explicit(&g_vm_other, 1, memory_order_relaxed);
+        else if (why == 1) atomic_fetch_add_explicit(&g_vm_ver, 1, memory_order_relaxed);
+        else if (why == 2) atomic_fetch_add_explicit(&g_vm_infb, 1, memory_order_relaxed);
+        else atomic_fetch_add_explicit(&g_vm_gen, 1, memory_order_relaxed);
+    }
     vka_img *im = NULL; VkImageView v = id_view(id, cb, dim, 0, &im, VK_FORMAT_UNDEFINED);
     if (im) { im->last_frame = vka_frame(); im->last_fence = vka_fence_last(); }
-    if (v && im && g_tver && !in_fb(im)) *m = (vmemo){id, dim, ver, gen, im, v};
+    if (v && im && g_tver && !in_fb(im)) {
+        uint32_t set = ((unsigned)id * 7u + dim) & (VM_SETS - 1);
+        int w = -1;
+        for (int i = 0; i < VM_WAYS && w < 0; i++) if (!s[i].v || (s[i].id == id && s[i].dim == dim)) w = i;
+        if (w < 0) w = g_vm_next[set]++ & (VM_WAYS - 1);
+        s[w] = (vmemo){id, dim, ver, gen, im, v};
+    }
     return v;
 }
+void vka_tex_memo_stats(uint64_t *hit, uint64_t *other, uint64_t *ver, uint64_t *infb, uint64_t *gen) {
+    *hit = atomic_load_explicit(&g_vm_hit, memory_order_relaxed); *other = atomic_load_explicit(&g_vm_other, memory_order_relaxed);
+    *ver = atomic_load_explicit(&g_vm_ver, memory_order_relaxed); *infb = atomic_load_explicit(&g_vm_infb, memory_order_relaxed);
+    *gen = atomic_load_explicit(&g_vm_gen, memory_order_relaxed);
+}
 int vka_tex_id_pending_rec(int id, uint8_t dim) {   // 0 at once when the memo holds the ID (its image was made)
-    if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1) && vm_hit(vm_slot(id, dim), id, dim)) return 0;
+    if (id > 0 && id < (1 << 20) && VKA_ENV("DM_VK_TEX_MEMO", 1)) {
+        const vmemo *s = vm_set(id, dim);
+        for (int w = 0; w < VM_WAYS; w++) if (vm_hit(&s[w], id, dim)) return 0;
+    }
     return vka_tex_id_pending(id);
 }
 VkSampler vka_samp_id_rec(int id) {
     if (id <= 0 || id >= 4096 * 4 || !g_sver || !VKA_ENV("DM_VK_TEX_MEMO", 1)) return vka_samp_id(id);
     uint32_t ver = atomic_load_explicit(&g_sver[id], memory_order_acquire);
-    typeof(g_sm[0]) *m = &g_sm[id & 511];
-    if (m->id == id && m->ver == ver && m->s) return m->s;
+    atomic_fetch_add_explicit(&g_sm_try, 1, memory_order_relaxed);
+    typeof(g_sm[0]) *s = &g_sm[(size_t)(id & 511) * SM_WAYS];   // four ways, as the view memo: "id & 511" piles every sampler ID 512 apart on one entry
+    for (int w = 0; w < SM_WAYS; w++) if (s[w].id == id && s[w].ver == ver && s[w].s) { atomic_fetch_add_explicit(&g_sm_hit, 1, memory_order_relaxed); return s[w].s; }
     VkSampler sp = vka_samp_id(id);
-    m->id = id; m->ver = ver; m->s = sp;
+    {   int w = -1;
+        for (int i = 0; i < SM_WAYS && w < 0; i++) if (!s[i].s || s[i].id == id) w = i;
+        if (w < 0) w = g_sm_next[id & 511]++ & (SM_WAYS - 1);
+        s[w] = (typeof(s[0])){id, ver, sp}; }
     return sp;
 }
+uint64_t vka_samp_memo_stats(uint64_t *hit, uint64_t *try_n) {
+    *hit = atomic_load_explicit(&g_sm_hit, memory_order_relaxed); *try_n = atomic_load_explicit(&g_sm_try, memory_order_relaxed);
+    return *try_n;
+}
+// The inputs vka_tex_id_view_rec and vka_samp_id_rec resolve from, as generations: the view memo's global (a texture map entry added or tombstoned) and per-ID, the sampler's
+// per-ID, and the open pass's attachments. vka_draw.c keeps a draw's resolved descriptors while all of these and its walk hold (sets_memo); each is read under the same rule
+// the memos use, so a change that makes a memo entry stale also makes the draw's descriptors stale
+uint64_t vka_tex_gen(void) { return atomic_load_explicit(&g_tgen, memory_order_acquire); }
+uint32_t vka_tex_ver(int id) { return g_tver && id > 0 && id < (1 << 20) ? atomic_load_explicit(&g_tver[id], memory_order_acquire) : 0; }
+uint32_t vka_samp_ver(int id) { return g_sver && id > 0 && id < 4096 * 4 ? atomic_load_explicit(&g_sver[id], memory_order_acquire) : 0; }
 // The format of the same texel size and channel layout in numeric class cls (0 float / unorm, 1 uint, 2 sint) for a view that reads a texture as another class, else UNDEFINED
 static VkFormat class_twin(VkFormat v, int cls) {
     static const struct { VkFormat f[3]; } t[] = {
@@ -2716,13 +2796,20 @@ int vka_tex_id_class(int id) {
 }
 // vka_tex_id_class for the recording thread: a memo by ID, valid while the ID was not registered again (its version: the class is its registration's format); the draws ask it for each texture they bind (vka_draw.c tex_masks, img_retype)
 int vka_tex_id_class_rec(int id) {
-    static struct { int id; uint32_t ver; int cls; } m[2048];
+    // Four ways: the same direct map the view and sampler memos had, with the same pile-up (every ID 2048 apart in one entry, ~6210 live IDs on Mario Kart World). This one
+    // is asked once per image record of every draw (tex_masks), and a miss takes the texture table's lock, so a collision here is a mutex on the frame path
+    enum { CL_SETS = 2048, CL_WAYS = 4 };
+    static struct { int id; uint32_t ver; int cls; } m[CL_SETS * CL_WAYS]; static uint8_t next[CL_SETS];
     if (id <= 0 || id >= (1 << 20) || !g_tver) return vka_tex_id_class(id);
     uint32_t ver = atomic_load_explicit(&g_tver[id], memory_order_acquire);
-    typeof(m[0]) *e = &m[(unsigned)id & 2047];
-    if (e->id == id && e->ver == ver) return e->cls;
+    uint32_t set = (uint32_t)((unsigned)id & (CL_SETS - 1));
+    typeof(m[0]) *s = &m[(size_t)set * CL_WAYS];
+    for (int w = 0; w < CL_WAYS; w++) if (s[w].id == id && s[w].ver == ver) return s[w].cls;
     int c = vka_tex_id_class(id);
-    e->id = id; e->ver = ver; e->cls = c;
+    {   int w = -1;
+        for (int i = 0; i < CL_WAYS && w < 0; i++) if (!s[i].id || s[i].id == id) w = i;
+        if (w < 0) w = next[set]++ & (CL_WAYS - 1);
+        s[w] = (typeof(s[0])){id, ver, c}; }
     return c;
 }
 // The replay's own storage view of texture ID id's image as R32_UINT, its texels' 32-bit words (a 4-byte colour format without storage use of its own: B10G11R11 on
@@ -2855,6 +2942,24 @@ void vka_tex_id_peek(int id, char *b, size_t n) {
              v && v->set_target ? v->target : -1, v && v->set_levels ? v->base_level : 0, v && v->set_levels ? v->nlevels : 0, v && v->set_layers ? v->min_layer : 0, v && v->set_layers ? v->nlayers : 0,
              im ? "made" : m ? "refused" : "not made", (unsigned long long)ims, imm, iw, ih, il, iv, fv);
 }
+// The memoized form for the frame path (vka_draw.c): a descriptor whose texture has no view of the asked shape (the game leaves bindings whose shader branch
+// never samples them) asks for its target on every draw, and the unlocked form takes the texture table's lock. Keyed on the ID's registration version, four ways, as the
+// other memos here
+int vka_tex_id_target_rec(int id) {
+    enum { TG_SETS = 1024, TG_WAYS = 4 };
+    static struct { int id; uint32_t ver; int t; } m[TG_SETS * TG_WAYS]; static uint8_t next[TG_SETS];
+    if (id <= 0 || id >= (1 << 20) || !g_tver) return vka_tex_id_target(id);
+    uint32_t ver = atomic_load_explicit(&g_tver[id], memory_order_acquire);
+    uint32_t set = (uint32_t)((unsigned)id & (TG_SETS - 1));
+    typeof(m[0]) *s = &m[(size_t)set * TG_WAYS];
+    for (int w = 0; w < TG_WAYS; w++) if (s[w].id == id && s[w].ver == ver) return s[w].t;
+    int t = vka_tex_id_target(id);
+    {   int w = -1;
+        for (int i = 0; i < TG_WAYS && w < 0; i++) if (!s[i].id || s[i].id == id) w = i;
+        if (w < 0) w = next[set]++ & (TG_WAYS - 1);
+        s[w] = (typeof(s[0])){id, ver, t}; }
+    return t;
+}
 int vka_tex_id_target(int id) {
     pthread_mutex_lock(&g_tmu);
     int t = id > 0 && id < g_ntreg && g_treg[id].t.serial ? (g_treg[id].has_v && g_treg[id].v.set_target ? g_treg[id].v.target : g_treg[id].t.d.target) : -1;
@@ -2892,13 +2997,19 @@ VkSampler vka_samp_default(void) {
     return s;
 }
 
+// vka_tex_prepare's phases (cumulative ns, the pace line reads them as deltas): the pruner, the CPU re-uploads, the GPU write log's poll, and the scan and re-uploads a GPU
+// write that is done calls for. The rest of the function -- the tracked images whose pages the CPU wrote -- is the pace line's remainder
+static uint64_t g_tp[5];
+void vka_tex_prep_phases(uint64_t *prune, uint64_t *redo, uint64_t *poll, uint64_t *gw, uint64_t *sweep) { *prune = g_tp[0]; *redo = g_tp[1]; *poll = g_tp[2]; *gw = g_tp[3]; *sweep = g_tp[4]; }
 void vka_tex_prepare(VkCommandBuffer cb) {
+    uint64_t t0_ = now_ns();
     bindless_init();
     nvn_pool_use(1);   // the re-uploads below read guest storage: no pool is finalized (and unmapped) under them. Taken before g_tmu, as write_tex does
     pthread_mutex_lock(&g_tmu);
     pfb_consume_locked();   // the texture IDs read through the pool in submissions done: their images stamped used, null slots written again with their images ("Texture pool reads")
     vka_tex_prune_locked();   // (the limit measured again every 60 frames; nothing to do under it)
     int n_up = 0;
+    g_tp[0] += now_ns() - t0_; t0_ = now_ns();
     for (int i = 0; i < g_nredo; i++) {   // CPU writes to textures that already have an image (WriteTexels): from now on they follow their storage
         smap_ent *e = map_get(g_redo[i]); vka_img *im = e ? e->im : NULL;
         if (!im || !im->cpu_dirty) continue;
@@ -2912,6 +3023,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         g_reup++; n_up++;
     }
     g_nredo = 0;
+    g_tp[1] += now_ns() - t0_; t0_ = now_ns();
     int any_rw = 0;
     if (n_up && g_nreg_writes) vka_barrier(cb);   // the whole-image uploads above before the region copies below, which may write the same texels
     for (int i = 0; i < g_nreg_writes; i++) {
@@ -2952,6 +3064,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
     if (any_rw) vka_barrier(cb);
     // GPU writes whose submission is done: the images over them that did not get their bytes are uploaded again (see gw_t above)
     gml_poll();
+    g_tp[2] += now_ns() - t0_; t0_ = now_ns();
     if (vka_nan_on()) watch_scan(cb);
     static uint64_t nprep, kinds[4], ntake; nprep++;
     if (vka_nan_on()) { for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence && g_gw[i].fence <= vka_done()) kinds[g_gw[i].kind]++;
@@ -2963,15 +3076,17 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         // all of them again (DM_VK_GW_SORT_KEEP, live, default 1; 0: filtered and sorted at each, as before). Which of them take part (from_mem, gpu_owned, vpool, a dead
         // pool can change) is checked at each use, and the scan's reach (maxsz) is the largest of those that take part, as before; images at one address keep an order qsort
         // does not promise either way
-        static vka_img **by; static int bycap, nall; static uint64_t by_gen = ~0ull; int nby = 0; uint64_t maxsz = 0, done = vka_done(); int k = 0, any = 0;
+        static vka_img **by; static int bycap, nall; static uint64_t by_gen = ~0ull, by_maxsz; int nby = 0; uint64_t maxsz = 0, done = vka_done(); int k = 0, any = 0;
         int keep = VKA_ENV("DM_VK_GW_SORT_KEEP", 1) != 0;
         #define GW_TAKES(im) ((im)->from_mem && !(im)->gpu_owned && (im)->mem && !(im)->vpool && !img_pool_dead(im))
         for (int i = 0; i < g_ngw && !any; i++) any = g_gw[i].fence && g_gw[i].fence <= done;
         if (any) {
             if (bycap < g_nlive) { bycap = g_nlive + 256; by = realloc(by, (size_t)bycap * sizeof *by); by_gen = ~0ull; }
             if (keep) {
-                if (by_gen != g_live_gen) { nall = 0; for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) by[nall++] = g_live[j]; qsort(by, (size_t)nall, sizeof *by, img_by_mem); by_gen = g_live_gen; }
-                nby = nall; for (int j = 0; j < nby; j++) if (GW_TAKES(by[j]) && by[j]->L.size > maxsz) maxsz = by[j]->L.size;
+                if (by_gen != g_live_gen) { nall = 0; uint64_t m = 0;
+                    for (int j = 0; j < g_nlive; j++) if (g_live[j]->mem) { by[nall++] = g_live[j]; if (g_live[j]->L.size > m) m = g_live[j]->L.size; }   // (every image with storage: one that starts taking part later only widens the scan's reach)
+                    qsort(by, (size_t)nall, sizeof *by, img_by_mem); by_gen = g_live_gen; by_maxsz = m; }
+                nby = nall; maxsz = by_maxsz;   // the reach is kept with the sorted list: the per-submission walk over every live image for it was the "images" phase's cost when no image came or went
             } else {
                 by_gen = ~0ull;
                 for (int j = 0; j < g_nlive; j++) { vka_img *im = g_live[j]; if (GW_TAKES(im)) { by[nby++] = im; if (im->L.size > maxsz) maxsz = im->L.size; } }
@@ -2998,6 +3113,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
         #undef GW_TAKES
         g_ngw = k;
     }
+    g_tp[3] += now_ns() - t0_; t0_ = now_ns();
     // Tracked images whose pages the CPU wrote since their last upload (a write to a protected page moves the dirty clock, so nothing is scanned while it stands still)
     // Sparse pools' textures also when a mapping request came since (the page table's generation moved)
     // Video pictures: the scan below runs when a picture was written into a video pool or a pool came or went since the last one (before 2026-11-10 every live image
@@ -3047,18 +3163,27 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             if (!im->track || im->gpu_owned || !im->mem) continue;
             uint64_t size = im->L.size;
             if (!im->span) im->span = nvn_dirty_span(im->mem, size);
-            if (!nvn_dirty_since_span(im->span, im->mem, size, im->stamp)) continue;
+            if (!nvn_dirty_since_span(im->span, im->mem, size, im->stamp)) continue;   // one atomic compare: nothing in it written since its upload
             if (img_edges_clean(im)) continue;
-            size_t lo, hi;
-            if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
             tex_t t = {0}; t.serial = im->serial; t.d = im->d; t.L = im->L; t.mem = (uint8_t *)im->mem;
             int rows = VKA_ENV("DM_VK_ROWS", 1);
-            if (rows && upload_rows_tracked(im, &t, cb, lo, hi)) continue;
-            if (upload_bands_tracked(im, &t, cb, lo, hi, im->stamp)) { if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x: the bands of its storage that changed re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format); continue; }
+            // The bounds are a page-by-page scan of the image's whole range (87,000 atomic loads for a 341 MB target written every frame) and only the row and band
+            // uploads read them; a texture neither of them can take skips the scan. Their preconditions are upload_rows_tracked's and upload_bands_tracked's own
+            const vka_fmt *f_ = &im->f;
+            int rowok = rows && (im->is_video || (im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) && im->levels <= 1 && im->layers <= 1 && im->depth <= 1 && f_->kind < 3;
+            int bandok = VKA_ENV("DM_VK_BANDS", 1) && !im->vpool && !im->m.z && !im->is_video && !vka_nan_on() && f_->kind < 3 && im->d.target != NVN_TEXTURE_TARGET_3D && im->depth <= 1
+                         && !(im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && size >= (1u << 20);
+            if (rowok || bandok) {
+                size_t lo = 0, hi = size;
+                if (!nvn_dirty_bounds_since(im->span, im->mem, size, im->stamp, &lo, &hi)) continue;
+                if (rowok && upload_rows_tracked(im, &t, cb, lo, hi)) continue;
+                if (upload_bands_tracked(im, &t, cb, lo, hi, im->stamp)) { if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x: the bands of its storage that changed re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format); continue; }
+            }
             upload_tracked(im, &t, cb);
             if (g_reup++ < 8) VLOG("texture serial %llu %ux%u format %#x flags %#x target %d: its storage changed, re-uploaded", (unsigned long long)im->serial, im->w, im->h, im->d.format, im->d.flags, im->d.target);
         }
     }
+    g_tp[4] += now_ns() - t0_;   // the sweep above: the bindless table's updates below are the pace line's "table"
     nvn_pool_use(0);   // (write_tex takes it again for each ID, after letting g_tmu go: never twice on one thread)
     if (!g_set) { g_ntd = g_nsd = 0; if (g_tdflag) memset(g_tdflag, 0, 1 << 20); if (g_sdflag) memset(g_sdflag, 0, 4096 * 4); pthread_mutex_unlock(&g_tmu); return; }
     enum { BATCH = 64 }; VkWriteDescriptorSet w[BATCH]; VkDescriptorImageInfo ii[BATCH]; int nw = 0;

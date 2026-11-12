@@ -648,6 +648,22 @@ public final class PackService extends Service {
      * null when the split found the shaders the app's profile lists (its shader_map.tsv byte for byte, as a Mac split of the same dump does), else what to do.
      * vk_android_build.py builds the keys of the profile's map from the split's package: another map means a dump with other shaders (modified, or incomplete).
      */
+    /** env.txt's DM_PACK_SHADERS_ANYWAY: a split whose tables are not the app's may be kept (a fork whose dump is laid out differently from the one the profile's tables
+     *  were made from can never match them, and the split is right about the dump). The tools read the same line themselves: shader_split.py keeps its targeted tables. */
+    private static boolean shadersAnyway(Job j) {
+        File f = new File(j.dir(), "env.txt");
+        try {
+            if (f.isFile()) for (String l : Files.readAllLines(f.toPath(), StandardCharsets.UTF_8)) {
+                int eq = l.indexOf('=');
+                if (eq > 0 && l.substring(0, eq).trim().equals("DM_PACK_SHADERS_ANYWAY")) {
+                    String v = l.substring(eq + 1).trim();
+                    return !v.isEmpty() && !v.equals("0");
+                }
+            }
+        } catch (IOException | RuntimeException e) { Log.w(TAG, "env.txt: " + e.getMessage()); }
+        return System.getenv("DM_PACK_SHADERS_ANYWAY") != null;
+    }
+
     private String splitMatchesProfile(Job j, File split) {
         if (engine.simulated()) return null;
         File have = new File(split, "shader_map.tsv");
@@ -661,6 +677,10 @@ public final class PackService extends Service {
             failure = new PrepareText.Failure("The app could not compare your dump's shaders with its list for " + j.name() + ". Tap Retry. If it stops again, Details has the error.",
                     why, PrepareText.FIX_RETRY);
             return why;
+        }
+        if (shadersAnyway(j)) {
+            Log.w(TAG, "split: its shader_map.tsv is not the app's; kept anyway (DM_PACK_SHADERS_ANYWAY)");
+            return null;   // (before the delete below: the split's tables are what the pack and the library build keep)
         }
         try {
             Outputs.delete(split);   // a Retry splits again, from the start

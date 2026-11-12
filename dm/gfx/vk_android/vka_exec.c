@@ -22,7 +22,7 @@ enum { NSLOT = 8 };
 enum { NCHUNK = 32 };
 static struct { VkCommandBuffer cb; uint64_t fence; VkCommandBuffer x[NCHUNK]; VkFence vf; int vf_on; } g_slot[NSLOT];   // vf: set when its commit had no timeline signal (vf_on)   // x: the command buffers a submission goes on in once it hands its first part to the queue (chunk)
 static unsigned g_slot_i;
-static int g_chunk_draws = -1, g_nx; static uint64_t g_chunk_d0;   // chunk(): draws a part, parts this submission, draws at its part's start
+static int g_chunk_draws = -1, g_chunk_first = -1, g_nx; static uint64_t g_chunk_d0;   // chunk(): draws a part, the first part's own draw count, parts this submission, draws at its part's start
 static VkCommandPool g_pool;
 static VkCommandBuffer g_cb;   // the submission being recorded (NULL without a device)
 VkCommandBuffer vka_rp_cb(void) { return g_cb; }
@@ -522,6 +522,7 @@ void vka_rp_sub_begin(void) {
     vka_draw_sub_begin(g_cb, k);
     { void vka_pso_pause(int on); vka_pso_pause(0); }   // the game submits: resumed (mtl_drain paused the pipeline threads)
     g_chunk_draws = VKA_ENV("DM_VK_CHUNK", 600);   // live: from the next submission
+    g_chunk_first = VKA_ENV("DM_VK_CHUNK_FIRST", 128);   // live: the first part ends this early (0: DM_VK_CHUNK), so the GPU starts while the rest is recorded
     g_nx = 0; g_chunk_d0 = g_stat_draws;
     g_t_begin += now_ns() - tb0;
 }
@@ -605,8 +606,12 @@ static inline void chunk_check(void) {
     }
     if (!g_cb || g_nx >= NCHUNK) return;   // no part left: chunk() would do nothing and leave the draw count, so every later draw would end its pass
     uint64_t in = g_stat_draws - g_chunk_d0;
-    if (g_chunk_draws > 0 && in >= (uint64_t)g_chunk_draws && vka_rp_split_ok(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); return; }
+    // The first part of a submission ends early (DM_VK_CHUNK_FIRST, default 128 draws; 0: DM_VK_CHUNK), so the GPU starts on it while the rest of the
+    // submission is still recorded, instead of waiting out the whole recording (MacNativeGames cuts its first segment at 30 draws for the same reason)
+    int lim = g_chunk_draws > 0 ? (g_nx ? g_chunk_draws : (g_chunk_first > 0 && g_chunk_first < g_chunk_draws ? g_chunk_first : g_chunk_draws)) : 0;
+    if (lim > 0 && in >= (uint64_t)lim && vka_rp_split_ok(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); return; }
     int cp = VKA_ENV("DM_VK_CHUNK_PASS", 600);
+    if (g_chunk_draws > 0 && !g_nx && g_chunk_first > 0 && cp > g_chunk_first) cp = g_chunk_first;
     if (cp > 0 && in >= (uint64_t)cp && vka_rp_open_for(&S.rt, S.has_rt)) {
         uint32_t w = 0, h = 0; int dep = vka_rp_depth(&w, &h);
         if ((uint64_t)w * h >= (16ull << 20)) return;   // a 6400x6400 ink map costs ~400 MB to store and load on a tiler: never split it mid-pass for chunking
@@ -1286,6 +1291,47 @@ static void memu_before_draw(const uint8_t *p, const p_draw *d) {
     vka_memu_cur(p);   // (after the look-ahead: the next entry of this record in the batch, which moves past it; a record met twice in one look-ahead has an entry per meeting)
 }
 
+// DM_VK_REC_PROF=1 (diagnostic, live): the record walk (exec, below) timed and counted by record kind, and the pace line naming the three kinds that took the most
+// since its last line. It exists because a 2.6 s freeze on the phone landed wholly in the pace line's "other records" -- what is left of the recording after draws,
+// texture prepare and commit, which is this walk -- and nothing here was measured: the log could say where but not what. The reads are cntvct (a few cycles), so even a
+// 100k-record frame pays under a millisecond
+static uint64_t g_rk_t[OP_COUNT_], g_rk_n[OP_COUNT_], g_rk_lt[OP_COUNT_], g_rk_ln[OP_COUNT_];
+static int g_rec_prof_on = -1;   // DM_VK_REC_PROF, read at the first walk
+static inline uint64_t rk_cnt(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+static double rk_hz(void) { static double f; if (!f) { uint64_t h; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(h)); f = h ? (double)h : 1.0; } return f; }
+static const char *const k_op_nm[OP_COUNT_] = {
+    "end", "jump", "begin", "call", "signal", "report", "copy-b2b", "update-ub", "set-rt", "clear-color", "clear-ds", "viewport", "scissor", "depth-range",
+    "bind-program", "bind-state", "bind-vattr", "bind-vstream", "bind-vbuf", "bind-ubo", "bind-ssbo", "bind-tex", "bind-samp", "stencil", "poly-offset",
+    "draw", "draw-idx", "dispatch", "barrier", "set-tex-pool", "set-samp-pool", "copy-b2t", "copy-stride", "blend-color", "copy-t2b", "bind-img", "copy-t2t",
+    "reset-counter", "clear-tex", "clear-buf", "depth-clamp", "render-cond", "fence-sync", "tf-bind", "tf-state", "rast-discard", "vp-swizzle", "bind-tex1",
+    "prim-restart", "bind-ubo-small", "bind-vbuf1", "draw-tex", "alpha-ref", "push-const" };
+// The pace line's share of it: the three kinds that took the most since the last call, in ms on the replay thread, with the records each. Nothing when off
+void vka_rec_prof_line(char *b, size_t n) {
+    if (!n) return;
+    b[0] = 0;
+    if (g_rec_prof_on != 1) return;
+    static uint64_t dk[OP_COUNT_], dn[OP_COUNT_];
+    uint64_t tot = 0;
+    for (int i = 0; i < OP_COUNT_; i++) {
+        dk[i] = g_rk_t[i] - g_rk_lt[i]; dn[i] = g_rk_n[i] - g_rk_ln[i];
+        g_rk_lt[i] = g_rk_t[i]; g_rk_ln[i] = g_rk_n[i];
+        tot += dk[i];
+    }
+    if (!tot) return;
+    static uint8_t used[OP_COUNT_];
+    for (int i = 0; i < OP_COUNT_; i++) used[i] = 0;
+    size_t o = 0;
+    o += (size_t)snprintf(b + o, n - o, "; records (DM_VK_REC_PROF):");
+    for (int k = 0; k < 3; k++) {
+        int best = -1;
+        for (int i = 0; i < OP_COUNT_; i++) if (!used[i] && (best < 0 || dk[i] > dk[best])) best = i;
+        if (best < 0 || !dk[best]) break;
+        used[best] = 1;
+        if (o < n) o += (size_t)snprintf(b + o, n - o, " %s %.1f ms (%llu),", k_op_nm[best], (double)dk[best] * 1000.0 / rk_hz(), (unsigned long long)dn[best]);
+    }
+    if (o < n && o && b[o - 1] == ',') b[o - 1] = 0;
+    if (o < n) snprintf(b + o, n - o, " of %.1f ms", (double)tot * 1000.0 / rk_hz());
+}
 static void seg_write(const void *a) { struct { VkCommandBuffer cb; VkPipelineStageFlagBits st; uint32_t q; } w; memcpy(&w, a, sizeof w); qf.write(w.cb, w.st, g_sqp, w.q); }
 // NVN queue waits (vka_qsched.h): the replay worker answers whether a wait holds (vka_wait_pass); one that does not ends the replay of this submission here, and its continuation
 // (the record after the wait and the return points of the lists that called it) is written to g_pk for vka_rp_resume. Replays outside the worker pass every wait
@@ -1299,8 +1345,10 @@ static int mdi_rest(uint32_t op, const void *a, uint32_t size) {   // (a multi-d
     return 0;
 }
 static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk holds where it goes on)
+    if (g_rec_prof_on < 0) g_rec_prof_on = VKA_ENV("DM_VK_REC_PROF", 0) != 0;
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
+        uint64_t rk0 = g_rec_prof_on == 1 ? rk_cnt() : 0;
         const void *a = p + 8;
         if ((h.op == OP_DRAW || h.op == OP_DRAW_IDX) && h.size >= 8 && mdi_rest(h.op, a, h.size)) { p += h.size; continue; }
         if (g_memu_cover && !memu_allowed(h.op)) g_memu_cover = 0;   // (mesh draws through compute: the look-ahead stopped here)
@@ -1324,8 +1372,11 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
         case OP_BEGIN: break;
         case OP_JUMP: memcpy(&p, a, 8); continue;
         case OP_CALL: { uint64_t t; memcpy(&t, a, 8);
-            if (depth < 16) { g_xret[g_nxret++] = p + h.size; int pk = exec((const uint8_t *)(uintptr_t)t, depth + 1); g_nxret--; if (pk) return 1; } else VRED_ONCE("command lists nested deeper than 16");
-            break; }
+                      // the recursion runs inside this iteration, so its time is taken here as the call's own before descending: otherwise every kind nested under a call is
+                      // counted twice (once by itself, once as part of the call), which makes the top-three meaningless and the total read far above the walk's real time
+                      if (rk0) { g_rk_t[OP_CALL] += rk_cnt() - rk0; g_rk_n[OP_CALL]++; rk0 = 0; }
+                      if (depth < 16) { g_xret[g_nxret++] = p + h.size; int pk = exec((const uint8_t *)(uintptr_t)t, depth + 1); g_xret[g_nxret--]; if (pk) return 1; } else VRED_ONCE("command lists nested deeper than 16");
+                      break; }
         case OP_SIGNAL_EVENT: { uint64_t val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4); post((pop){1, m, v, 0, val});
             vka_event_replayed((volatile uint32_t *)(uintptr_t)val, m, v); break; }
         case OP_WAIT_EVENT: case OP_WAIT_SYNC:
@@ -1380,6 +1431,7 @@ static int exec(const uint8_t *p, int depth) {   // 1: parked at a wait (g_pk ho
         default: break;   // state: taken by vka_state_op above
         }
         if (g_rcl) rcl_op(h.op, a);
+if (rk0 && h.op < OP_COUNT_) { g_rk_t[h.op] += rk_cnt() - rk0; g_rk_n[h.op]++; }
         if (h.size < 8) { VRED("command record of size %u at %p (op %u): the list is cut here", h.size, (const void *)p, h.op); return 0; }
         p += h.size;
     }

@@ -203,26 +203,31 @@ static int pace_thr(int tid, vkpace_thr *o) {
     return ok;
 }
 static void pace_cost(uint64_t f, double nf, uint64_t draws, double rec_ms) {
-    static int rtid, etid; static vkpace_thr r0, e0; static uint64_t b0, p0, c0, ce0, cu0, cs0, ql0, qc0, qn0, qh0[4], sl0, jn0, ji0;
+    static int rtid, etid; static vkpace_thr r0, e0; static uint64_t b0, p0, c0, ce0, cu0, cs0, ql0, qc0, qn0, qh0[4], sl0, jn0, ji0, tp0[5];
     uint64_t bg, pr, cm, ce, cu, cs, ql, qc, qn, qh[4], sl, jn, ji; vka_qhold_stats(qh); vka_exec_phases(&bg, &pr, &cm); vka_exec_commit_parts(&ce, &cu, &cs); vka_submit_stats(&ql, &qc, &qn);
     vka_exec_begin_parts(&sl, &jn); vka_mem_join_stats(&ji);
+    uint64_t tp1[5]; vka_tex_prep_phases(&tp1[0], &tp1[1], &tp1[2], &tp1[3], &tp1[4]);
     int rt = vka_rec_tid(), et = vka_enc_tid(); vkpace_thr r1 = {0}, e1 = {0};
     int rok = pace_thr(rt, &r1), eok = pace_thr(et, &e1);
     int rfirst = rt != rtid, efirst = et != etid;   // (a new thread: its counters from the next window)
     vkpace_thr rd = vkpace_thr_delta(&r0, &r1), ed = vkpace_thr_delta(&e0, &e1);
-    char dp[700], ep[400]; double dus = 0; vka_draw_pace(dp, sizeof dp, &dus); vka_enc_pace(ep, sizeof ep, nf);
+    char dp[1400], ep[400], rp[400]; double dus = 0; vka_draw_pace(dp, sizeof dp, &dus); vka_enc_pace(ep, sizeof ep, nf); vka_rec_prof_line(rp, sizeof rp);
     double dms = nf ? dus * (double)draws / nf / 1e3 : 0, pms = nf ? (pr - p0) / 1e6 / nf : 0, bms = nf ? (bg - b0) / 1e6 / nf - pms : 0, cms = nf ? (cm - c0) / 1e6 / nf : 0;
     double sms = nf ? (sl - sl0) / 1e6 / nf : 0, jms = nf ? (jn - jn0) / 1e6 / nf : 0, ims = nf ? (ji - ji0) / 1e6 / nf : 0;
+    double tm[5] = {0, 0, 0, 0, 0};   // texture prepare's own parts a frame: the pruner, the CPU re-uploads, the write log, the GPU-write scan, the images' sweep
+    if (nf) for (int i = 0; i < 5; i++) { tm[i] = (double)(tp1[i] - tp0[i]) / 1e6 / nf; tp0[i] = tp1[i]; }
     char rs[160], es[160];
     if (rok && !rfirst && nf) snprintf(rs, sizeof rs, "on a core %.1f ms, waited for a core %.1f ms, %.0f blocked / %.0f preempted switches", rd.run_ns / 1e6 / nf, rd.wait_ns / 1e6 / nf, rd.vol / nf, rd.invol / nf);
     else snprintf(rs, sizeof rs, "%s", rok ? "from the next line" : "not readable");
     if (eok && !efirst && nf) snprintf(es, sizeof es, "on a core %.1f ms, waited for a core %.1f ms, %.0f blocked / %.0f preempted switches", ed.run_ns / 1e6 / nf, ed.wait_ns / 1e6 / nf, ed.vol / nf, ed.invol / nf);
     else snprintf(es, sizeof es, "%s", eok ? "from the next line" : et ? "not readable" : "off");
-    if (nf) VLOG("pace cost up to frame %llu, a frame: recording %.1f ms = draws %.1f + texture prepare %.1f + submission start %.1f (waiting for a command buffer slot's GPU work %.1f, segment joins %.1f (queue idle %.1f), the rest %.1f) + commit %.1f (encoder drain %.1f, uploads %.1f, queue submit %.1f) + other records %.1f; all queue submits %.1f a frame: their lock %.1f ms, the driver %.1f ms; the lock held by the present %.1f ms (its submit %.1f, vkQueuePresentKHR %.1f) and the GPU clock floor %.1f; replay thread %s; encoder %s; "
-                 "encoder calls ms (count): %s; %s", (unsigned long long)f, rec_ms, dms, pms, bms, sms, jms, ims, bms - sms - jms, cms, (ce - ce0) / 1e6 / nf, (cu - cu0) / 1e6 / nf, (cs - cs0) / 1e6 / nf,
+    if (nf) VLOG("pace cost up to frame %llu, a frame: recording %.1f ms = draws %.1f + texture prepare %.1f (prune %.1f, re-uploads %.1f, write log %.1f, GPU-write scan %.1f, images %.1f, table %.1f) + submission start %.1f (waiting for a command buffer slot's GPU work %.1f, segment joins %.1f (queue idle %.1f), the rest %.1f) + commit %.1f (encoder drain %.1f, uploads %.1f, queue submit %.1f) + other records %.1f; all queue submits %.1f a frame: their lock %.1f ms, the driver %.1f ms; the lock held by the present %.1f ms (its submit %.1f, vkQueuePresentKHR %.1f) and the GPU clock floor %.1f; replay thread %s; encoder %s; "
+                 "encoder calls ms (count): %s; %s", (unsigned long long)f, rec_ms, dms, pms, tm[0], tm[1], tm[2], tm[3], tm[4], pms - tm[0] - tm[1] - tm[2] - tm[3] - tm[4], bms, sms, jms, ims, bms - sms - jms, cms, (ce - ce0) / 1e6 / nf, (cu - cu0) / 1e6 / nf, (cs - cs0) / 1e6 / nf,
                  rec_ms - dms - pms - bms - cms, (qn - qn0) / nf, (ql - ql0) / 1e6 / nf, (qc - qc0) / 1e6 / nf,
                  (qh[0] - qh0[0] + qh[1] - qh0[1]) / 1e6 / nf, (qh[0] - qh0[0]) / 1e6 / nf, (qh[1] - qh0[1]) / 1e6 / nf, (qh[2] - qh0[2]) / 1e6 / nf, rs, es, ep[0] ? ep : "none", dp[0] ? dp : "no draws timed");
+    if (rp[0]) VLOG("pace %s", rp + 2);   // (DM_VK_REC_PROF: its own line, the cost line is long enough)
     rtid = rt; etid = et; if (rok) r0 = r1; if (eok) e0 = e1; b0 = bg; p0 = pr; c0 = cm; sl0 = sl; jn0 = jn; ji0 = ji; ce0 = ce; cu0 = cu; cs0 = cs; ql0 = ql; qc0 = qc; qn0 = qn; for (int i = 0; i < 4; i++) qh0[i] = qh[i];
+
 }
 static void pace_tick(double period_s) {
     static vkpace P; static uint64_t sampled;

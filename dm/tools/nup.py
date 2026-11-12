@@ -347,8 +347,11 @@ class _Raw(io.RawIOBase):
         self.pos += len(data); return data
     def close(self):
         if not self.closed:
-            if self.regions is not None: self.regions.pop(self.fd, None)
-            os.close(self.fd)
+            # A pack the user pauses mid-read finalizes this object through __init__ that never ran (the interpreter's "Exception ignored while
+            # finalizing"): with the attributes missing, that used to raise AttributeError and hide the real reason in the log
+            regions = getattr(self, 'regions', None); fd = getattr(self, 'fd', -1)
+            if regions is not None: regions.pop(fd, None)
+            if fd >= 0: os.close(fd)
         super().close()
 
 

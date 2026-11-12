@@ -19,6 +19,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_yuv.h"
@@ -68,6 +69,8 @@ static cv_dec *g_cv[16];
 static int g_cv_dec_seq;
 static pthread_mutex_t g_cv_mu = PTHREAD_MUTEX_INITIALIZER;   // lock order: g_cv_mu, then a decoder's mu, then g_spt_mu
 static cv_pool *g_active_pools[64];
+static _Atomic uint32_t g_pool_gen;   // moved when a video pool joins or leaves the active set (dm_codec_pool_gen): the replay asks whether an image's storage is one
+                                      // of theirs once per generation, not once per image per submission (vka_tex_prepare)
 static pthread_mutex_t g_active_pools_mu = PTHREAD_MUTEX_INITIALIZER;
 // Read without the lock by the Vulkan replay's texture cache, which asked dm_codec_is_video_mem for every live image at each submission and at each texture lookup (a lock
 // and 64 slots each: about 5 ms a frame with 2,600 images and 9 submissions, Mario Kart World on the Adreno 840): how many pools are registered (0: no memory is a video
@@ -299,6 +302,9 @@ int dm_native_image(uint32_t handle, uint8_t **mem, uint64_t *size, uint32_t *w,
     pthread_mutex_unlock(&g_cv_mu);
     return ok;
 }
+// The video pool set's generation (hle_codec_video.c): vka_tex_prepare asks an image whether its storage is a decoder pool's once per generation, not for every image of
+// every submission -- each ask is a lock and a 64-slot scan, and on the phone the sweep over ~6000 images cost about 6 ms a frame
+uint32_t dm_codec_pool_gen(void) { return atomic_load_explicit(&g_pool_gen, memory_order_acquire); }
 int dm_codec_is_video_mem(const void *mem, uint64_t size, uint32_t *stride) {
     (void)size;
     if (!mem || !atomic_load_explicit(&g_vpool_n, memory_order_acquire)) return 0;
@@ -385,7 +391,13 @@ static void cv_open(cv_dec *d) {   // (re)creates the codec state: a new stream 
     }
     if (d->codec == CV_H264) { if (!d->avc) d->avc = mavc_new(); else mavc_drop(d->avc); if (d->csd_n) mavc_param_sets(d->avc, d->csd, d->csd_n); d->vpx_ok = 1; return; }
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
-    vpx_codec_dec_cfg_t cfg = {.threads = 2, .w = d->w, .h = d->h};
+    // DM_VP9_THREADS (diagnostic, read at each decoder's open; default 2): libvpx's decode threads. VP9 decodes a frame's rows in parallel when the stream allows it, so more
+    // threads finish a large picture sooner at more of the cores' cost; Mario Kart World's cutscenes are 2560x1440, where two threads may not keep real time at all
+    int nth = 2;
+    { const char *e = getenv("DM_VP9_THREADS"); if (e && atoi(e) > 0) nth = atoi(e);
+      long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu > 0 && nth > ncpu) nth = (int)ncpu;
+      static int logged; if (!logged++) LOG("[codec] libvpx decodes with %d thread(s) (DM_VP9_THREADS)", nth); }
+    vpx_codec_dec_cfg_t cfg = {.threads = (unsigned)nth, .w = d->w, .h = d->h};
     d->vpx_ok = vpx_codec_dec_init(&d->vpx, d->codec == CV_VP8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx(), &cfg, 0) == VPX_CODEC_OK;
     if (!d->vpx_ok) LOG("[RED] nn::codec %s decoder: libvpx init failed", k_cv_name[d->codec]);
 }

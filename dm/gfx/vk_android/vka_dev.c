@@ -173,6 +173,12 @@ static int init_once(void) {
     int mesh_qcom = mesh_ext && pdr0.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY && !(mesh_env && *mesh_env);
     int x_mesh = mesh_ext && !(mesh_env && !strcmp(mesh_env, "0")) && !mesh_qcom;
     if (x_mesh) dext[ndext++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
+    // VK_EXT_descriptor_buffer (DM_VK_DESC_BUF=1, restart): set 0's descriptors written as plain words into a buffer and bound by offset, instead of a
+    // vkCmdPushDescriptorSetKHR per draw. Off until phone-checked; it needs bufferDeviceAddress for the buffer descriptors it writes
+    int x_db = has_ext(de, nde, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+    const char *db_env = getenv("DM_VK_DESC_BUF");
+    int want_db = x_db && db_env && *db_env && strcmp(db_env, "0");
+    if (want_db) dext[ndext++] = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME;
     int x_ph = has_ext(de, nde, "VK_QCOM_queue_perf_hint");
     if (x_ph) dext[ndext++] = "VK_QCOM_queue_perf_hint";
     // VK_EXT_device_fault: after a lost device, what the driver knows of the fault (the address a GPU access faulted on, the kind), printed with the hang (fault_report).
@@ -193,10 +199,11 @@ static int init_once(void) {
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDeviceMeshShaderFeaturesEXT fmesh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     VkPhysicalDeviceFaultFeaturesEXT ffault = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT fdb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     void *chain = placed ? &fmp : NULL;
 #define LINK(on, st) if (on) { (st).pNext = chain; chain = &(st); }
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
-    LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh) LINK(x_fault, ffault)
+    LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh) LINK(x_fault, ffault) LINK(want_db, fdb)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
@@ -231,6 +238,9 @@ static int init_once(void) {
     vka_shader_pfb_hook();   // (over the FPCR wrapper: the module it makes is the rewritten one)
     if (!vk.vkMapMemory2KHR) vk.vkMapMemory2KHR = (PFN_vkMapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkMapMemory2");   // core in 1.4
     if (!vk.vkUnmapMemory2KHR) vk.vkUnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkUnmapMemory2");
+    // Descriptor buffers need the extension, its feature, bufferDeviceAddress (the buffer descriptors are written as addresses) and the five entry points
+    V.db = want_db && fdb.descriptorBuffer && f12.bufferDeviceAddress && vk.vkCmdBindDescriptorBuffersEXT && vk.vkCmdSetDescriptorBufferOffsetsEXT
+           && vk.vkGetDescriptorEXT && vk.vkGetDescriptorSetLayoutSizeEXT && vk.vkGetDescriptorSetLayoutBindingOffsetEXT;
     if (!vk.vkMapMemory2KHR || !vk.vkUnmapMemory2KHR) V.placed = V.placed_range = 0;
     // A driver that has the placed map but does not advertise it (Qualcomm 512.863 on the Adreno 740: the strings and vkMapMemory2 are in the driver, the extension is
     // not reported and cannot be enabled): try one placed map of a small allocation at a reserved address; when it lands there, use placed maps without enabling the
@@ -255,7 +265,8 @@ static int init_once(void) {
     VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, .pNext = placed ? &pmp : NULL};
     VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, .pNext = &p13};
     VkPhysicalDevicePushDescriptorPropertiesKHR ppd = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR, .pNext = &p11};
-    VkPhysicalDeviceMaintenance3Properties pm3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, .pNext = V.push_desc ? (void *)&ppd : (void *)&p11};
+    VkPhysicalDeviceDescriptorBufferPropertiesEXT pdb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT, .pNext = V.push_desc ? (void *)&ppd : (void *)&p11};
+    VkPhysicalDeviceMaintenance3Properties pm3 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES, .pNext = want_db ? (void *)&pdb : V.push_desc ? (void *)&ppd : (void *)&p11};
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT pgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT, .pNext = &pm3};
     VkPhysicalDeviceDriverProperties pdr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, .pNext = x_gpl ? (void *)&pgpl : (void *)&pm3};
     VkPhysicalDeviceMeshShaderPropertiesEXT pmesh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT, .pNext = &pdr};
@@ -269,6 +280,12 @@ static int init_once(void) {
       VLOG("graphics pipeline libraries: %s", V.gpl ? "on (a pipeline the cache lacks is linked from stage libraries, the optimized one is made in the background; DM_VK_GPL=0 off)"
            : !x_gpl ? "not on this device" : !fgpl.graphicsPipelineLibrary ? "extension without the feature" : !pgpl.graphicsPipelineLibraryFastLinking ? "no fast linking" : "off (DM_VK_GPL=0)"); }
     V.placed_align = pmp.minPlacedMemoryMapAlignment ? pmp.minPlacedMemoryMapAlignment : 4096; V.max_alloc = pm3.maxMemoryAllocationSize;
+    if (V.db) V.dbprops = pdb;
+    VLOG("descriptor buffers (DM_VK_DESC_BUF): %s", V.db ? "on" : !x_db ? "not on this device" : !want_db ? "available, off (DM_VK_DESC_BUF=1 turns it on)" :
+         !fdb.descriptorBuffer ? "extension without descriptorBuffer" : !f12.bufferDeviceAddress ? "no bufferDeviceAddress" : "extension without its entry points");
+    if (V.db) VLOG("descriptor sizes: combined image sampler %u, sampled image %u, sampler %u, uniform buffer %u, storage buffer %u bytes; set layout size %llu",
+                   V.dbprops.combinedImageSamplerDescriptorSize, V.dbprops.sampledImageDescriptorSize, V.dbprops.samplerDescriptorSize,
+                   V.dbprops.uniformBufferDescriptorSize, V.dbprops.storageBufferDescriptorSize, (unsigned long long)V.dbprops.maxDescriptorBufferBindings);
     V.max_push = V.push_desc ? ppd.maxPushDescriptors : 0;
     if (V.mesh && !vk.vkCmdDrawMeshTasksEXT) V.mesh = V.task = 0;
     if (V.mesh) { V.mesh_inv = pmesh.maxMeshWorkGroupInvocations; V.task_inv = pmesh.maxTaskWorkGroupInvocations; V.mesh_out_v = pmesh.maxMeshOutputVertices;

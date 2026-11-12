@@ -22,6 +22,7 @@ uint64_t now_ns(void);
 // held, enter with 1 before waiting and balance with 0 after reacquiring it.
 void dm_thread_native_wait(int entering);
 void dm_thread_service_request(void);   // an HLE call that is a blocking service request on Horizon: the caller gives up its core (hle_thread.c)
+int dm_audio_threads_dump(const char *why);   // DM_AUDIO_STALL_DUMP: every guest thread, and the host threads' CPU, logged once (at most n times, 1 s apart); hle_audio.c calls it from its watchdog
 uint64_t guest_ns(void);              // Guest clock (hle_os.c; does not advance while frozen, guest_clock_freeze)
 int dm_detclock_enabled(void);
 void dm_guest_clock_advanced(void);

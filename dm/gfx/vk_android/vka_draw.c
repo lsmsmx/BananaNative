@@ -23,6 +23,12 @@
 
 static VkCommandBuffer g_cb; static unsigned g_slot; static int g_prof, g_dyn_filter = 1, g_pass_keep = 1, g_vb_filter = 1;   // g_prof: this draw is timed (vka_draw)
 static int g_prof_all, g_prof_every;   // DM_VK_PROF: every draw timed; the pace line's sample (DM_VK_PACE_PROF): one draw in g_prof_every
+// DM_VK_PROF_IMG (diagnostic, default 0): the image descriptors' own split in the pace line (how much of them is the ID's view lookup and how much everything after it).
+// It costs two counter reads per image descriptor -- six or so a draw -- which was a tenth of a draw's recording time, so it is off unless asked for
+static int g_prof_img;
+// The two per-descriptor diagnostics are off unless asked for: class_note walks a 4096-entry table for every image descriptor of every draw to log at most 64 lines in a
+// run, and tex_peek re-read the switch's list each time. DM_VK_CLASS_NOTE=1 brings the first back (it explains "reads as unbound" lines); DM_VK_TEX_PEEK its own
+static int g_class_note, g_tex_peek_any;
 static int g_vin_skip = 1;             // DM_VK_VIN_SKIP (vin_build_kept)
 static int g_inst_on;   // DM_VK_INSTANCE (the instanced runs below)
 static int g_vattr_clear = 1;   // DM_VK_VATTR_CLEAR: a BindVertexAttribState replaces the whole attribute state, as the Metal backend does (S.nattr = b->n);
@@ -139,12 +145,13 @@ static VkDescriptorPool g_dp[NSLOT][MAXPOOLS]; static int g_ndp[NSLOT], g_cur_dp
 void vka_dyn_invalidate(void);
 static void drv_memo_reset(void);
 static void rp_miss_reset(void);   // g_miss_n, below: a submission's draws start the render-area miss count again
+static void sets_memo_drop(void);
 void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     rp_miss_reset();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
-    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
+    g_prof_all = VKA_ENV("DM_VK_PROF", 0) != 0; g_prof = g_prof_all; g_prof_every = VKA_ENV("DM_VK_PACE_LOG", 5000) > 0 ? VKA_ENV("DM_VK_PACE_PROF", 16) : 0; g_prof_img = VKA_ENV("DM_VK_PROF_IMG", 0); g_class_note = VKA_ENV("DM_VK_CLASS_NOTE", 0); g_tex_peek_any = VKA_ENV("DM_VK_TEX_PEEK_ANY", 0) || getenv("DM_VK_TEX_PEEK") != NULL; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1); g_inst_on = VKA_ENV("DM_VK_INSTANCE", 0);   // live: from this submission
     g_vin_skip = VKA_ENV("DM_VK_VIN_SKIP", 1);
     g_vattr_clear = VKA_ENV("DM_VK_VATTR_CLEAR", 1);
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
@@ -1193,7 +1200,7 @@ static struct { int valid; vka_span s; uint64_t k[3]; uint8_t b[DMSH_DRV_SIZE]; 
 static struct { int valid; uint64_t gen; vka_span s; } g_gm;
 static struct { int valid; uint32_t ref; vka_span s; } g_sm_ref;   // the support buffer with the alpha test's reference (stage_writes)
 static int g_drv_memo = 1, g_drv_stamp = 1; static uint64_t g_dm_hit, g_dm_miss, g_dm_stamp;
-static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_gm.valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); g_drv_stamp = VKA_ENV("DM_VK_DRV_STAMP", 1); }
+static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_gm.valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); g_drv_stamp = VKA_ENV("DM_VK_DRV_STAMP", 1); sets_memo_drop(); }   // (and the sets' memo: the spans g_w holds go with the submission's fence)
 // What a graphics stage's segment is filled from (vka_bind.c vka_drv_fill), as stamps and values: c0 from the stage's storage buffers, the base instance and the sample
 // count; c2 from the stage's texture, sampler and image handles (and the pools' bases when the shader reads the pools); the push bank from the pushed constants. The same
 // key as the memo's: the same bytes, so the draw binds the memo's span without filling the segment and comparing it (DM_VK_DRV_STAMP, live from the next submission,
@@ -1308,7 +1315,7 @@ VkImageView placeholder(uint8_t dim, int storage) {
 
 // Where a draw's CPU time goes: the virtual counter at each phase boundary of vka_draw, in the draws timed (every draw with DM_VK_PROF=1, logged with the replay statistics;
 // else one in DM_VK_PACE_PROF for the pace line). Cumulative; each reader keeps its own last reading. g_pt_n: draws timed, g_pt_tot: their whole time
-static uint64_t g_pt_last, g_pt[9], g_ps[6], g_pt_n, g_pt_tot; static int g_pt_ph;
+static uint64_t g_pt_last, g_pt[9], g_ps[8], g_pt_n, g_pt_tot; static int g_pt_ph;
 static inline uint64_t cntvct(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
 // ---------- Set 0 from the walk ----------
 typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint64_t ad[512]; uint32_t n; } writes_t;   // ad: a guest buffer's address (0 = other)
@@ -1330,8 +1337,27 @@ static void class_note(const vka_shader *sh, int st, const vka_res *r, int tid, 
     VLOG("class: shader %016llx stage %d binding %u declares a %s %s, texture ID %d is %s (%s)", (unsigned long long)sh->key, st, r->binding, cn[want], storage ? "image" : "texture", tid, cn[have], why);
 }
 static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
+// A resolved image descriptor kept by (texture ID, shape, type, element, the view memo's generations, the open pass). The view memo answers 87-90 % of the
+// lookups, but each hit still walks the pass's attachments (in_fb) and stamps the image's frame and fence (stores into a scattered struct); a draw that binds a
+// texture it bound a moment ago - most of them, ~5 image descriptors a draw - copies two words instead. DM_VK_DESC_MEMO=1 (default 0 until phone-checked)
+typedef struct { uint32_t tid, ver, dim, desc, elem; uint64_t texgen, fbgen; VkImageView v; VkSampler s; VkImageLayout lay; } dmemo_ent;
+static dmemo_ent g_dmemo[4096]; static uint64_t g_dm_hit;
+static int dmemo_on(void) { return VKA_ENV("DM_VK_DESC_MEMO", 0); }
+static inline int dmemo_get(int tid, int dim, int desc, int elem, uint64_t texgen, uint64_t fbgen, VkImageView *v, VkSampler *s, VkImageLayout *lay) {
+    if (!tid || desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !dmemo_on()) return 0;
+    const dmemo_ent *e = &g_dmemo[((uint32_t)tid * 31u + (uint32_t)dim) & 4095];
+    if (e->v && e->tid == (uint32_t)tid && e->dim == (uint32_t)dim && e->desc == (uint32_t)desc && e->elem == (uint32_t)elem && e->texgen == texgen && e->fbgen == fbgen && e->ver == vka_tex_ver(tid)) {
+        *v = e->v; *s = e->s; *lay = e->lay; return 1;
+    }
+    return 0;
+}
+static inline void dmemo_put(int tid, int dim, int desc, int elem, uint64_t texgen, uint64_t fbgen, VkImageView v, VkSampler s, VkImageLayout lay) {
+    if (!tid || desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || !dmemo_on()) return;
+    g_dmemo[((uint32_t)tid * 31u + (uint32_t)dim) & 4095] = (dmemo_ent){(uint32_t)tid, vka_tex_ver(tid), (uint32_t)dim, (uint32_t)desc, (uint32_t)elem, texgen, fbgen, v, s, lay};
+}
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
 static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
+    uint64_t dmtg = vka_tex_gen(), dmfb = vka_tex_fb_gen();   // (the descriptor memo's generations, read once for this stage)
     for (int i = 0; i < n; i++) {
         if (g_w.n == 512) { VRED_ONCE("more than 512 descriptors in one draw"); return 0; }
         uint32_t k = g_w.n;
@@ -1374,15 +1400,20 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             break; }
         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE: case VK_DESCRIPTOR_TYPE_SAMPLER: case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE: {
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; uint64_t ti_ = g_prof ? cntvct() : 0;
+            uint64_t tw_ = 0, tv_ = 0;   // how much of an image descriptor is the ID's lookup into a view (g_ps[6]) and how much everything after it (g_ps[7])
             VkImageView v = VK_NULL_HANDLE; VkSampler s = VK_NULL_HANDLE; VkImageLayout lay = VK_IMAGE_LAYOUT_GENERAL;
+            int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0, dm_hit = 0;
             if (r[i].desc != VK_DESCRIPTOR_TYPE_SAMPLER) {
-                int tid = r[i].what == VKA_R_TEX || r[i].what == VKA_R_IMG ? r[i].tid : 0;
+                if (dmemo_get(tid, r[i].dim, r[i].desc, r[i].elem, dmtg, dmfb, &v, &s, &lay)) { dm_hit = 1; g_dm_hit++; }
+                else {
+                tw_ = g_prof && g_prof_img && tid ? cntvct() : 0;
                 if (tid) v = vka_tex_id_view_rec(tid, g_cb, r[i].dim, storage, &lay);
-                if (tid && v) class_note(sh, st, &r[i], tid, storage);
-                if (tid) tex_peek(sh->key, st, &r[i], v, storage);
+                if (tw_) { tv_ = cntvct() - tw_; g_ps[6] += tv_; }
+                if (g_class_note && tid && v) class_note(sh, st, &r[i], tid, storage);
+                if (g_tex_peek_any && tid) tex_peek(sh->key, st, &r[i], v, storage);
                 // A 2D texture in a 3D or cube slot: what the game leaves bound where a shader's branch does not sample (DKB's materials keep a 1x1 2D texture in their volume slot 12).
                 // It reads as unbound, zeros, as nvn_mtl.m's zero 3D / zero cube fallback does; noted once. Other mismatches are reported
-                int dd = r[i].dim & DMSH_VK_DIM_MASK, tt = tid && !v ? vka_tex_id_target(tid) : -1;
+                int dd = r[i].dim & DMSH_VK_DIM_MASK, tt = tid && !v ? vka_tex_id_target_rec(tid) : -1;
                 if (tid && !v && (dd == 2 || dd == 3) && (tt == NVN_TEXTURE_TARGET_2D || tt == NVN_TEXTURE_TARGET_2D_ARRAY)) {
                     static _Atomic int noted; if (!atomic_exchange(&noted, 1)) { char why[320]; vka_tex_id_desc(tid, why, sizeof why);
                         VLOG("%s binding fallback: shader %016llx binding %u, texture ID %d is a 2D texture (%s): it reads as zeros (the shader may leave it unused)", dd == 2 ? "3D" : "cube", (unsigned long long)sh->key, r[i].binding, tid, why); }
@@ -1390,13 +1421,14 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
                     VRED("shader %016llx binding %u: texture ID %d has no view of shape %#x%s: it reads as unbound (%s)", (unsigned long long)sh->key, r[i].binding, tid, r[i].dim, storage ? " (storage)" : "", why); } }
                 if (!v && !V.null_desc) v = placeholder(r[i].dim, storage);
                 if (!v && !V.null_desc) { VRED_ONCE("an unbound image of shape %#x and no null descriptors: the draw is skipped", r[i].dim); g_skip_dev[VKS_FEATURE]++; return 0; }
+                }
             }
             if (r[i].desc == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || r[i].desc == VK_DESCRIPTOR_TYPE_SAMPLER) {
-                s = r[i].sid ? vka_samp_id_rec(r[i].sid) : VK_NULL_HANDLE;
-                if (!s) s = vka_samp_default();
+                if (!dm_hit || !s) { s = r[i].sid ? vka_samp_id_rec(r[i].sid) : VK_NULL_HANDLE; if (!s) s = vka_samp_default(); }
             }
+            if (!dm_hit && tid && v) dmemo_put(tid, r[i].dim, r[i].desc, r[i].elem, dmtg, dmfb, v, s, lay);
             *ii = (VkDescriptorImageInfo){s, v, lay};
-            w->pImageInfo = ii; if (g_prof) { g_ps[4] += cntvct() - ti_; g_ps[5]++; }
+            w->pImageInfo = ii; if (g_prof) { uint64_t tt_ = cntvct() - ti_; g_ps[4] += tt_; g_ps[5]++; if (tw_) g_ps[7] += tt_ - tv_; }
             break; }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
             if (r[i].what != VKA_R_NULL) VRED_ONCE("texel buffers are not on Vulkan yet (shader %016llx binding %u): bound as null", (unsigned long long)sh->key, r[i].binding);
@@ -1523,7 +1555,96 @@ static int sets_push(const vka_layout *lay, VkPipelineBindPoint bp, int any_pool
     return 1;
 }
 static void memu_bind_arena(void);
+// The last draw's writes, kept as what made them (DM_VK_SETS_MEMO, live, default 1). Building them (stage_writes) is 7.7 us a draw on the phone: 7.6 image descriptors of it,
+// each resolving its texture ID to a view. The resolution's inputs are the walk (walk_all), the shaders' keys (their c1 bytes), the texture IDs' view and sampler versions, the
+// open pass's attachments, the memory segments' generation, and the draw state the driver segments and the alpha test's copy are filled from. When all of those are the ones
+// the last draw had, the descriptors are the same and are not built again: g_w still holds them (a draw resolves set 0 once, and the only other writer, the instanced run's
+// range shrinking, drops the memo). Only graphics draws whose walks resolve without an image of their own, a storage image, a shared-memory spill, a texel buffer or raw global
+// memory's log are kept: those take memory or a new scratch span each time. DM_VK_SETS_MEMO=0: every draw builds them, as before
+typedef struct {
+    uint64_t lay, texgen, memgen, fbgen, alpha, spush, pools, base, sk[VKA_NSTAGE], stemo[VKA_NSTAGE][2];
+    int rast_discard;
+} sets_key;
+// Eight entries, not one: a scene reaches back over more patterns (material A, B, A ...) than a single entry covers
+// (20 % of the draws that could keep their writes on the phone; four entries measured 21-32 %). Sixteen is not tried:
+// an entry holds the walk's records, ~200 KB each
+typedef struct { sets_key k; int ok, any, n[VKA_NSTAGE], pool[VKA_NSTAGE]; uint64_t rv[VKA_NSTAGE][512]; vka_res r[VKA_NSTAGE][512]; } sets_memo;
+enum { SNMEMO = 8 };
+static sets_memo g_sm[SNMEMO]; static unsigned g_smn;
+static int sets_memo_ways(void) {   // DM_VK_SETS_MEMO_WAYS: 1 is the earlier one-entry memo, for the A/B
+    static int v = -1;
+    if (v < 0) { v = VKA_ENV("DM_VK_SETS_MEMO_WAYS", SNMEMO); if (v < 1) v = 1; if (v > SNMEMO) v = SNMEMO; }
+    return v;
+}
+static void sets_memo_drop(void) { for (int i = 0; i < SNMEMO; i++) g_sm[i].ok = 0; }
+// The key of this draw's writes: the layout, the shaders, the generations the views and samplers resolve from, and the state the driver segments are filled from
+static void sets_key_of(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, sets_key *k) {
+    memset(k, 0, sizeof *k);   // (memcmp'd: its padding too)
+    uint32_t ab; memcpy(&ab, &d->alpha_ref, 4);
+    k->lay = (uint64_t)lay->layout; k->texgen = vka_tex_gen(); k->memgen = vka_mem_gen(); k->fbgen = vka_tex_fb_gen();
+    k->alpha = (uint64_t)ab | (uint64_t)d->color.alpha_func << 32;
+    k->spush = d->s_push; k->pools = (uint64_t)(uint32_t)d->b.tex_base | (uint64_t)(uint32_t)d->b.samp_base << 32;
+    k->base = (uint64_t)d->b.base_instance | (uint64_t)d->b.samples << 32; k->rast_discard = d->rast_discard;
+    for (int st = 0; st < VKA_NSTAGE; st++) {
+        k->sk[st] = sh[st] ? sh[st]->key : 0;
+        k->stemo[st][0] = d->s_ssbo[st]; k->stemo[st][1] = d->s_tex[st];
+    }
+}
+// A record's view and sampler versions (the memos' keys): what a texture or image binding resolves to changes only with them
+static uint64_t sets_rv(const vka_res *r) {
+    if (r->what != VKA_R_TEX && r->what != VKA_R_IMG && r->what != VKA_R_TBUF) return 0;
+    return (uint64_t)vka_tex_ver(r->tid) | (uint64_t)vka_samp_ver(r->sid) << 32;
+}
+// 0 when the draw's writes cannot be kept: they take memory or a new scratch span each time, so no two draws' are ever the same
+static int sets_keepable(vka_shader *const sh[VKA_NSTAGE], VkPipelineBindPoint bp) {
+    if (bp != VK_PIPELINE_BIND_POINT_GRAPHICS || !g_drv_memo) return 0;   // (a compute stage's driver segment is filled into a new span every dispatch)
+    if (sh[2] && sh[2]->gs_fx > 0) return 0;                              // (the claim words: a zeroed span per draw)
+    for (int st = 0; st < VKA_NSTAGE; st++) for (int i = 0; i < g_wk.n[st]; i++) {
+        const vka_res *r = &g_wk.r[st][i];
+        if (r->what == VKA_R_IMG || r->what == VKA_R_TBUF || r->what == VKA_R_SHARED_SPILL || r->what == VKA_R_GMEM_LOG) return 0;
+        if (r->desc == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || r->desc == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || r->desc == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) return 0;
+    }
+    return 1;
+}
+// The walk's records compared field by field (vka_res has padding bytes vka_walk's initializer does not fix: a raw memcmp would read them)
+static inline int res_same(const vka_res *a, const vka_res *b) {
+    return a->what == b->what && a->desc == b->desc && a->flags == b->flags && a->dim == b->dim && a->binding == b->binding && a->elem == b->elem
+        && a->bank == b->bank && a->tid == b->tid && a->sid == b->sid && a->addr == b->addr && a->size == b->size;
+}
+// 1 when the last kept draw's walk and view and sampler versions are this draw's
+static uint64_t g_sm_hit, g_sm_try;   // draws whose writes were kept, of the draws that could be (vka_draw_pace's line)
+static int sets_memo_same(const sets_key *k, const sets_memo *m) {
+    if (!m->ok || memcmp(k, &m->k, sizeof *k)) return 0;
+    for (int st = 0; st < VKA_NSTAGE; st++) {
+        int n = g_wk.n[st];
+        if (n != m->n[st] || g_wk.pool[st] != m->pool[st]) return 0;
+        if (n <= 0) continue;
+        for (int i = 0; i < n; i++) if (sets_rv(&g_wk.r[st][i]) != m->rv[st][i] || !res_same(&g_wk.r[st][i], &m->r[st][i])) return 0;
+    }
+    return 1;
+}
+// The writes the build below makes, kept for the next draws (the key is the one the hit test read: what the build does must not change it)
+static void sets_memo_store(const sets_key *k, int any_pool) {
+    sets_memo *m = &g_sm[g_smn++ % (unsigned)sets_memo_ways()];
+    m->k = *k; m->any = any_pool;
+    for (int st = 0; st < VKA_NSTAGE; st++) {
+        int n = m->n[st] = g_wk.n[st]; m->pool[st] = g_wk.pool[st];
+        for (int i = 0; i < n; i++) m->rv[st][i] = sets_rv(&g_wk.r[st][i]);
+        if (n > 0) memcpy(m->r[st], g_wk.r[st], (size_t)n * sizeof(vka_res));
+    }
+    m->ok = 1;
+}
 static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, VkPipelineBindPoint bp, c0_at *c0) {
+    int keep = VKA_ENV("DM_VK_SETS_MEMO", 1) && sets_keepable(sh, bp);
+    sets_key k; if (keep) sets_key_of(d, sh, lay, &k);   // (before the build: what it resolves must not change it)
+    if (keep) {
+        g_sm_try++;
+        for (int i = 0, w = sets_memo_ways(); i < w; i++) if (sets_memo_same(&k, &g_sm[i])) {   // g_w as that draw left it: the same writes
+            g_sm_hit++;
+            if (g_sets_dry) { g_dry_pool = g_sm[i].any; return 1; }
+            return sets_push(lay, bp, g_sm[i].any);
+        }
+    }
     g_w.n = 0;
     int any_pool = 0;
     uint64_t t1_ = g_prof ? cntvct() : 0;
@@ -1545,6 +1666,7 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
         g_w.bi[k] = (VkDescriptorBufferInfo){cs.buf, cs.off, n};
         g_w.w[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = VKA_GS_CLAIM_BINDING, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &g_w.bi[k]};
     }
+    if (keep) sets_memo_store(&k, any_pool);
     if (sh[0] && sh[0]->memu == 2 && bp == VK_PIPELINE_BIND_POINT_GRAPHICS) memu_bind_arena();   // a mesh draw through compute: the arena it draws (vka_memu_draw.inc)
     if (g_sets_dry) { g_dry_pool = any_pool; return 1; }   // DM_VK_INSTANCE: the writes only (sets_push binds them)
     return sets_push(lay, bp, any_pool);
@@ -1891,11 +2013,11 @@ static int inst_ib(const p_draw_idx *di, VkBuffer *ib, VkDeviceSize *io, VkIndex
     if (*it == VK_INDEX_TYPE_UINT8 && !V.idx8) return 0;
     return di->count > 0 && vka_addr(di->ibuf, isz * (uint64_t)di->count, ib, io, NULL) && !(*io % isz);
 }
-typedef struct { uint64_t pt[9], ps[6], n, tot; } dprof;
+typedef struct { uint64_t pt[9], ps[8], n, tot; } dprof;
 static void dprof_take(dprof *last, dprof *d) {   // the timed draws since the reader's last reading
     dprof c; memcpy(c.pt, g_pt, sizeof c.pt); memcpy(c.ps, g_ps, sizeof c.ps); c.n = g_pt_n; c.tot = g_pt_tot;
     for (int i = 0; i < 9; i++) d->pt[i] = c.pt[i] - last->pt[i];
-    for (int i = 0; i < 6; i++) d->ps[i] = c.ps[i] - last->ps[i];
+    for (int i = 0; i < 8; i++) d->ps[i] = c.ps[i] - last->ps[i];
     d->n = c.n - last->n; d->tot = c.tot - last->tot; *last = c;
 }
 static double tick_us(void) { uint64_t f; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f)); return 1e6 / (double)f; }
@@ -1908,7 +2030,8 @@ void vka_draw_prof(char *b, size_t n, double draws) {
     size_t o = 0; for (int i = 0; i < 8 && o < n; i++) o += snprintf(b + o, n - o, "%s%s %.2f", i ? ", " : "", nm[i], d.pt[i] * us);
     if (o < n) o += snprintf(b + o, n - o, "; pushes %.0f%% skipped as the last one", g_pd_skip + g_pd_push ? 100.0 * g_pd_skip / (double)(g_pd_skip + g_pd_push) : 0.0);
     g_pd_skip = g_pd_push = 0;
-    if (o < n) o += snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (driver segments %.2f, %.1f images %.2f), push %.2f", d.ps[0] * us, d.ps[1] * us, d.ps[3] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[2] * us);
+    if (o < n) o += snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (driver segments %.2f, %.1f images %.2f: view %.2f, rest %.2f), push %.2f",
+                             d.ps[0] * us, d.ps[1] * us, d.ps[3] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[6] * us, d.ps[7] * us, d.ps[2] * us);
     if (g_inst_on && o < n) o += snprintf(b + o, n - o, "; instanced runs %llu (%.1f draws joined each, %.0f%% of them without the walk), %llu fell back to single draws",
                                           (unsigned long long)g_inst_runs, g_inst_runs ? (double)g_inst_joined / (double)g_inst_runs : 0.0,
                                           g_inst_joined ? 100.0 * (double)g_inst_fast / (double)g_inst_joined : 0.0, (unsigned long long)g_inst_falls);
@@ -1917,18 +2040,40 @@ void vka_draw_prof(char *b, size_t n, double draws) {
 // The pace line's view of the draw path (vka_perf.c pace_tick, on the recording thread): the timed draws' mean per draw (us) and by phase, and the shortcuts' shares.
 // *draw_us: the mean whole time of a draw (0: none timed)
 void vka_draw_pace(char *b, size_t n, double *draw_us) {
-    static dprof last; static uint64_t vk0, vb0, vk1, vb1, dh0, dm0, ds0;
+    static dprof last; static uint64_t vk0, vb0, vk1, vb1, dh0, dm0, ds0, sh0, st0;
+    static uint64_t mh0, mo0, mv0, mi0, mg0;   // the view memo's counters at the last line
+    static uint64_t msh0, mst0;                // the sampler memo's
     dprof d; dprof_take(&last, &d);
     uint64_t vk = g_vin_kept - vk0, vb = g_vin_built - vb0, bk = g_vb_kept - vk1, bb = g_vb_bound - vb1, dh = g_dm_hit - dh0, dm = g_dm_miss - dm0, ds = g_dm_stamp - ds0;
-    vk0 = g_vin_kept; vb0 = g_vin_built; vk1 = g_vb_kept; vb1 = g_vb_bound; dh0 = g_dm_hit; dm0 = g_dm_miss; ds0 = g_dm_stamp;
+    uint64_t sh = g_sm_hit - sh0, st = g_sm_try - st0;
+    vk0 = g_vin_kept; vb0 = g_vin_built; vk1 = g_vb_kept; vb1 = g_vb_bound; dh0 = g_dm_hit; dm0 = g_dm_miss; ds0 = g_dm_stamp; sh0 = g_sm_hit; st0 = g_sm_try;
     *draw_us = 0; if (n) b[0] = 0;
     size_t o = 0;
     if (d.n) {
         double us = tick_us() / (double)d.n; *draw_us = d.tot * us;
         o += (size_t)snprintf(b + o, n - o, "draw path %.2f us a draw (1 in %d timed:", d.tot * us, g_prof_all ? 1 : g_prof_every);
         for (int i = 0; i < 8 && o < n; i++) o += (size_t)snprintf(b + o, n - o, " %s %.2f%s", g_pt_nm[i], d.pt[i] * us, i < 7 ? "," : "");
-        if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f, driver segments %.2f), push %.2f)", d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, d.ps[3] * us, d.ps[2] * us);
+        char vs[64] = "";
+        if (g_prof_img) snprintf(vs, sizeof vs, ": view %.2f, rest %.2f", d.ps[6] * us, d.ps[7] * us);
+        if (o < n) o += (size_t)snprintf(b + o, n - o, "; sets: walk %.2f, writes %.2f (%.1f images %.2f%s; driver segments %.2f), push %.2f)",
+                                      d.ps[0] * us, d.ps[1] * us, d.ps[5] / (double)d.n, d.ps[4] * us, vs, d.ps[3] * us, d.ps[2] * us);
     }
+    {   // the view memo's own hits and misses (vka_tex.c vka_tex_memo_stats): which of its four reasons a lookup was not answered from it
+        uint64_t h, other, ver, infb, gen2; vka_tex_memo_stats(&h, &other, &ver, &infb, &gen2);
+        uint64_t dh2 = h - mh0, dot = other - mo0, dv = ver - mv0, di = infb - mi0, dg = gen2 - mg0;
+        mh0 = h; mo0 = other; mv0 = ver; mi0 = infb; mg0 = gen2;
+        uint64_t tot = dh2 + dot + dv + di + dg;
+        if (o < n && tot) o += (size_t)snprintf(b + o, n - o, "%sview memo answered %.0f %% of %llu lookups: another ID in the slot %.0f, the ID's version moved (registered again, its texture dropped or its image remade) %.0f, a pass's own target %.0f, a texture dropped since %.0f",
+                                               o ? "; " : "", 100.0 * (double)dh2 / (double)tot, (unsigned long long)tot, 100.0 * (double)dot / (double)tot, 100.0 * (double)dv / (double)tot,
+                                               100.0 * (double)di / (double)tot, 100.0 * (double)dg / (double)tot);
+    }
+    {   // the sampler memo (vka_tex.c vka_samp_memo_stats)
+        uint64_t h, t; vka_samp_memo_stats(&h, &t);
+        uint64_t dh3 = h - msh0, dt3 = t - mst0; msh0 = h; mst0 = t;
+        if (o < n && dt3) o += (size_t)snprintf(b + o, n - o, "%ssampler memo answered %.0f %% of %llu lookups", o ? "; " : "", 100.0 * (double)dh3 / (double)dt3, (unsigned long long)dt3);
+    }
+    if (o < n) o += (size_t)snprintf(b + o, n - o, "%sset 0 writes kept %.0f %% of the draws that could (DM_VK_SETS_MEMO)",
+                                      o ? "; " : "", st ? 100.0 * (double)sh / (double)st : 0.0);
     if (o < n) o += (size_t)snprintf(b + o, n - o, "%svertex input kept %.0f %% (DM_VK_VIN_SKIP), vertex buffers kept %.0f %%, driver segments %.0f %% by their inputs (DM_VK_DRV_STAMP) of %.0f %% bound again",
                                       o ? "; " : "", vk + vb ? 100.0 * vk / (double)(vk + vb) : 0.0, bk + bb ? 100.0 * bk / (double)(bk + bb) : 0.0, dh ? 100.0 * ds / (double)dh : 0.0, dh + dm ? 100.0 * dh / (double)(dh + dm) : 0.0);
 }
@@ -2443,7 +2588,7 @@ static void draw_body(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_sci
                      && vka_scratch(4 * INST_CAP, 16, &i_ta) && vka_scratch(20, 4, &i_aa);
             if (istart) {
                 vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, ip); DY.pipe = ip; VB.valid = 0;
-                g_w.bi[i_wv].range = wv; g_w.bi[i_wp].range = wp;
+                g_w.bi[i_wv].range = wv; g_w.bi[i_wp].range = wp; sets_memo_drop();   // (g_w is no longer what the walk alone makes it)
                 vk.vkCmdPushDescriptorSetKHR(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, lay.layout, 0, g_w.n, g_w.w); g_pd[0].n = 0;
                 RUN.open = 1; RUN.ipipe = ip; RUN.wv = i_wv; RUN.wp = i_wp; RUN.win_v = wv; RUN.win_p = wp; RUN.n = 1;
                 RUN.table = (uint32_t *)i_ta.ptr; RUN.args = (uint32_t *)i_aa.ptr; RUN.table[0] = 0;
