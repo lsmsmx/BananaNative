@@ -62,7 +62,7 @@ final class DriverZip {
 
     static byte[] readMeta(File f) {
         if (!f.isFile() || f.length() > MAX_META) return null;
-        try (InputStream in = new FileInputStream(f)) { return in.readAllBytes(); }
+        try (InputStream in = new FileInputStream(f)) { return Io.all(in); }
         catch (IOException | SecurityException e) { return null; }
     }
 
