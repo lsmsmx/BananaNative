@@ -125,7 +125,7 @@ final class PackCheck {
                 String n = e.getName();
                 boolean want = n.startsWith("dm/tools/") && n.indexOf('/', 9) < 0 || n.startsWith(RewriteKey.EQUIV) && n.indexOf('/', RewriteKey.EQUIV.length()) < 0
                         || n.startsWith("dm/games/") && (n.endsWith("/patches.py") || n.endsWith("/game.tsv"));
-                if (want && !e.isDirectory()) out.put(n, z.readAllBytes());
+                if (want && !e.isDirectory()) out.put(n, Io.all(z));
             }
         } catch (IOException e) {
             return null;

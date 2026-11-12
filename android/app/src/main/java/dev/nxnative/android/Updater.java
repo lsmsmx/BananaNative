@@ -175,7 +175,7 @@ final class Updater {
         HttpsURLConnection c = open(UpdateCheck.busted(s.api, Long.toString(System.currentTimeMillis())), s.accept, s.name, API_CONNECT_MS, API_READ_MS, true);
         String body;
         try (InputStream in = c.getInputStream()) {
-            byte[] b = in.readNBytes(MAX_LIST + 1);
+            byte[] b = Io.upTo(in, MAX_LIST + 1);
             if (b.length > MAX_LIST) throw new Failure(s.name + "'s answer is too large");
             body = new String(b, StandardCharsets.UTF_8);
         } finally { c.disconnect(); }

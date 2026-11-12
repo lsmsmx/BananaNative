@@ -84,7 +84,7 @@ final class DriverFetch {
     static List<Asset> list(String repo) throws IOException, JSONException {
         HttpsURLConnection c = open("https://api.github.com/repos/" + repo + "/releases?per_page=30", "application/vnd.github+json");
         String body;
-        try (InputStream in = c.getInputStream()) { body = new String(in.readAllBytes(), StandardCharsets.UTF_8); }
+        try (InputStream in = c.getInputStream()) { body = new String(Io.all(in), StandardCharsets.UTF_8); }
         finally { c.disconnect(); }
         List<Asset> out = new ArrayList<>();
         JSONArray rel = new JSONArray(body);
